@@ -976,7 +976,7 @@ void renderJobDetail(SSD1306Wire &display, int jobIndex) {
   }
   String dateStr = formatJobDate(job.createdAt);
   // Show location/date OR instruction (alternate or just show instruction)
-  display.drawString(0, 54, "Tap:Back  Hold:Done");  
+  display.drawString(0, 54, "Press:Back  Hold:Done");  
   display.display();
 }
 
