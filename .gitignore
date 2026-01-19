@@ -1,0 +1,48 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Arduino IDE
+*.elf
+*.bin
+*.hex
+build/
+.arduino/
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Compiled files
+*.o
+*.a
+*.so
+*.dylib
+
+# Backup files
+*.backup
+*.backup*
+*.bak
+*~
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
