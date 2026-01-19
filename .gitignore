@@ -46,3 +46,4 @@ build/
 # Temporary files
 tmp/
 temp/
+auto-push.sh
