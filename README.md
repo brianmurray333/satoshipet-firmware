@@ -1,4 +1,4 @@
-# 🐱⚡ Satoshi Pet Firmware
+<h1 align="center">🐱⚡ Satoshi Pet Firmware</h1>
 
 <p align="center">
   <strong>A cute hardware companion that reacts to your Bitcoin activity</strong>
