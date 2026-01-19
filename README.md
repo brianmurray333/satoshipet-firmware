@@ -1,8 +1,4 @@
-# Satoshi Pet Firmware
-
-<p align="center">
-  <img src="images/satoshi-pet-logo.png" alt="Satoshi Pet" width="200"/>
-</p>
+# 🐱⚡ Satoshi Pet Firmware
 
 <p align="center">
   <strong>A cute hardware companion that reacts to your Bitcoin activity</strong>
