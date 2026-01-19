@@ -17,9 +17,8 @@ Complete parts list for building your own Satoshi Pet.
 | Battery | Built-in LiPo charger (JST-PH 2.0) |
 
 **Where to Buy:**
+- [Amazon US (Recommended)](https://www.amazon.com/dp/B07DKD79Y9?th=1) - ~$18
 - [AliExpress - Official Heltec Store](https://www.aliexpress.com/item/1005006439587092.html) - ~$15
-- [Amazon US](https://www.amazon.com/dp/B0BKVKVQ4S) - ~$20
-- [Amazon UK](https://www.amazon.co.uk/dp/B0BKVKVQ4S) - ~£18
 
 **⚠️ Important:** Make sure to get the **V3** version (ESP32-S3), not V2 or V1.
 
@@ -37,9 +36,9 @@ Complete parts list for building your own Satoshi Pet.
 | Size | ~50x30x8mm or smaller |
 
 **Where to Buy:**
-- Search "3.7V LiPo JST-PH 2.0" on Amazon/AliExpress
+- [Amazon US (Recommended)](https://www.amazon.com/dp/B0FMY3M1YX?th=1) - ~$8
 - [Adafruit 2000mAh](https://www.adafruit.com/product/2011) - $12
-- [SparkFun 1000mAh](https://www.sparkfun.com/products/13813) - $10
+- Search "3.7V LiPo JST-PH 2.0" on AliExpress for cheaper options
 
 **Battery Life Estimates:**
 | Capacity | Active Use | Sleep Mode |
@@ -60,10 +59,9 @@ Complete parts list for building your own Satoshi Pet.
 | Size | ~12mm diameter |
 
 **Where to Buy:**
-- Amazon: Search "passive piezo buzzer 5V" - pack of 10 for ~$5
-- [Adafruit](https://www.adafruit.com/product/160) - $1.50
+- [Amazon US (Recommended) - 10 pack](https://www.amazon.com/dp/B01N7NHSY6) - ~$6
 
-**Note:** Get a **passive** buzzer, not active. Passive buzzers can play different tones, active buzzers only beep.
+**Note:** The firmware works with both active and passive buzzers. Active buzzers are simpler to use.
 
 ---
 
@@ -82,10 +80,23 @@ The Heltec board has a built-in PRG button (GPIO 0), but you can add an external
 | Connection | Normally open (NO) |
 
 **Where to Buy:**
-- Amazon: Pack of 100 for ~$5
-- Any electronics store
+- [Amazon US (Recommended)](https://www.amazon.com/dp/B07GN1K4HG) - ~$6
 
 **Wiring:** Connect between GPIO 2 and GND (pull-up is internal).
+
+---
+
+### 5. Jumper Wires
+
+**For connecting buzzer and button to the board**
+
+| Spec | Value |
+|------|-------|
+| Type | Male-to-female or male-to-male |
+| Quantity | 4-6 wires needed |
+
+**Where to Buy:**
+- [Amazon US (Recommended)](https://www.amazon.com/EDGELEC-Breadboard-Optional-Assorted-Multicolored/dp/B07GD2BWPY) - ~$7
 
 ---
 
@@ -121,16 +132,17 @@ The Heltec board has a built-in PRG button (GPIO 0), but you can add an external
 
 ## Total Cost Estimate
 
-| Item | Low | High |
-|------|-----|------|
-| Heltec WiFi Kit 32 V3 | $15 | $25 |
-| LiPo Battery | $5 | $15 |
-| Piezo Buzzer | $0.50 | $2 |
-| External Button | $0 | $0.50 |
-| 3D Printed Case | $2 | $10 |
-| **Total** | **~$23** | **~$53** |
+| Item | Est. Cost |
+|------|-----------|
+| Heltec WiFi Kit 32 V3 | ~$18 |
+| LiPo Battery | ~$8 |
+| Buzzer (10 pack) | ~$6 |
+| Buttons (pack) | ~$6 |
+| Jumper Wires | ~$7 |
+| 3D Printed Case | ~$2-5 |
+| **Total** | **~$45-50** |
 
-Most builders spend around **$25-35** for a complete kit.
+**Note:** Many parts come in multi-packs, so the per-unit cost is lower if building multiple devices. Sharing packs with friends can bring individual cost down to ~$30.
 
 ---
 
