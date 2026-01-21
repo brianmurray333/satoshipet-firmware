@@ -1,3 +1,4 @@
+// Test comment - delete me
 #ifndef CONFIG_H
 #include <Preferences.h>
 #define CONFIG_H
