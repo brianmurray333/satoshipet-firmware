@@ -21,8 +21,14 @@ GanamosConfig ganamosConfig = {
   20000,       // pollInterval
   "",          // serverUrl
   "",          // lastMessage
+  "",          // lastMessageType
+  "",          // lastPostTitle
+  "",          // lastSenderName
   100,         // gameCost (default: 100 coins per game)
-  15           // gameReward (default: 15 happiness per game)
+  15,          // gameReward (default: 15 happiness per game)
+  "",          // lastRejectionId
+  "",          // rejectionMessage
+  ""           // rejectionPostTitle
 };
 int consecutiveFailures = 0;
 int lastHttpCode = 0; // Track last HTTP response code
@@ -293,13 +299,17 @@ process_success:
     ganamosConfig.pollInterval = config["pollInterval"];
     ganamosConfig.serverUrl = config["serverUrl"].as<String>();
     ganamosConfig.lastMessage = config["lastMessage"].as<String>();
+    ganamosConfig.lastMessageType = config["lastMessageType"].as<String>();
+    ganamosConfig.lastPostTitle = config["lastPostTitle"].as<String>();
+    ganamosConfig.lastSenderName = config["lastSenderName"].as<String>();
     // Pet care costs (with defaults)
     ganamosConfig.gameCost = config["gameCost"] | 100;
     ganamosConfig.gameReward = config["gameReward"] | 15;
     
-    // NEW: Parse fix rejection data
+    // Parse fix rejection data
     ganamosConfig.lastRejectionId = config["lastRejectionId"].as<String>();
     ganamosConfig.rejectionMessage = config["rejectionMessage"].as<String>();
+    ganamosConfig.rejectionPostTitle = config["rejectionPostTitle"].as<String>();
 
     // Economy parameters (with defaults)
     if (config.containsKey("hungerDecayPer24h")) {

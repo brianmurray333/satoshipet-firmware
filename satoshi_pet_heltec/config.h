@@ -1,4 +1,3 @@
-// Test comment - delete me
 #ifndef CONFIG_H
 #include <Preferences.h>
 #define CONFIG_H
@@ -37,11 +36,15 @@ struct GanamosConfig {
   int pollInterval;
   String serverUrl;
   String lastMessage;  // Message from last transaction
+  String lastMessageType;    // "fix" for fix rewards, "transfer" for internal transfers
+  String lastPostTitle;      // Post title for fix rewards
+  String lastSenderName;     // Sender name for internal transfers
   // Pet care costs (loaded from server but food uses FoodOption costs, heal unused)
   int gameCost;        // Coins per game attempt (default: 100)
   int gameReward;      // Happiness increase per successful game (default: 15)
   String lastRejectionId;    // ID of last rejected fix (to detect new rejections)
   String rejectionMessage;   // Message to show on rejection
+  String rejectionPostTitle; // Post title for rejected fix
 };
 
 extern GanamosConfig ganamosConfig;
