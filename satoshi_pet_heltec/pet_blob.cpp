@@ -284,29 +284,38 @@ void renderRejection(SSD1306Wire &display) {
   display.setFont(ArialMT_Plain_16);
   display.setTextAlignment(TEXT_ALIGN_CENTER);
   
-  // Main rejection message
-  display.drawString(64, 2, "FIX REJECTED");
+  // Header: "Fix rejected"
+  display.drawString(64, 2, "Fix rejected");
   
   display.setFont(ArialMT_Plain_10);
   
-  // Show X marks (opposite of spinning bitcoins)
-  int frame = (elapsed / 150) % 2; // Blink effect
-  if (frame == 0) {
-    display.drawString(20, 36, "X");
-    display.drawString(50, 36, "X");
-    display.drawString(80, 36, "X");
-    display.drawString(108, 36, "X");
+  // Context message: "for [post title]"
+  String contextMsg;
+  if (ganamosConfig.rejectionPostTitle.length() > 0) {
+    contextMsg = "for " + ganamosConfig.rejectionPostTitle;
+  } else if (rejectionMessage.length() > 0) {
+    contextMsg = rejectionMessage;
+  } else {
+    contextMsg = "Try again!";
   }
   
-  // Show message or default
-  String displayMsg = rejectionMessage;
-  if (displayMsg.length() == 0) {
-    displayMsg = "Try again!";
+  // Truncate if too long
+  if (contextMsg.length() > 21) {
+    contextMsg = contextMsg.substring(0, 18) + "...";
   }
-  if (displayMsg.length() > 18) {
-    displayMsg = displayMsg.substring(0, 18) + "...";
+  display.drawString(64, 22, contextMsg);
+  
+  // Show X marks (blinking)
+  int frame = (elapsed / 150) % 2;
+  if (frame == 0) {
+    display.drawString(20, 40, "X");
+    display.drawString(50, 40, "X");
+    display.drawString(80, 40, "X");
+    display.drawString(108, 40, "X");
   }
-  display.drawString(64, 50, displayMsg);
+  
+  // Encouragement message
+  display.drawString(64, 54, "Keep trying!");
   
   display.display();
 }
@@ -381,31 +390,61 @@ void renderCelebration(SSD1306Wire &display) {
   }
   
   display.clear();
-  display.setFont(ArialMT_Plain_16);
   display.setTextAlignment(TEXT_ALIGN_CENTER);
   
-  // Main celebration message - moved up from y=10 to y=2
-  display.drawString(64, 2, "SATS EARNED!");
-  display.setFont(ArialMT_Plain_10);
-  display.drawString(64, 22, "+" + String(satsEarned) + " sats");
+  // Determine if this is a fix reward or internal transfer
+  bool isFixReward = (ganamosConfig.lastMessageType == "fix");
+  bool isTransfer = (ganamosConfig.lastMessageType == "transfer");
   
-  // Spinning Bitcoin logos - moved up from y=45 to y=36
+  // Format sats amount with k suffix
+  String satsText;
+  if (satsEarned >= 1000) {
+    satsText = String(satsEarned / 1000) + "k";
+  } else {
+    satsText = String(satsEarned);
+  }
+  
+  // Line 1: Amount and type header
+  display.setFont(ArialMT_Plain_16);
+  if (isTransfer) {
+    display.drawString(64, 2, satsText + " Sats Received");
+  } else {
+    display.drawString(64, 2, satsText + " Sats Earned");
+  }
+  
+  // Line 2: Context message
+  display.setFont(ArialMT_Plain_10);
+  String contextMsg;
+  
+  if (isFixReward && ganamosConfig.lastPostTitle.length() > 0) {
+    // Fix reward: show "fix: [post title]"
+    contextMsg = "fix: " + ganamosConfig.lastPostTitle;
+  } else if (isTransfer && ganamosConfig.lastSenderName.length() > 0) {
+    // Internal transfer: show "sent from [sender name]"
+    contextMsg = "sent from " + ganamosConfig.lastSenderName;
+  } else if (celebrationMessage.length() > 0 && celebrationMessage != "null") {
+    // Fallback to celebration message
+    contextMsg = celebrationMessage;
+  } else {
+    // Default fallback
+    contextMsg = ganamosConfig.petName + " is happy!";
+  }
+  
+  // Truncate long messages to fit on screen
+  if (contextMsg.length() > 21) {
+    contextMsg = contextMsg.substring(0, 18) + "...";
+  }
+  display.drawString(64, 22, contextMsg);
+  
+  // Spinning Bitcoin logos
   int frame = (celebrationFrame / 2) % 4;
   display.drawXbm(20, 36, 8, 8, bitcoin_spin_frames[frame]);
   display.drawXbm(50, 36, 8, 8, bitcoin_spin_frames[(frame + 1) % 4]);
   display.drawXbm(80, 36, 8, 8, bitcoin_spin_frames[(frame + 2) % 4]);
   display.drawXbm(110, 36, 8, 8, bitcoin_spin_frames[(frame + 3) % 4]);
   
-  // Display sender's message if available, otherwise default message - moved up from y=55 to y=48
-  String displayMsg = celebrationMessage;
-  if (displayMsg.length() == 0 || displayMsg == "null") {
-    displayMsg = ganamosConfig.petName + " is happy!";
-  }
-  // Truncate long messages to fit on screen
-  if (displayMsg.length() > 21) {
-    displayMsg = displayMsg.substring(0, 18) + "...";
-  }
-  display.drawString(64, 48, displayMsg);
+  // Additional happy message at bottom
+  display.drawString(64, 48, ganamosConfig.petName + " is happy!");
   
   display.display();
 }
