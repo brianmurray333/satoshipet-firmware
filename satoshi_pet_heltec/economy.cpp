@@ -213,6 +213,8 @@ int syncPendingSpends() {
     }
     
     http.setTimeout(5000);
+    // Prefer headers for identity; keep query param temporarily for compatibility
+    attachIdentityHeaders(http);
     http.addHeader("Content-Type", "application/json");
     http.addHeader("Connection", "close");
     
@@ -524,6 +526,8 @@ int syncPendingGameScores() {
     }
     
     http.setTimeout(5000);
+    // Prefer headers for identity
+    attachIdentityHeaders(http);
     http.addHeader("Content-Type", "application/json");
     
     StaticJsonDocument<128> doc;

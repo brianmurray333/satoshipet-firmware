@@ -5,6 +5,9 @@
 
 #include <ArduinoJson.h>
 
+// Forward declaration to avoid pulling HTTPClient into all includers
+class HTTPClient;
+
 struct DeviceConfig {
   String pet;
   String lnurl;
@@ -111,5 +114,15 @@ bool fetchJobs();
 
 // Format sats with k/M suffix (e.g., 1500 -> "1.5k", 2000000 -> "2M")
 String formatSatsShort(int sats);
+
+// === HTTP identity handling ===
+// Attaches device identity headers to every HTTP request.
+// - X-Device-Id: current device id, when available
+// - X-Pairing-Code: current pairing code, when available
+// Note: deviceId remains in the query string temporarily for one release as a compatibility fallback.
+void attachIdentityHeaders(HTTPClient& http);
+
+// Returns a redacted form of a secret for logs (first 4 chars + "****")
+String maskForLog(const String& value);
 
 #endif

@@ -33,6 +33,24 @@ GanamosConfig ganamosConfig = {
 int consecutiveFailures = 0;
 int lastHttpCode = 0; // Track last HTTP response code
 
+// Attach device identity headers to a request
+void attachIdentityHeaders(HTTPClient& http) {
+  // Send device identity via headers (primary)
+  if (ganamosConfig.deviceId.length() > 0) {
+    http.addHeader("X-Device-Id", ganamosConfig.deviceId);
+  }
+  if (pairingCode.length() > 0) {
+    http.addHeader("X-Pairing-Code", pairingCode);
+  }
+}
+
+// Redact secrets for logs: show first 4 characters only
+String maskForLog(const String& value) {
+  if (value.length() == 0) return "";
+  int visible = value.length() < 4 ? value.length() : 4;
+  return value.substring(0, visible) + "****";
+}
+
 // Economy configuration (0.05/min for both stats = 72 points/day)
 EconomyConfig economyConfig = {
   72.0,        // hungerDecayPer24h (0.05/min × 1440 min)
@@ -92,6 +110,8 @@ bool fetchJobs() {
   http.setTimeout(5000);
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   http.setReuse(false);
+  // Attach identity via headers (keep query param for temporary compatibility)
+  attachIdentityHeaders(http);
   http.addHeader("Connection", "close");
   
   int httpCode = http.GET();
@@ -201,6 +221,8 @@ bool fetchGanamosConfig() {
       http.setTimeout(5000);
       http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
       http.setReuse(false);
+      // Identity headers preferred path
+      attachIdentityHeaders(http);
       http.addHeader("Connection", "close");
       
       lastHttpCode = 0;
@@ -247,6 +269,8 @@ bool fetchGanamosConfig() {
     http.setTimeout(5000);
     http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
     http.setReuse(false);
+    // Include headers for pairing-code based fetch as well
+    attachIdentityHeaders(http);
     http.addHeader("Connection", "close");
     
     lastHttpCode = 0;
@@ -394,8 +418,8 @@ bool loadDeviceConfig() {
 
   Serial.println("🔐 loadDeviceConfig() - raw values:");
   Serial.println("  isPaired: " + String(isPaired ? "true" : "false"));
-  Serial.println("  deviceId: " + storedDeviceId);
-  Serial.println("  pairingCode: " + storedPairingCode);
+  Serial.println("  deviceId: " + maskForLog(storedDeviceId));
+  Serial.println("  pairingCode: " + maskForLog(storedPairingCode));
   Serial.println("  lastBalance: " + String(storedBalance));
   Serial.println("  lastCoins: " + String(storedCoins));
   Serial.println("  lastBtcPrice: " + String(storedBtcPrice, 2));
@@ -486,6 +510,8 @@ bool spendCoins(int amount, String action) {
   String payload;
   serializeJson(doc, payload);
   
+  // Prefer headers for identity
+  attachIdentityHeaders(http);
   http.addHeader("Content-Type", "application/json");
   int httpCode = http.POST(payload);
   
@@ -559,6 +585,8 @@ bool submitGameScore(int score, GameScoreResponse &response) {
     return false;
   }
 
+  // Prefer headers for identity
+  attachIdentityHeaders(http);
   http.addHeader("Content-Type", "application/json");
 
   StaticJsonDocument<128> payloadDoc;
@@ -688,6 +716,8 @@ bool markJobComplete(String jobId) {
   }
   
   http.setTimeout(5000);
+  // Prefer headers for identity
+  attachIdentityHeaders(http);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Connection", "close");
   

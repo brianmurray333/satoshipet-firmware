@@ -189,6 +189,7 @@ The firmware communicates with these public endpoints:
 | `GET /api/device/jobs` | Fetch available jobs |
 | `POST /api/device/job-complete` | Mark a job as completed |
 
+Note: Device identity is now sent in HTTP headers (`X-Device-Id`, `X-Pairing-Code`). The `deviceId` query parameter remains temporarily for one release to maintain compatibility with existing devices and backend versions.
 ## Troubleshooting
 
 ### Device won't connect to WiFi
