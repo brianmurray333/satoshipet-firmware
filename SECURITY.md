@@ -27,6 +27,13 @@ The device authenticates using a unique `deviceId` (UUID) assigned by the Ganamo
 - Only allows reading balance and spending "coins" (virtual pet currency)
 - Is tied to a single Ganamos account
 
+As of this release, device identity is transmitted in HTTP headers:
+
+- `X-Device-Id`
+- `X-Pairing-Code` (when pairing)
+
+For compatibility with existing backend releases and older devices, the `deviceId` query parameter is still included temporarily and will be removed in the next firmware release.
+
 ## Data Stored on Device
 
 The device stores in flash memory:

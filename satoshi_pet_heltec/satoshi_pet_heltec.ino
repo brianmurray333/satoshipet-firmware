@@ -270,7 +270,7 @@
   void displayPairingCode() {
   #ifdef DEBUG_LOGGING
     Serial.print(F("Pairing code: "));
-    Serial.println(pairingCode);
+    Serial.println(maskForLog(pairingCode));
   #endif
     display.clear();
     display.setFont(ArialMT_Plain_10);
@@ -597,9 +597,9 @@
     // Now handle pairing - WiFi is guaranteed to be connected for unpaired devices
     if (hadSavedConfigOnBoot) {
       Serial.println("Found saved config! Device already paired.");
-      Serial.println("Device ID: " + ganamosConfig.deviceId);
+      Serial.println("Device ID: " + maskForLog(ganamosConfig.deviceId));
       Serial.println("Pet name: " + ganamosConfig.petName);
-      Serial.println("Pairing code: " + pairingCode);
+      Serial.println("Pairing code: " + maskForLog(pairingCode));
       Serial.println("Last known balance from config: " + String(ganamosConfig.balance) + " sats");
       Serial.println("Last known coins from config (server): " + String(ganamosConfig.coins) + " coins");
       
@@ -614,7 +614,7 @@
       Serial.println(F("WiFi connected - generating pairing code"));
       generatePairingCode();
       Serial.print(F("Pairing code: "));
-      Serial.println(pairingCode);
+      Serial.println(maskForLog(pairingCode));
       displayPairingCode();
       isPaired = false;
     }
@@ -648,8 +648,8 @@
 
   void logCurrentPairingState() {
     Serial.println("🔍 Current pairing snapshot:");
-    Serial.println("  deviceId: " + ganamosConfig.deviceId);
-    Serial.println("  pairingCode: " + pairingCode);
+    Serial.println("  deviceId: " + maskForLog(ganamosConfig.deviceId));
+    Serial.println("  pairingCode: " + maskForLog(pairingCode));
     Serial.println("  petName: " + ganamosConfig.petName);
     Serial.println("  petType: " + ganamosConfig.petType);
     Serial.println("  balance: " + String(ganamosConfig.balance));
@@ -856,7 +856,7 @@
             clearDeviceConfig();
             isPaired = false;
             generatePairingCode(); // Generate new pairing code
-            Serial.println("New pairing code generated: " + pairingCode);
+            Serial.println("New pairing code generated: " + maskForLog(pairingCode));
             hasHandledSavedConfig404 = true;
             displayPairingCode();
             consecutiveConfig404s = 0;
@@ -982,7 +982,7 @@
               delay(100);
               display.init();
               displayPairingCode();
-              Serial.println("New pairing code generated: " + pairingCode);
+              Serial.println("New pairing code generated: " + maskForLog(pairingCode));
               consecutiveConfig404s = 0;
               return; // Skip to next loop iteration
             } else {
