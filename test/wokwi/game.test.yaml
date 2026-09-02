@@ -1,0 +1,33 @@
+name: Satoshi Pet game flow
+version: 1
+author: Satoshi Pet
+steps:
+  - wait-serial: "Setup complete!"
+
+  # Open the menu.
+  - set-control: { part-id: externalButton, control: pressed, value: 1 }
+  - delay: 150ms
+  - set-control: { part-id: externalButton, control: pressed, value: 0 }
+  - delay: 250ms
+
+  # Move from Home to Play.
+  - set-control: { part-id: externalButton, control: pressed, value: 1 }
+  - delay: 150ms
+  - set-control: { part-id: externalButton, control: pressed, value: 0 }
+  - delay: 250ms
+
+  # Hold to launch the selected game.
+  - set-control: { part-id: externalButton, control: pressed, value: 1 }
+  - delay: 1s
+  - set-control: { part-id: externalButton, control: pressed, value: 0 }
+  - delay: 250ms
+
+  # Flappy Pet is the default item in the new game chooser; hold to launch it.
+  - set-control: { part-id: externalButton, control: pressed, value: 1 }
+  - delay: 1s
+  - set-control: { part-id: externalButton, control: pressed, value: 0 }
+  - wait-serial: "Starting Flappy Pet Game!"
+
+  # Let the first wall end the round, then verify the result path completes.
+  - delay: 8s
+  - wait-serial: "Game played!"

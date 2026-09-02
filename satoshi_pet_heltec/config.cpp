@@ -51,10 +51,10 @@ String maskForLog(const String& value) {
   return value.substring(0, visible) + "****";
 }
 
-// Economy configuration (0.05/min for both stats = 72 points/day)
+// Safe offline defaults match the live server configuration.
 EconomyConfig economyConfig = {
-  72.0,        // hungerDecayPer24h (0.05/min × 1440 min)
-  72.0         // happinessDecayPer24h (0.05/min × 1440 min)
+  40.0,        // hungerDecayPer24h
+  25.0         // happinessDecayPer24h
 };
 
 // Jobs data - cached from server
