@@ -1,0 +1,6 @@
+name: Satoshi Pet boots into simulator fixture
+version: 1
+author: Satoshi Pet
+steps:
+  - wait-serial: "Satoshi Pet"
+  - wait-serial: "Setup complete!"

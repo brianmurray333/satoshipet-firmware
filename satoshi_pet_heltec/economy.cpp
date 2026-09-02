@@ -11,21 +11,93 @@ static Preferences economyPrefs;
 static PendingSpend pendingSpends[MAX_PENDING_SPENDS];
 static int pendingSpendCount = 0;
 static int localCoinBalance = 0;
+static void savePendingSpends();
+
+static constexpr uint32_t ECONOMY_STATE_MAGIC = 0x45564D32; // "EVM2"
+static constexpr uint16_t ECONOMY_STATE_VERSION = 2;
+static constexpr uint32_t SCORE_STATE_MAGIC = 0x53435632; // "SCV2"
+static constexpr uint16_t SCORE_STATE_VERSION = 2;
+
+struct EconomyStateV2 {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t count;
+  int32_t localCoins;
+  PendingSpend spends[MAX_PENDING_SPENDS];
+  uint32_t checksum;
+};
+
+struct ScoreStateV2 {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t count;
+  PendingGameScore scores[MAX_PENDING_SCORES];
+  uint32_t checksum;
+};
+
+// Keep the large queue image out of the Arduino loop-task stack. A 4 KB local
+// object here materially increases stack-overflow risk during NVS operations.
+static EconomyStateV2 economyStateScratch;
+static ScoreStateV2 scoreStateScratch;
+
+static uint32_t checksumBytes(const void* data, size_t length) {
+  const uint8_t* bytes = static_cast<const uint8_t*>(data);
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; i < length; ++i) {
+    hash ^= bytes[i];
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
+template <typename T>
+static uint32_t stateChecksum(const T& state) {
+  return checksumBytes(&state, sizeof(T) - sizeof(state.checksum));
+}
 
 // Generate a simple UUID (not cryptographically secure, but unique enough for our use)
 static void generateUUID(char* uuidStr) {
-  sprintf(uuidStr, "%08lx-%04x-%04x-%04x-%012lx",
-    (unsigned long)random(0xFFFFFFFF),
+  uint64_t tail = ((uint64_t)esp_random() << 16) | (esp_random() & 0xFFFFULL);
+  snprintf(uuidStr, 37, "%08lx-%04x-%04x-%04x-%012llx",
+    (unsigned long)esp_random(),
     (unsigned int)random(0xFFFF),
     (unsigned int)(0x4000 | random(0x0FFF)), // Version 4
     (unsigned int)(0x8000 | random(0x3FFF)), // Variant
-    (unsigned long)random(0xFFFFFFFF) | ((unsigned long)random(0xFFFF) << 32)
+    (unsigned long long)tail
   );
 }
 
 void initEconomy() {
   // Load pending spends from NVS
   economyPrefs.begin("economy", true); // read-only
+
+  memset(&economyStateScratch, 0, sizeof(economyStateScratch));
+  const size_t v2Length = economyPrefs.getBytesLength("stateV2");
+  const bool hasV2 = v2Length == sizeof(economyStateScratch) &&
+                     economyPrefs.getBytes("stateV2", &economyStateScratch, sizeof(economyStateScratch)) == sizeof(economyStateScratch) &&
+                     economyStateScratch.magic == ECONOMY_STATE_MAGIC &&
+                     economyStateScratch.version == ECONOMY_STATE_VERSION &&
+                     economyStateScratch.count <= MAX_PENDING_SPENDS &&
+                     economyStateScratch.checksum == stateChecksum(economyStateScratch);
+  if (hasV2) {
+    pendingSpendCount = economyStateScratch.count;
+    localCoinBalance = max(0, (int)economyStateScratch.localCoins);
+    memcpy(pendingSpends, economyStateScratch.spends, sizeof(pendingSpends));
+    economyPrefs.end();
+    Serial.printf("Economy: restored %d pending spends and %d coins\n",
+                  pendingSpendCount, localCoinBalance);
+    return;
+  }
+  if (v2Length > 0) {
+    // Do not resurrect stale legacy entries after a damaged modern record.
+    // The server will restore the authoritative coin balance on the next poll.
+    pendingSpendCount = 0;
+    localCoinBalance = 0;
+    memset(pendingSpends, 0, sizeof(pendingSpends));
+    economyPrefs.end();
+    Serial.println("Economy: corrupt state rejected; awaiting server reconciliation");
+    return;
+  }
   
   pendingSpendCount = economyPrefs.getInt("spendCount", 0);
   if (pendingSpendCount > MAX_PENDING_SPENDS) {
@@ -69,12 +141,14 @@ void initEconomy() {
   Serial.println("💰 Economy: Local balance = " + String(localCoinBalance) + " coins");
   
   economyPrefs.end();
+
+  // Convert legacy per-key records to one checksummed NVS value. A single
+  // record avoids partial queue rewrites and greatly reduces heap churn.
+  savePendingSpends();
 }
 
 static void savePendingSpends() {
   Serial.println("💰 [REBOOT DEBUG] savePendingSpends() START - count=" + String(pendingSpendCount));
-  
-  economyPrefs.begin("economy", false); // read-write
   
   // Safety: Validate pendingSpendCount before saving
   if (pendingSpendCount < 0 || pendingSpendCount > MAX_PENDING_SPENDS) {
@@ -82,36 +156,38 @@ static void savePendingSpends() {
     pendingSpendCount = min(max(0, pendingSpendCount), MAX_PENDING_SPENDS);
   }
   
-  // CRITICAL: Save localCoins FIRST before pending spends!
-  // If device loses power mid-save, the balance will still be correct.
-  // Pending spends can be re-created, but losing coin balance is worse.
-  Serial.println("💰 [REBOOT DEBUG] Saving localCoins=" + String(localCoinBalance));
-  economyPrefs.putInt("localCoins", localCoinBalance);
-  
-  Serial.println("💰 [REBOOT DEBUG] Saving count=" + String(pendingSpendCount));
-  economyPrefs.putInt("spendCount", pendingSpendCount);
-  
-  for (int i = 0; i < pendingSpendCount && i < MAX_PENDING_SPENDS; i++) {
-    // Safety: Ensure strings are null-terminated before using them
-    pendingSpends[i].id[36] = '\0';     // Force null termination
-    pendingSpends[i].action[31] = '\0'; // Force null termination
-    
-    String data = String(pendingSpends[i].id) + "|" +
-                  String(pendingSpends[i].timestamp) + "|" +
-                  String(pendingSpends[i].amount) + "|" +
-                  String(pendingSpends[i].action) + "|" +
-                  String(pendingSpends[i].synced ? 1 : 0);
-    
-    String key = "spend_" + String(i);
-    economyPrefs.putString(key.c_str(), data);
+  memset(&economyStateScratch, 0, sizeof(economyStateScratch));
+  economyStateScratch.magic = ECONOMY_STATE_MAGIC;
+  economyStateScratch.version = ECONOMY_STATE_VERSION;
+  economyStateScratch.count = pendingSpendCount;
+  economyStateScratch.localCoins = max(0, localCoinBalance);
+  memcpy(economyStateScratch.spends, pendingSpends, sizeof(pendingSpends));
+  for (int i = 0; i < pendingSpendCount; ++i) {
+    economyStateScratch.spends[i].id[36] = '\0';
+    economyStateScratch.spends[i].action[31] = '\0';
   }
-  
+  economyStateScratch.checksum = stateChecksum(economyStateScratch);
+
+  economyPrefs.begin("economy", false);
+  const size_t written = economyPrefs.putBytes("stateV2", &economyStateScratch, sizeof(economyStateScratch));
   economyPrefs.end();
-  
-  Serial.println("💰 [REBOOT DEBUG] savePendingSpends() COMPLETE");
+  if (written != sizeof(economyStateScratch)) {
+    Serial.println("Economy: failed to persist complete state");
+  }
 }
 
 bool spendCoinsLocal(int amount, const char* action) {
+  if (amount <= 0 || action == nullptr || action[0] == '\0') {
+    Serial.println("Economy: invalid local spend");
+    return false;
+  }
+
+  // Never deduct a coin unless its idempotent sync record can be retained.
+  if (pendingSpendCount >= MAX_PENDING_SPENDS) {
+    Serial.println("Economy: pending queue full; spend rejected safely");
+    return false;
+  }
+
   // Check if we have enough coins
   if (localCoinBalance < amount) {
     Serial.println("❌ Economy: Insufficient coins (" + String(localCoinBalance) + " < " + String(amount) + ")");
@@ -121,8 +197,8 @@ bool spendCoinsLocal(int amount, const char* action) {
   // Deduct coins immediately
   localCoinBalance -= amount;
   
-  // Add to pending queue if we have room
-  if (pendingSpendCount < MAX_PENDING_SPENDS) {
+  // Add to pending queue.
+  {
     PendingSpend& spend = pendingSpends[pendingSpendCount];
     generateUUID(spend.id);
     spend.timestamp = millis();
@@ -139,11 +215,6 @@ bool spendCoinsLocal(int amount, const char* action) {
     // Save to NVS
     savePendingSpends();
     
-    return true;
-  } else {
-    Serial.println("⚠️ Economy: Pending queue full, dropping spend");
-    // Still deduct coins (already happened above) but warn
-    savePendingSpends();
     return true;
   }
 }
@@ -346,31 +417,49 @@ static int pendingScoreCount = 0;
 static Preferences scorePrefs;
 
 static void savePendingScores() {
-  scorePrefs.begin("scores", false); // read-write
-  
   if (pendingScoreCount < 0 || pendingScoreCount > MAX_PENDING_SCORES) {
     pendingScoreCount = min(max(0, pendingScoreCount), MAX_PENDING_SCORES);
   }
-  
-  scorePrefs.putInt("scoreCount", pendingScoreCount);
-  
-  for (int i = 0; i < pendingScoreCount && i < MAX_PENDING_SCORES; i++) {
-    pendingScores[i].id[36] = '\0';
-    
-    String data = String(pendingScores[i].id) + "|" +
-                  String(pendingScores[i].timestamp) + "|" +
-                  String(pendingScores[i].score) + "|" +
-                  String(pendingScores[i].synced ? 1 : 0);
-    
-    String key = "score_" + String(i);
-    scorePrefs.putString(key.c_str(), data);
-  }
-  
+
+  memset(&scoreStateScratch, 0, sizeof(scoreStateScratch));
+  scoreStateScratch.magic = SCORE_STATE_MAGIC;
+  scoreStateScratch.version = SCORE_STATE_VERSION;
+  scoreStateScratch.count = pendingScoreCount;
+  memcpy(scoreStateScratch.scores, pendingScores, sizeof(pendingScores));
+  for (int i = 0; i < pendingScoreCount; ++i) scoreStateScratch.scores[i].id[36] = '\0';
+  scoreStateScratch.checksum = stateChecksum(scoreStateScratch);
+
+  scorePrefs.begin("scores", false);
+  const size_t written = scorePrefs.putBytes("stateV2", &scoreStateScratch, sizeof(scoreStateScratch));
   scorePrefs.end();
+  if (written != sizeof(scoreStateScratch)) Serial.println("Scores: failed to persist complete state");
 }
 
 static void loadPendingScores() {
   scorePrefs.begin("scores", true); // read-only
+
+  memset(&scoreStateScratch, 0, sizeof(scoreStateScratch));
+  const size_t v2Length = scorePrefs.getBytesLength("stateV2");
+  const bool hasV2 = v2Length == sizeof(scoreStateScratch) &&
+                     scorePrefs.getBytes("stateV2", &scoreStateScratch, sizeof(scoreStateScratch)) == sizeof(scoreStateScratch) &&
+                     scoreStateScratch.magic == SCORE_STATE_MAGIC &&
+                     scoreStateScratch.version == SCORE_STATE_VERSION &&
+                     scoreStateScratch.count <= MAX_PENDING_SCORES &&
+                     scoreStateScratch.checksum == stateChecksum(scoreStateScratch);
+  if (hasV2) {
+    pendingScoreCount = scoreStateScratch.count;
+    memcpy(pendingScores, scoreStateScratch.scores, sizeof(pendingScores));
+    scorePrefs.end();
+    Serial.printf("Scores: restored %d pending scores\n", pendingScoreCount);
+    return;
+  }
+  if (v2Length > 0) {
+    pendingScoreCount = 0;
+    memset(pendingScores, 0, sizeof(pendingScores));
+    scorePrefs.end();
+    Serial.println("Scores: corrupt state rejected safely");
+    return;
+  }
   
   pendingScoreCount = scorePrefs.getInt("scoreCount", 0);
   if (pendingScoreCount > MAX_PENDING_SCORES) {
@@ -408,6 +497,7 @@ static void loadPendingScores() {
   }
   
   scorePrefs.end();
+  savePendingScores();
 }
 
 bool queueGameScoreLocal(int score) {
@@ -428,13 +518,7 @@ bool queueGameScoreLocal(int score) {
     PendingGameScore& entry = pendingScores[pendingScoreCount];
     
     // Generate UUID
-    sprintf(entry.id, "%08lx-%04x-%04x-%04x-%012lx",
-      (unsigned long)random(0xFFFFFFFF),
-      (unsigned int)random(0xFFFF),
-      (unsigned int)(0x4000 | random(0x0FFF)),
-      (unsigned int)(0x8000 | random(0x3FFF)),
-      (unsigned long)random(0xFFFFFFFF) | ((unsigned long)random(0xFFFF) << 32)
-    );
+    generateUUID(entry.id);
     
     entry.timestamp = millis();
     entry.score = score;
@@ -447,26 +531,8 @@ bool queueGameScoreLocal(int score) {
     savePendingScores();
     return true;
   } else {
-    Serial.println("⚠️ Scores: Queue full, dropping oldest unsynced score");
-    // Remove oldest unsynced and add new one
-    for (int i = 0; i < pendingScoreCount - 1; i++) {
-      pendingScores[i] = pendingScores[i + 1];
-    }
-    
-    PendingGameScore& entry = pendingScores[pendingScoreCount - 1];
-    sprintf(entry.id, "%08lx-%04x-%04x-%04x-%012lx",
-      (unsigned long)random(0xFFFFFFFF),
-      (unsigned int)random(0xFFFF),
-      (unsigned int)(0x4000 | random(0x0FFF)),
-      (unsigned int)(0x8000 | random(0x3FFF)),
-      (unsigned long)random(0xFFFFFFFF) | ((unsigned long)random(0xFFFF) << 32)
-    );
-    entry.timestamp = millis();
-    entry.score = score;
-    entry.synced = false;
-    
-    savePendingScores();
-    return true;
+    Serial.println("Scores: queue full; score retained in gameplay only");
+    return false;
   }
 }
 
@@ -602,4 +668,3 @@ void clearSyncedGameScores() {
     savePendingScores();
   }
 }
-

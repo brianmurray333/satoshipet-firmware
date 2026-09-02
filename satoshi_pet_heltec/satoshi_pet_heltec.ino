@@ -9,7 +9,24 @@
   #include "economy.h"
   #include "button_handler.h"
   #include "display_assets.h"
+  #include "espnow_comm.h"
+  #include "pickleball.h"
   #include <esp_task_wdt.h>  // Watchdog timer support (framework auto-initializes)
+  #include <esp_idf_version.h>
+  #include <esp_sleep.h>
+
+  // Keep declarations explicit so this sketch builds consistently with both
+  // Arduino IDE and non-IDE toolchains such as PlatformIO/Wokwi.
+  bool isQuietHours();
+  void playLowBatterySound();
+  void renderLowBatteryWarning(SSD1306Wire &display, int batteryPercent);
+  void renderOnboardingStep(SSD1306Wire &display, int step, String petName);
+  void renderDeathWarning(SSD1306Wire &display, String petName);
+  void renderHungerWarning(SSD1306Wire &display, String petName, int fullness);
+  void renderSadnessWarning(SSD1306Wire &display, String petName, int happiness);
+  void handleFactoryReset();
+  void playButtonChirp();
+  void playMenuSelectTone();
 
   // Debug logging - comment out to disable verbose logs and save memory
   // #define DEBUG_LOGGING
@@ -23,7 +40,13 @@
   #define VBAT_PIN 1            // GPIO1 - Battery voltage ADC reading pin (ADC1_CH0)
   // Heltec WiFi Kit 32 V3 (ESP32-S3) voltage divider: 100kΩ/390kΩ = multiply by 4.9
 
+  #ifdef WOKWI_SIMULATOR
+  // Wokwi's standalone SSD1306 part has no reset pin. The real Heltec OLED
+  // does, so preserve the hardware behavior in the normal build.
+  SSD1306Wire display(0x3c, 400000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, -1);
+  #else
   SSD1306Wire display(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_OLED);
+  #endif
 
   // Function to dim OLED display (SSD1306 commands)
   // Based on Heltec forum: contrast control may not work well on V2.0+ boards
@@ -62,8 +85,11 @@
   }
 
   bool isPaired = false;  
+  String pendingPickleballGameId = "";
+  String pendingPickleballHostMac = "";
   unsigned long lastUpdate = 0;
-  const unsigned long UPDATE_INTERVAL = 20000; // 20 seconds for better responsiveness
+  const unsigned long DEFAULT_UPDATE_INTERVAL = 60000; // Default to one poll/minute to reduce radio wakeups
+  const unsigned long MIN_UPDATE_INTERVAL = 60000;     // Never let server config create a battery-heavy poll loop
   bool buttonPressed = false;
   unsigned long buttonPressTime = 0;
   unsigned long lastButtonPress = 0;
@@ -94,9 +120,20 @@
   unsigned long lastMenuCycle = 0;
 
   // Screensaver settings for power saving
+#ifdef WOKWI_SIMULATOR
+  // Accelerate power-state transitions so sleep/wake can be covered quickly.
+  const unsigned long SCREENSAVER_TIMEOUT = 15000;
+  const unsigned long BITCOIN_FACTS_TIMEOUT = 30000;
+  const unsigned long SCREENSAVER_DISPLAY_OFF_TIMEOUT = 45000;
+  const unsigned long BATTERY_CHECK_INTERVAL = 5000;
+#else
   const unsigned long SCREENSAVER_TIMEOUT = 180000; // 3 minutes of inactivity → animated screensaver
   const unsigned long BITCOIN_FACTS_TIMEOUT = 220000; // 3.67 minutes → Bitcoin facts screen
   const unsigned long SCREENSAVER_DISPLAY_OFF_TIMEOUT = 280000; // 4.67 minutes total → display OFF
+  const unsigned long BATTERY_CHECK_INTERVAL = 60000;
+#endif
+  float cachedBatteryVoltage = 0.0f;
+  unsigned long lastBatteryVoltageSample = 0;
   uint8_t NORMAL_BRIGHTNESS = 255;  // Full brightness (non-const so it can be extern)
   uint8_t DIM_BRIGHTNESS = 10;      // Dimmed brightness (much lower for V2.0+ boards that don't respond well to contrast)
   bool isScreensaverActive = false;
@@ -185,6 +222,12 @@
   }
 
   float getBatteryVoltage() {
+    unsigned long now = millis();
+    if (cachedBatteryVoltage > 0.0f &&
+        now - lastBatteryVoltageSample < BATTERY_CHECK_INTERVAL) {
+      return cachedBatteryVoltage;
+    }
+
     // Brief wait for voltage to settle after any WiFi transmission
     delay(10);
     
@@ -192,9 +235,9 @@
     analogReadResolution(12);
     analogSetAttenuation(ADC_11db);
     
-    // Use ADC_CTRL HIGH consistently (tested to work reliably)
+    // Heltec's V3 ADC control is active-high: enable it only while sampling.
     pinMode(ADC_CTRL, OUTPUT);
-    digitalWrite(ADC_CTRL, LOW);
+    digitalWrite(ADC_CTRL, HIGH);
     delay(5);
     
     // Debug: Read raw ADC values
@@ -225,6 +268,12 @@
     }
     
     float voltage = smoothedVoltage;
+    cachedBatteryVoltage = voltage;
+    lastBatteryVoltageSample = now;
+
+    // Disable the divider between samples so its resistor
+    // path does not continuously drain the battery.
+    digitalWrite(ADC_CTRL, LOW);
     
     // Sanity check for disconnected battery or bad reading
     if (voltage < 0.1) {
@@ -440,6 +489,7 @@
 
   void setup() {
     Serial.begin(115200);
+    Serial.println(F("Satoshi Pet boot"));
     
     // ESP32 Arduino framework already initializes watchdog timer (5s default)
     // DISABLED: Watchdog registration causing boot loop
@@ -487,6 +537,21 @@
       // FIRST: Check if device is already paired (before WiFi setup)
     // This determines whether we need mandatory WiFi setup or can try quick reconnect
     hadSavedConfigOnBoot = loadDeviceConfig();
+#ifdef WOKWI_SIMULATOR
+    // Wokwi is an isolated functional test fixture. Seed a paired device so the
+    // complete UI can be exercised without a phone, personal WiFi, or production
+    // account. This block is compiled out of physical Heltec firmware.
+    hadSavedConfigOnBoot = true;
+    pairingCode = "SIM-TEST";
+    ganamosConfig.deviceId = "wokwi-simulator";
+    ganamosConfig.petName = "Satoshi";
+    ganamosConfig.petType = "cat";
+    ganamosConfig.userName = "Simulator";
+    ganamosConfig.balance = 12345;
+    ganamosConfig.coins = 1000;
+    ganamosConfig.btcPrice = 100000.0;
+    ganamosConfig.pollInterval = DEFAULT_UPDATE_INTERVAL;
+#endif
     logCurrentPairingState();
     
     WiFiManager wm;
@@ -551,7 +616,11 @@
       Serial.println(F("Device paired - trying quick WiFi reconnect..."));
       WiFi.mode(WIFI_STA);
       WiFi.setAutoReconnect(false);
+#ifdef WOKWI_SIMULATOR
+      WiFi.begin("Wokwi-GUEST", "", 6);
+#else
       WiFi.begin();
+#endif
       
       // Wait up to 10 seconds for connection
       unsigned long wifiStart = millis();
@@ -563,6 +632,9 @@
       if (WiFi.status() == WL_CONNECTED) {
         Serial.print(F("WiFi connected: "));
         Serial.println(WiFi.localIP());
+        // ESP32 modem sleep preserves connectivity while substantially reducing
+        // idle radio power. Interactive UI does not require it to be disabled.
+        WiFi.setSleep(true);
       } else {
         Serial.println(F("WiFi unavailable - continuing offline"));
         WiFi.disconnect(true);
@@ -584,6 +656,10 @@
     extern void clearEconomyData();
     
     initEconomy();
+#ifdef WOKWI_SIMULATOR
+    // Give simulator tests enough local currency to exercise games and feeding.
+    setLocalCoins(1000);
+#endif
     
     // Check for corrupted economy data and clear if needed
     int pendingCount = getPendingSpendCount();
@@ -634,12 +710,17 @@
     
       // Register main loop task with watchdog (15 second timeout)
     // Configure watchdog with 15 second timeout
-    esp_task_wdt_config_t wdt_config = {
-      .timeout_ms = 15000,           // 15 second timeout
-      .idle_core_mask = 0,           // Don't watch idle tasks
-      .trigger_panic = true          // Panic (reset) on timeout
-    };
-    esp_task_wdt_reconfigure(&wdt_config);  // Reconfigure existing watchdog
+    #if ESP_IDF_VERSION_MAJOR >= 5
+      esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = 15000,           // 15 second timeout
+        .idle_core_mask = 0,           // Don't watch idle tasks
+        .trigger_panic = true          // Panic (reset) on timeout
+      };
+      esp_task_wdt_reconfigure(&wdt_config);
+    #else
+      // Arduino-ESP32 2.x / ESP-IDF 4.x uses the legacy seconds-based API.
+      esp_task_wdt_init(15, true);
+    #endif
     esp_task_wdt_add(NULL);                  // Add current task (main loop)
     Serial.println("🐕 Watchdog initialized (15s timeout)");
 
@@ -698,8 +779,8 @@
     static int cachedBatteryPct = -1; // Cache battery percentage (-1 = not initialized)
     static unsigned long lastBatteryCheck = 0;
     
-    // Initialize battery on first loop OR update every 60 seconds
-    if (cachedBatteryPct < 0 || (now - lastBatteryCheck > 60000)) { 
+    // Initialize battery on first loop, then sample at the target-specific cadence.
+    if (cachedBatteryPct < 0 || (now - lastBatteryCheck > BATTERY_CHECK_INTERVAL)) {
       cachedBatteryPct = getBatteryPercentage();
       lastBatteryCheck = now;
       
@@ -737,8 +818,7 @@
       Serial.println("🔋 Low battery warning complete - returning to normal mode");
       isLowBatteryWarningActive = false;
       // Just return to normal pet screen, don't enter ultra-low-power yet
-      int batteryPct = getBatteryPercentage();
-      renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);
+      renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, cachedBatteryPct);
     }
     
     // Enter ultra-low-power mode only at 5% (critical battery)
@@ -896,7 +976,15 @@
       }
       
       // Normal operation - fetch data less frequently during screensaver to save power
-      unsigned long updateInterval = isScreensaverActive ? 300000 : UPDATE_INTERVAL; // 5 minutes during screensaver, 20s normal
+      unsigned long configuredInterval = ganamosConfig.pollInterval > 0
+        ? (unsigned long)ganamosConfig.pollInterval
+        : DEFAULT_UPDATE_INTERVAL;
+      configuredInterval = max(configuredInterval, MIN_UPDATE_INTERVAL);
+      unsigned long updateInterval = isScreensaverActive ? 300000UL : configuredInterval;
+#ifdef WOKWI_SIMULATOR
+      // Keep simulator tests deterministic and completely separate from the live API.
+      updateInterval = 0xFFFFFFFFUL;
+#endif
       
       if (now - lastUpdate > updateInterval) {
         lastUpdate = now;
@@ -1067,10 +1155,9 @@
             } else {
               Serial.println("💰 Balance increased - waking from animated screensaver!");
             }
-            // Disable WiFi power saving for responsive active use
-            if (WiFi.status() == WL_CONNECTED) {
-              WiFi.setSleep(false);
-            }
+            // Keep modem sleep enabled; it preserves the connection and UI input
+            // remains local, so disabling it only increases idle battery drain.
+            if (WiFi.status() == WL_CONNECTED) WiFi.setSleep(true);
             isDisplayOff = false;
           }
           lastBalance = ganamosConfig.balance;
@@ -1243,7 +1330,9 @@
                             petStats.happiness != lastDisplayedHappiness ||
                             cachedBatteryPct != lastDisplayedBattery);
           
-          bool animationUpdate = (now - lastDisplayUpdate > 500);
+          // One frame per second keeps the pet feeling alive while halving idle
+          // OLED transfers compared with the previous 500 ms refresh cadence.
+          bool animationUpdate = (now - lastDisplayUpdate > 1000);
           
           if (dataChanged || animationUpdate) {
             renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, cachedBatteryPct);
@@ -1339,10 +1428,8 @@
             WiFi.begin();  // Uses saved credentials, connects in background
           }
         }
-        // Disable WiFi power saving for responsive active use
-        if (WiFi.status() == WL_CONNECTED) {
-          WiFi.setSleep(false);
-        }
+        // Button handling is local, so modem sleep can remain enabled after wake.
+        if (WiFi.status() == WL_CONNECTED) WiFi.setSleep(true);
         isDisplayOff = false;
         int batteryPct = getBatteryPercentage();
         renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);
@@ -1410,8 +1497,64 @@
             int batteryPct = getBatteryPercentage();
             renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);
           } else if (selectedOption == 1) {
-            extern int handleLightningGame(SSD1306Wire &display);
-            handleLightningGame(display);
+            bool inGameMenu = true;
+            int selectedGame = 0;
+            unsigned long lastGameInput = millis();
+
+            auto renderGameMenu = [&]() {
+              const char* gameOptions[] = {"Flappy Pet", "Pickle Practice", "Multiplayer", "Back"};
+              display.clear();
+              display.setFont(ArialMT_Plain_10);
+              display.setTextAlignment(TEXT_ALIGN_LEFT);
+              display.drawString(0, 0, "Choose game");
+              display.drawLine(0, 12, 127, 12);
+              for (int i = 0; i < 4; i++) {
+                display.drawString(4, 15 + i * 12,
+                  String(i == selectedGame ? "> " : "  ") + gameOptions[i]);
+              }
+              display.display();
+            };
+            renderGameMenu();
+
+            while (inGameMenu && millis() - lastGameInput < 30000) {
+              bool gameButtonDown = digitalRead(BUTTON_PIN_PRG) == LOW ||
+                                    digitalRead(BUTTON_PIN_EXTERNAL) == LOW;
+              if (gameButtonDown && !buttonPressed) {
+                buttonPressed = true;
+                buttonPressTime = millis();
+              }
+              if (!gameButtonDown && buttonPressed) {
+                unsigned long duration = millis() - buttonPressTime;
+                buttonPressed = false;
+                lastGameInput = millis();
+                if (duration <= SHORT_PRESS_MAX) {
+                  selectedGame = (selectedGame + 1) % 4;
+                  playButtonChirp();
+                  renderGameMenu();
+                } else if (duration >= HOLD_PRESS_MIN && duration < VERY_LONG_PRESS) {
+                  playMenuSelectTone();
+                  inGameMenu = false;
+                  if (selectedGame == 0) {
+                    handleLightningGame(display);
+                  } else if (selectedGame == 1) {
+                    handlePickleballPractice(display);
+                  } else if (selectedGame == 2) {
+#ifdef WOKWI_SIMULATOR
+                    display.clear();
+                    display.setTextAlignment(TEXT_ALIGN_CENTER);
+                    display.drawString(64, 22, "Multiplayer needs");
+                    display.drawString(64, 38, "physical devices");
+                    display.display();
+                    delay(1800);
+#else
+                    handlePickleballGame(display);
+#endif
+                  }
+                }
+              }
+              esp_task_wdt_reset();
+              delay(20);
+            }
             int batteryPct = getBatteryPercentage();
             renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);
                   } else if (selectedOption == 2) {
@@ -1553,8 +1696,20 @@
       }
     }
     
-    // Let system tasks run (prevents WiFi stack from blocking)
-    yield();
+    // When both OLED and radio are off, light-sleep the CPU between button
+    // scans. The 100 ms timer keeps wake latency human-imperceptible and avoids
+    // the reliability risk of deep sleep while still removing most idle CPU
+    // draw. Wokwi omits this because it validates behavior, not current draw.
+#ifndef WOKWI_SIMULATOR
+    if (isDisplayOff && WiFi.getMode() == WIFI_OFF) {
+      esp_sleep_enable_timer_wakeup(100000);
+      esp_light_sleep_start();
+    } else {
+      delay(10);
+    }
+#else
+    delay(10);
+#endif
   }
 
   void playButtonChirp() {

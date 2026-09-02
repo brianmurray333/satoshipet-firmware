@@ -5,7 +5,6 @@
 #define BUTTON_PIN_EXTERNAL 2 // External button (active LOW with pull-up)
 #endif
 
-#include <heltec.h>
 #include <Wire.h>
 #include <esp_task_wdt.h>
 #include "pet_blob.h"
@@ -471,30 +470,39 @@ void updatePetMood(int price, int sats) {
 
 PetStats petStats = {50, 50, 0, false, 0, 0, 0}; // happiness, fullness, age, sleeping, lastFeed, lastActivity, lastUpdate (7 values total)
 
+static float hungerDecayRemainder = 0.0f;
+static float happinessDecayRemainder = 0.0f;
+
+static void applyDecayForMilliseconds(unsigned long elapsedMs) {
+  if (elapsedMs == 0) return;
+  const float days = (float)elapsedMs / 86400000.0f;
+  hungerDecayRemainder += economyConfig.hungerDecayPer24h * days;
+  happinessDecayRemainder += economyConfig.happinessDecayPer24h * days;
+
+  const int hungerPoints = (int)hungerDecayRemainder;
+  const int happinessPoints = (int)happinessDecayRemainder;
+  hungerDecayRemainder -= hungerPoints;
+  happinessDecayRemainder -= happinessPoints;
+  petStats.fullness = max(0, petStats.fullness - hungerPoints);
+  petStats.happiness = max(0, petStats.happiness - happinessPoints);
+}
+
 void updatePetStats(int newBalance, int oldBalance) {
   unsigned long now = millis();
   
   // Note: Earning sats no longer automatically feeds pet
   // Pet feeding must be done manually via menu
   
-  // Entropy/decay over time: fullness decreases, happiness decreases
-  // Update every 5 minutes (300000ms) for smooth decay
-  if (now - petStats.lastUpdate > 300000) { // 5 minutes
-    unsigned long elapsedMinutes = (now - petStats.lastUpdate) / 60000;
+  // Accumulate fractional decay. The old five-minute integer calculation always
+  // truncated 0.05 * 5 to zero and then reset the timer, effectively disabling decay.
+  if (petStats.lastUpdate == 0) petStats.lastUpdate = now;
+  if (now - petStats.lastUpdate >= 60000) {
+    unsigned long elapsedMs = now - petStats.lastUpdate;
     
     int oldFullness = petStats.fullness;
     int oldHappiness = petStats.happiness;
     
-    // Fullness decreases over time (0.05 per minute = 72 points/day)
-    petStats.fullness = max(0, petStats.fullness - (int)(elapsedMinutes * 0.05));
-    
-    // Happiness decreases over time (0.05 per minute = 72 points/day)
-    petStats.happiness = max(0, petStats.happiness - (int)(elapsedMinutes * 0.05));
-    
-    // If fullness is low, happiness decreases faster
-    if (petStats.fullness < 30) {
-      petStats.happiness = max(0, petStats.happiness - (int)(elapsedMinutes * 0.05));
-    }
+    applyDecayForMilliseconds(elapsedMs);
     
     petStats.lastUpdate = now;
     
@@ -1373,7 +1381,7 @@ static void playHighScoreCelebrationTone() {
   }
 }
 
-static void playGameOverWomp() {
+void playGameOverWomp() {
   int melody[] = { 392, 330, 262 };
   int durations[] = { 200, 220, 300 };
 
@@ -1845,11 +1853,17 @@ int handleLightningGame(SSD1306Wire &display) {
   GameScoreResponse leaderboardResponse;
   bool leaderboardSuccess = false;
 
+  #ifdef WOKWI_SIMULATOR
+  // Simulator runs must be deterministic and never write test scores to the
+  // production service.
+  leaderboardSuccess = false;
+  #else
   if (ganamosConfig.deviceId.length() > 0) {
     leaderboardSuccess = submitGameScore(score, leaderboardResponse);
   } else {
     Serial.println("Skipping leaderboard submission - missing deviceId");
   }
+  #endif
 
   // Check if score made it into top 5 global leaderboard
   if (leaderboardSuccess && leaderboardResponse.isNewHighScore) {
@@ -1915,17 +1929,194 @@ int handleLightningGame(SSD1306Wire &display) {
   return happinessIncrease;
 }
 
+int handlePickleballArcadePrototype(SSD1306Wire &display) {
+  Serial.println("Starting Pickleball Practice!");
+
+  DebouncedButton hitExternal;
+  hitExternal.pin = BUTTON_PIN_EXTERNAL;
+  hitExternal.begin();
+  DebouncedButton hitPrg;
+  hitPrg.pin = BUTTON_PIN_PRG;
+  hitPrg.begin();
+
+  const int paddleWidth = 22;
+  const int paddleHeight = 3;
+  const int playerY = 58;
+  const int cpuY = 10;
+  const unsigned long matchLimitMs = 45000;
+  float playerX = 53.0f;
+  float playerVelocity = 1.15f;
+  float cpuX = 53.0f;
+  float ballX = 64.0f;
+  float ballY = 34.0f;
+  float ballVX = 0.65f;
+  float ballVY = 1.05f;
+  int playerScore = 0;
+  int cpuScore = 0;
+  unsigned long started = millis();
+  unsigned long lastFrame = started;
+
+  auto resetServe = [&](bool towardPlayer) {
+    ballX = 64.0f;
+    ballY = 34.0f;
+    ballVX = random(0, 2) ? 0.65f : -0.65f;
+    ballVY = towardPlayer ? 1.05f : -1.05f;
+    delay(350);
+  };
+
+  display.clear();
+  display.setTextAlignment(TEXT_ALIGN_CENTER);
+  display.setFont(ArialMT_Plain_16);
+  display.drawString(64, 10, "Pickle Practice");
+  display.setFont(ArialMT_Plain_10);
+  display.drawString(64, 34, "Paddle auto-moves");
+  display.drawString(64, 48, "Press near ball to hit");
+  display.display();
+  delay(1200);
+  (void)hitExternal.justPressed();
+  (void)hitPrg.justPressed();
+
+  while (playerScore < 5 && cpuScore < 5 && millis() - started < matchLimitMs) {
+    unsigned long now = millis();
+    float dt = (now - lastFrame) / 40.0f;
+    if (dt < 0.5f) dt = 0.5f;
+    if (dt > 2.0f) dt = 2.0f;
+    lastFrame = now;
+
+    playerX += playerVelocity * dt;
+    if (playerX <= 1 || playerX + paddleWidth >= 127) {
+      playerVelocity = -playerVelocity;
+      playerX = constrain(playerX, 1.0f, 127.0f - paddleWidth);
+    }
+
+    // CPU tracks with a capped speed, leaving room for angled shots to win.
+    float cpuTarget = ballX - paddleWidth / 2;
+    float cpuStep = 0.72f * dt;
+    if (cpuX < cpuTarget) cpuX += min(cpuStep, cpuTarget - cpuX);
+    if (cpuX > cpuTarget) cpuX -= min(cpuStep, cpuX - cpuTarget);
+    cpuX = constrain(cpuX, 1.0f, 127.0f - paddleWidth);
+
+    bool hitPressed = hitExternal.justPressed() || hitPrg.justPressed();
+    if (hitPressed && ballVY > 0 && ballY >= playerY - 9 &&
+        ballX >= playerX - 4 && ballX <= playerX + paddleWidth + 4) {
+      ballVY = -abs(ballVY) - 0.04f;
+      ballVX += ((ballX - (playerX + paddleWidth / 2)) / paddleWidth) * 0.9f;
+      ballVX = constrain(ballVX, -1.8f, 1.8f);
+      tone(BUZZER_PIN, 1050, 30);
+    }
+
+    ballX += ballVX * dt;
+    ballY += ballVY * dt;
+    if (ballX <= 2 || ballX >= 125) {
+      ballVX = -ballVX;
+      ballX = constrain(ballX, 2.0f, 125.0f);
+    }
+
+    if (ballVY < 0 && ballY <= cpuY + paddleHeight &&
+        ballX >= cpuX && ballX <= cpuX + paddleWidth) {
+      ballVY = abs(ballVY) + 0.025f;
+      ballVX += ((ballX - (cpuX + paddleWidth / 2)) / paddleWidth) * 0.45f;
+    }
+
+    if (ballY < 3) {
+      playerScore++;
+      Serial.println("Pickleball point: player " + String(playerScore) + "-" + String(cpuScore));
+      resetServe(false);
+    } else if (ballY > 63) {
+      cpuScore++;
+      Serial.println("Pickleball point: CPU " + String(playerScore) + "-" + String(cpuScore));
+      resetServe(true);
+    }
+
+    display.clear();
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.drawString(2, 0, "CPU " + String(cpuScore));
+    display.setTextAlignment(TEXT_ALIGN_RIGHT);
+    display.drawString(126, 0, "YOU " + String(playerScore));
+    display.drawLine(0, 32, 127, 32);
+    for (int x = 4; x < 128; x += 12) display.drawLine(x, 31, x + 5, 31);
+    display.fillRect((int)cpuX, cpuY, paddleWidth, paddleHeight);
+    display.fillRect((int)playerX, playerY, paddleWidth, paddleHeight);
+    display.fillCircle((int)ballX, (int)ballY, 2);
+    display.display();
+
+    esp_task_wdt_reset();
+    delay(40); // 25 FPS is responsive and much cheaper than the Flappy 60 FPS loop.
+  }
+
+  noTone(BUZZER_PIN);
+  bool won = playerScore > cpuScore;
+  Serial.println("Pickleball practice complete! Score: " + String(playerScore) + "-" + String(cpuScore));
+  display.clear();
+  display.setTextAlignment(TEXT_ALIGN_CENTER);
+  display.setFont(ArialMT_Plain_16);
+  display.drawString(64, 12, won ? "You win!" : "Practice over");
+  display.setFont(ArialMT_Plain_10);
+  display.drawString(64, 36, "YOU " + String(playerScore) + " - " + String(cpuScore) + " CPU");
+  display.drawString(64, 52, "Offline / no wager");
+  display.display();
+  delay(1800);
+  return playerScore;
+}
+
 // Pet stats persistence functions (stubs - stats already managed in updatePetStats)
+static constexpr uint32_t PET_STATE_MAGIC = 0x50545632; // "PTV2"
+static constexpr uint16_t PET_STATE_VERSION = 2;
+
+struct PetStateV2 {
+  uint32_t magic;
+  uint16_t version;
+  int16_t happiness;
+  int16_t fullness;
+  uint32_t savedEpoch;
+  uint32_t checksum;
+};
+
+static uint32_t petStateChecksum(const PetStateV2& state) {
+  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&state);
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; i < sizeof(state) - sizeof(state.checksum); ++i) {
+    hash ^= bytes[i];
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
 void loadPetStats() {
   extern Preferences preferences;
-  preferences.begin("satoshi-pet", false);
-  
-  // Load happiness and fullness from NVS (default to 50 if not found)
-  petStats.happiness = preferences.getInt("happiness", 50);
-  petStats.fullness = preferences.getInt("fullness", 50);
-  unsigned long lastSaveEpoch = preferences.getULong("lastSaveEpoch", 0);
-  
+  preferences.begin("satoshi-pet", true);
+
+  PetStateV2 state = {};
+  const size_t stateLength = preferences.getBytesLength("petStateV2");
+  const bool validState = stateLength == sizeof(state) &&
+                          preferences.getBytes("petStateV2", &state, sizeof(state)) == sizeof(state) &&
+                          state.magic == PET_STATE_MAGIC &&
+                          state.version == PET_STATE_VERSION &&
+                          state.happiness >= 0 && state.happiness <= 100 &&
+                          state.fullness >= 0 && state.fullness <= 100 &&
+                          state.checksum == petStateChecksum(state);
+
+  unsigned long lastSaveEpoch = 0;
+  if (validState) {
+    petStats.happiness = state.happiness;
+    petStats.fullness = state.fullness;
+    lastSaveEpoch = state.savedEpoch;
+  } else if (stateLength == 0) {
+    // One-time migration from the original independent keys.
+    petStats.happiness = constrain(preferences.getInt("happiness", 50), 0, 100);
+    petStats.fullness = constrain(preferences.getInt("fullness", 50), 0, 100);
+    lastSaveEpoch = preferences.getULong("lastSaveEpoch", 0);
+  } else {
+    // A partial/corrupt state must not create impossible pet values.
+    petStats.happiness = 50;
+    petStats.fullness = 50;
+    Serial.println("Pet stats: corrupt state rejected; using safe defaults");
+  }
+
   preferences.end();
+
+  if (!validState) savePetStats();
   
   Serial.println("📊 Loaded pet stats from flash:");
   Serial.println("  Happiness: " + String(petStats.happiness));
@@ -1944,22 +2135,14 @@ void loadPetStats() {
         
         Serial.println("⏰ Device was offline for " + String(elapsedMinutes) + " minutes");
         
-        // Apply fullness decay (0.05 per minute)
-        int fullnessDecay = (int)(elapsedMinutes * 0.05);
         int oldFullness = petStats.fullness;
-        petStats.fullness = max(0, petStats.fullness - fullnessDecay);
-        
-        // Apply happiness decay (0.05 per minute)
-        int happinessDecay = (int)(elapsedMinutes * 0.05);
         int oldHappiness = petStats.happiness;
-        petStats.happiness = max(0, petStats.happiness - happinessDecay);
-        
-        // If fullness is low, apply additional happiness decay
-        if (petStats.fullness < 30) {
-          int extraDecay = (int)(elapsedMinutes * 0.05);
-          petStats.happiness = max(0, petStats.happiness - extraDecay);
-          Serial.println("⚠️ Low fullness - extra happiness decay applied");
-        }
+        // More than 30 days already takes both meters to zero at current rates;
+        // cap the conversion so seconds-to-milliseconds cannot overflow uint32_t.
+        const unsigned long cappedSeconds = min((unsigned long)elapsedSeconds, 30UL * 86400UL);
+        applyDecayForMilliseconds(cappedSeconds * 1000UL);
+        int fullnessDecay = oldFullness - petStats.fullness;
+        int happinessDecay = oldHappiness - petStats.happiness;
         
         Serial.println("📉 Offline decay applied:");
         Serial.println("  Fullness: " + String(oldFullness) + " → " + String(petStats.fullness) + " (-" + String(fullnessDecay) + ")");
@@ -1989,12 +2172,19 @@ void savePetStats() {
     now = mktime(&timeinfo);
   }
   
-  // Save happiness, fullness, and current epoch timestamp to NVS
-  preferences.putInt("happiness", petStats.happiness);
-  preferences.putInt("fullness", petStats.fullness);
-  preferences.putULong("lastSaveEpoch", (unsigned long)now);
+  PetStateV2 state = {};
+  state.magic = PET_STATE_MAGIC;
+  state.version = PET_STATE_VERSION;
+  state.happiness = constrain(petStats.happiness, 0, 100);
+  state.fullness = constrain(petStats.fullness, 0, 100);
+  state.savedEpoch = (unsigned long)now;
+  state.checksum = petStateChecksum(state);
+
+  const size_t written = preferences.putBytes("petStateV2", &state, sizeof(state));
   
   preferences.end();
+
+  if (written != sizeof(state)) Serial.println("Pet stats: incomplete NVS write");
   
   Serial.println("💾 Saved pet stats to flash:");
   Serial.println("  Happiness: " + String(petStats.happiness));
@@ -2003,7 +2193,5 @@ void savePetStats() {
 }
 
 void applyTimeBasedDecay() {
-  // Time-based decay is handled by updatePetStats when rendering
-  // This stub exists for compatibility
-  Serial.println("applyTimeBasedDecay() called (decay handled by updatePetStats)");
+  updatePetStats(0, 0);
 }

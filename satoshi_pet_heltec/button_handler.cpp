@@ -29,6 +29,7 @@ bool updateButtonState(ButtonState& state) {
   // Detect button release (transition from pressed to not pressed)
   if (!currentButtonState && state.pressed) {
     state.pressed = false;
+    state.lastPress = millis();
     return true; // State changed
   }
   
@@ -70,4 +71,3 @@ bool wasPrgPressed(const ButtonState& state) {
 bool wasExternalPressed(const ButtonState& state) {
   return state.externalPressed;
 }
-
