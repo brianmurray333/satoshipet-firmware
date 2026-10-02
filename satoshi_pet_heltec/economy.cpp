@@ -257,7 +257,7 @@ int syncPendingSpends() {
   
   client->setInsecure();
   client->setTimeout(5000);
-  client->setHandshakeTimeout(5000);
+  client->setHandshakeTimeout(5);
   
   for (int i = 0; i < pendingSpendCount; i++) {
     // Feed watchdog at start of each sync attempt
@@ -580,7 +580,7 @@ int syncPendingGameScores() {
     
     client->setInsecure();
     client->setTimeout(5000);
-    client->setHandshakeTimeout(5000);
+    client->setHandshakeTimeout(5);
     
     HTTPClient http;
     String url = "https://www.ganamos.earth/api/device/game-score?deviceId=" + ganamosConfig.deviceId;

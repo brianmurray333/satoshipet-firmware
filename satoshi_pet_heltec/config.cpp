@@ -97,7 +97,7 @@ bool fetchJobs() {
   
   client->setInsecure();
   client->setTimeout(5000);
-  client->setHandshakeTimeout(5000);
+  client->setHandshakeTimeout(5);
   
   String url = "https://www.ganamos.earth/api/device/jobs?deviceId=" + ganamosConfig.deviceId;
   
@@ -202,7 +202,7 @@ bool fetchGanamosConfig() {
   // Configure SSL client with shorter timeout to prevent watchdog resets
   client->setInsecure();  // Skip certificate validation
   client->setTimeout(5000); // 5 second timeout (reduced from 10s to prevent watchdog)
-  client->setHandshakeTimeout(5000); // 5 second SSL handshake timeout
+  client->setHandshakeTimeout(5); // 5 second SSL handshake timeout
   
   // Build URL using hostname (DNS is now resolved)
   // Strategy: Try deviceId first (most reliable, never changes), then fallback to pairingCode
@@ -258,7 +258,7 @@ bool fetchGanamosConfig() {
     }
     client->setInsecure();
     client->setTimeout(5000);
-    client->setHandshakeTimeout(5000);
+    client->setHandshakeTimeout(5);
     
     delay(100);
     if (!http.begin(*client, url)) {
@@ -488,7 +488,7 @@ bool spendCoins(int amount, String action) {
   // Configure SSL client
   client->setInsecure();  // Skip certificate validation
   client->setTimeout(5000); // 5 second timeout (reduced from 10s)
-  client->setHandshakeTimeout(5000);  // 5 second handshake timeout
+  client->setHandshakeTimeout(5);  // 5 second handshake timeout
   
   String url = "https://www.ganamos.earth/api/device/spend-coins?deviceId=" + ganamosConfig.deviceId;
   
@@ -575,7 +575,7 @@ bool submitGameScore(int score, GameScoreResponse &response) {
   }
   client->setInsecure();
   client->setTimeout(5000);
-  client->setHandshakeTimeout(5000);
+  client->setHandshakeTimeout(5);
 
   HTTPClient http;
   String url = "https://www.ganamos.earth/api/device/game-score?deviceId=" + ganamosConfig.deviceId;
@@ -705,7 +705,7 @@ bool markJobComplete(String jobId) {
   
   client->setInsecure();
   client->setTimeout(5000);
-  client->setHandshakeTimeout(5000);
+  client->setHandshakeTimeout(5);
   
   String url = "https://www.ganamos.earth/api/device/job-complete?deviceId=" + ganamosConfig.deviceId;
   

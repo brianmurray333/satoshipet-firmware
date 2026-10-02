@@ -14,6 +14,7 @@
   #include <esp_task_wdt.h>  // Watchdog timer support (framework auto-initializes)
   #include <esp_idf_version.h>
   #include <esp_sleep.h>
+  #include <driver/gpio.h>
 
   // Keep declarations explicit so this sketch builds consistently with both
   // Arduino IDE and non-IDE toolchains such as PlatformIO/Wokwi.
@@ -27,6 +28,9 @@
   void handleFactoryReset();
   void playButtonChirp();
   void playMenuSelectTone();
+  void VextON();
+  void playDeathSound();
+  void playSadSound();
 
   // Debug logging - comment out to disable verbose logs and save memory
   // #define DEBUG_LOGGING
@@ -91,6 +95,8 @@
   const unsigned long DEFAULT_UPDATE_INTERVAL = 60000; // Default to one poll/minute to reduce radio wakeups
   const unsigned long MIN_UPDATE_INTERVAL = 60000;     // Never let server config create a battery-heavy poll loop
   bool buttonPressed = false;
+  bool consumeButtonUntilRelease = false;
+  bool lastSyncSucceeded = false;
   unsigned long buttonPressTime = 0;
   unsigned long lastButtonPress = 0;
   bool hadSavedConfigOnBoot = false; // Track if we loaded saved config on boot
@@ -127,9 +133,9 @@
   const unsigned long SCREENSAVER_DISPLAY_OFF_TIMEOUT = 45000;
   const unsigned long BATTERY_CHECK_INTERVAL = 5000;
 #else
-  const unsigned long SCREENSAVER_TIMEOUT = 180000; // 3 minutes of inactivity → animated screensaver
-  const unsigned long BITCOIN_FACTS_TIMEOUT = 220000; // 3.67 minutes → Bitcoin facts screen
-  const unsigned long SCREENSAVER_DISPLAY_OFF_TIMEOUT = 280000; // 4.67 minutes total → display OFF
+  const unsigned long SCREENSAVER_TIMEOUT = 30000; // Dim after 30 seconds
+  const unsigned long BITCOIN_FACTS_TIMEOUT = 45000; // Brief facts screen
+  const unsigned long SCREENSAVER_DISPLAY_OFF_TIMEOUT = 60000; // Off after one minute
   const unsigned long BATTERY_CHECK_INTERVAL = 60000;
 #endif
   float cachedBatteryVoltage = 0.0f;
@@ -148,9 +154,45 @@
   unsigned long lowBatteryWarningStartTime = 0;
   bool lowBatteryAlertPlayed = false; // Prevent repeated alerts
 
-  const unsigned long SHORT_PRESS_MAX = 600;
   const unsigned long HOLD_PRESS_MIN = 700;
+  const unsigned long SHORT_PRESS_MAX = HOLD_PRESS_MIN - 1;
   const unsigned long VERY_LONG_PRESS = 10000; // 10 seconds to prevent accidental factory reset
+
+  bool notificationActive = false;
+  bool notificationReturnToSleep = false;
+  unsigned long notificationStarted = 0;
+  const unsigned long NOTIFICATION_DURATION = 6000;
+  int petWarning = 0;
+
+  void wakeForNotification() {
+    notificationReturnToSleep |= isScreensaverActive || isDisplayOff;
+    notificationActive = true;
+    notificationStarted = millis();
+    if (isDisplayOff) {
+      VextON();
+      delay(100);
+      display.init();
+    }
+    isDisplayOff = isScreensaverActive = isBitcoinFactsActive = false;
+    setOLEDContrast(NORMAL_BRIGHTNESS);
+  }
+
+  void renderHoldProgress() {
+    if (!buttonPressed) return;
+    static unsigned long lastFrame = 0;
+    unsigned long now = millis();
+    if (now - lastFrame < 50) return;
+    lastFrame = now;
+    unsigned long elapsed = now - buttonPressTime;
+    display.setColor(BLACK);
+    display.fillRect(0, 49, 128, 15);
+    display.setColor(WHITE);
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(64, 49, elapsed < HOLD_PRESS_MIN ? "Hold to select" : "Release to select");
+    display.fillRect(0, 63, min(128UL, elapsed * 128 / HOLD_PRESS_MIN), 1);
+    display.display();
+  }
 
   int getBatteryPercentage() {
     float voltage = getBatteryVoltage();
@@ -207,11 +249,10 @@
     else return 0;                     // Critical
   }
 
-  // Returns true if battery appears to be charging (USB connected)
+  // Charging detection requires a hardware status signal, not a voltage guess.
   bool isBatteryCharging() {
-    float voltage = getBatteryVoltage();
-    // If voltage >= 4.1V, likely charging or nearly full on USB power
-    return voltage >= 4.1;
+    // Voltage alone cannot distinguish a full battery from active charging.
+    return false;
   }
 
   // Helper function to read battery once
@@ -292,6 +333,7 @@
   }
 
   void playSatsEarnedSound() {
+    if (isQuietHours()) return;
     // Uplifting 8-bit style melody for earning sats
     int melody[] = {523, 587, 659, 784, 880, 1047};
     int durations[] = {100, 100, 100, 150, 150, 300};
@@ -696,6 +738,11 @@
     }
     // Initialize buttons using button_handler module
     initButtons();
+#ifndef WOKWI_SIMULATOR
+    gpio_wakeup_enable((gpio_num_t)BUTTON_PIN_PRG, GPIO_INTR_LOW_LEVEL);
+    gpio_wakeup_enable((gpio_num_t)BUTTON_PIN_EXTERNAL, GPIO_INTR_LOW_LEVEL);
+    esp_sleep_enable_gpio_wakeup();
+#endif
     
     // Quick battery test before main loop starts
     Serial.println("\n=== Battery Quick Test ===");
@@ -755,9 +802,26 @@
     static unsigned long lastLoopDebug = 0;
     static unsigned long lastLoopTime = 0;
     unsigned long now = millis();
+    if (notificationActive && now - notificationStarted >= NOTIFICATION_DURATION) {
+      notificationActive = false;
+      petWarning = 0;
+      isLowBatteryWarningActive = false;
+      showCelebration = false;
+      showNewJobNotification = false;
+      showRejection = false;
+      digitalWrite(RGB_LED, LOW);
+      if (notificationReturnToSleep) {
+        isDisplayOff = isScreensaverActive = true;
+        isBitcoinFactsActive = false;
+        VextOFF();
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+      }
+      notificationReturnToSleep = false;
+    }
     
     // Warn if loop is running slowly (taking more than 500ms between iterations)
-    if (lastLoopTime > 0 && (now - lastLoopTime) > 500) {
+    if (!isDisplayOff && lastLoopTime > 0 && (now - lastLoopTime) > 500) {
       Serial.print(F("SLOW LOOP: "));
       Serial.print(now - lastLoopTime);
       Serial.println(F("ms since last iteration"));
@@ -788,14 +852,7 @@
       if (cachedBatteryPct <= 10 && !lowBatteryAlertPlayed && !isLowBatteryWarningActive) {
         Serial.println("🔋 LOW BATTERY WARNING - waking display to show warning");
         
-        // Wake display if needed
-        if (isDisplayOff) {
-          VextON();
-          delay(100);
-          display.init();
-          display.setFont(ArialMT_Plain_10);
-          display.setTextAlignment(TEXT_ALIGN_LEFT);
-        }
+        wakeForNotification();
         
         // Enter low battery warning mode
         isLowBatteryWarningActive = true;
@@ -813,21 +870,13 @@
       }
     }
     
-    // Handle low battery warning timeout (60 seconds) - return to normal mode
-    if (isLowBatteryWarningActive && (now - lowBatteryWarningStartTime > 60000)) {
-      Serial.println("🔋 Low battery warning complete - returning to normal mode");
-      isLowBatteryWarningActive = false;
-      // Just return to normal pet screen, don't enter ultra-low-power yet
-      renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, cachedBatteryPct);
-    }
-    
     // Enter ultra-low-power mode only at 5% (critical battery)
     // BUT only if user hasn't interacted recently - let normal screensaver flow handle sleep
     // This ensures button press always wakes device for full timeout period
     if (cachedBatteryPct <= 5 && !isDisplayOff && !isLowBatteryWarningActive) {
       // Only force low-power if we've already gone through the screensaver timeout
       // (i.e., user hasn't pressed a button recently)
-      if (now - lastButtonPress > SCREENSAVER_DISPLAY_OFF_TIMEOUT) {
+      if (!notificationActive && !inMenuMode && now - lastButtonPress > SCREENSAVER_DISPLAY_OFF_TIMEOUT) {
         Serial.println("🔋 CRITICAL BATTERY (5%) - entering ultra-low-power mode");
         isScreensaverActive = true;
         isDisplayOff = true;
@@ -844,10 +893,11 @@
     }
     
     // Multi-stage sleep transition: screensaver → facts → display OFF
-      if (!isScreensaverActive && (now - lastButtonPress > SCREENSAVER_TIMEOUT)) {
+      if (!notificationActive && !inMenuMode && !buttonPressed && !isScreensaverActive && (now - lastButtonPress > SCREENSAVER_TIMEOUT)) {
       isScreensaverActive = true;
       isBitcoinFactsActive = false;
       isDisplayOff = false;
+      setOLEDContrast(DIM_BRIGHTNESS);
       // Enable WiFi power saving when idle (saves 20-40mA)
       if (WiFi.status() == WL_CONNECTED) {
         WiFi.setSleep(true);
@@ -857,7 +907,7 @@
   #endif
     }
     
-    // After 40 seconds in screensaver, show Bitcoin facts
+    // Briefly show facts before display-off.
     if (isScreensaverActive && !isBitcoinFactsActive && !isDisplayOff && (now - lastButtonPress > BITCOIN_FACTS_TIMEOUT)) {
       isBitcoinFactsActive = true;
       bitcoinFactsStartTime = now;
@@ -871,7 +921,7 @@
   #endif
     }
     
-    // After 60 seconds of facts, turn display completely OFF
+    // End the idle display period.
     if (isBitcoinFactsActive && !isDisplayOff && (now - lastButtonPress > SCREENSAVER_DISPLAY_OFF_TIMEOUT)) {
       isDisplayOff = true;
       VextOFF();  // Turn display OFF completely to save power
@@ -989,11 +1039,20 @@
       if (now - lastUpdate > updateInterval) {
         lastUpdate = now;
         unsigned long fetchStart = millis();
+        // Always restore idle radio state, including early returns and HTTP errors.
+        struct IdleRadioCleanup {
+          bool wasSleeping;
+          ~IdleRadioCleanup() {
+            if (wasSleeping) {
+              WiFi.disconnect(true);
+              WiFi.mode(WIFI_OFF);
+            }
+          }
+        } radioCleanup{isDisplayOff};
         
-        // Non-blocking WiFi reconnection during screensaver
-        // WiFi.begin() starts background reconnection, doesn't block
-        // If not connected yet, we skip this fetch and try next cycle
-              if (WiFi.status() != WL_CONNECTED) {
+        // Reconnect and fetch in this same cycle; never leave the radio waiting
+        // for the next five-minute poll after a successful connection.
+        if (WiFi.status() != WL_CONNECTED) {
           unsigned long backoffDelay = getWifiBackoffDelay();
           
           // Check if enough time has passed since last attempt
@@ -1029,13 +1088,14 @@
           if (WiFi.status() == WL_CONNECTED) {
             Serial.println(F("✅ WiFi reconnected!"));
             wifiReconnectAttempts = 0;
+            WiFi.setSleep(true);
           } else {
             Serial.println(F("❌ WiFi reconnect failed"));
             WiFi.disconnect(true);
             WiFi.mode(WIFI_OFF);  // Turn off to save power between attempts
+            lastSyncSucceeded = false;
+            return;
           }
-          
-          return;  // Skip to next loop iteration
         } else {
           // Connected - reset retry counter
           if (wifiReconnectAttempts > 0) {
@@ -1046,6 +1106,7 @@
         
         extern int getLastHttpCode();
         bool fetchSuccess = fetchGanamosConfig();
+        lastSyncSucceeded = fetchSuccess;
         
         // Log fetch timing
         unsigned long fetchTime = millis() - fetchStart;
@@ -1139,26 +1200,9 @@
           updatePetMood(ganamosConfig.btcPrice, ganamosConfig.balance);
           cachedBatteryPct = getBatteryPercentage(); // Update cached battery value
           
-          // Check for balance increase (wake from screensaver/facts if needed)
-            if (ganamosConfig.balance > lastBalance && (isScreensaverActive || isBitcoinFactsActive)) {
-            // Balance increased! Wake from sleep mode
-            isScreensaverActive = false;
-            isBitcoinFactsActive = false;
-            if (isDisplayOff) {
-              // Display was completely off, turn it back on
-              VextON();  // Turn display back on
-              delay(100);  // Wait for display to stabilize
-              display.init();
-              display.setFont(ArialMT_Plain_10);
-              display.setTextAlignment(TEXT_ALIGN_LEFT);
-              Serial.println("💰 Balance increased - waking from display OFF!");
-            } else {
-              Serial.println("💰 Balance increased - waking from animated screensaver!");
-            }
-            // Keep modem sleep enabled; it preserves the connection and UI input
-            // remains local, so disabling it only increases idle battery drain.
-            if (WiFi.status() == WL_CONNECTED) WiFi.setSleep(true);
-            isDisplayOff = false;
+          // Preserve the idle state before the celebration renderer wakes us.
+          if (ganamosConfig.balance > lastBalance && isScreensaverActive) {
+            wakeForNotification();
           }
           lastBalance = ganamosConfig.balance;
 
@@ -1171,67 +1215,13 @@
               triggerRejection(ganamosConfig.rejectionMessage);
               }
           
-          // Check for critical pet states (sad/dying) - wake if needed
-          extern PetStats petStats;
-          if ((isScreensaverActive || isBitcoinFactsActive || isDisplayOff)) {
-            if (petStats.fullness == 0 && petStats.happiness == 0) {
-              // Pet died! Wake immediately and alert
-              Serial.println("💀 CRITICAL: Pet died! Waking from sleep mode");
-              isScreensaverActive = false;
-              isBitcoinFactsActive = false;
-              
-              if (isDisplayOff) {
-                VextON();
-                delay(100);
-                display.init();
-              }
-              isDisplayOff = false;
-              
-              // Play death sound and show warning
-              extern void playDeathSound();
-              playDeathSound();
-              renderDeathWarning(display, ganamosConfig.petName);
-              
-            } else if (petStats.fullness < 20 || petStats.happiness < 20) {
-              // Pet became sad! Wake and alert
-              Serial.println("😢 ALERT: Pet needs attention! Waking from sleep mode");
-              isScreensaverActive = false;
-              isBitcoinFactsActive = false;
-              
-              if (isDisplayOff) {
-                VextON();
-                delay(100);
-                display.init();
-              }
-              isDisplayOff = false;
-              
-              // Play sad sound and show appropriate warning
-              extern void playSadSound();
-              playSadSound();
-              
-              // Show hunger warning if fullness is low, otherwise sadness warning
-              if (petStats.fullness < 20) {
-                renderHungerWarning(display, ganamosConfig.petName, petStats.fullness);
-              } else {
-                renderSadnessWarning(display, ganamosConfig.petName, petStats.happiness);
-              }
-            }
-          }
-          
-          // Disconnect WiFi again after poll to save power (if still in screensaver)
-          if (isScreensaverActive && isDisplayOff) {
-            Serial.println("📡 Disconnecting WiFi to save power...");
-            WiFi.disconnect(true);
-            WiFi.mode(WIFI_OFF);
-          }
-          
           // Render based on power saving mode
           if (isDisplayOff) {
             // Display is completely OFF - just log (maximum power saving)
             // DO NOT RENDER - display is powered off
             Serial.println("💤💤 Display OFF: Balance=" + String(ganamosConfig.balance) + " Battery=" + String(cachedBatteryPct) + "%");
           } else if (isLowBatteryWarningActive) {
-            // Low battery warning mode - keep showing warning for 60 seconds
+            // Low battery warning shares the brief notification timeout
             renderLowBatteryWarning(display, cachedBatteryPct);
           } else if (isBitcoinFactsActive && !isDisplayOff) {
             // Bitcoin facts mode - rotate through 3 facts (20 seconds each)
@@ -1263,6 +1253,19 @@
         lastDecayCheck = now;
       }
       
+      static int lastPetWarning = 0;
+      int warning = petStats.fullness == 0 && petStats.happiness == 0 ? 3
+        : petStats.fullness < 20 ? 1 : petStats.happiness < 20 ? 2 : 0;
+      if (warning != lastPetWarning) {
+        lastPetWarning = warning;
+        if (warning && isScreensaverActive && !notificationActive) {
+          wakeForNotification();
+          petWarning = warning;
+          if (warning == 3) playDeathSound();
+          else playSadSound();
+        }
+      }
+
       // Keep updating the display based on current mode
       extern bool showCelebration;
       extern bool showNewJobNotification;
@@ -1291,6 +1294,12 @@
         if (isDisplayOff) {
           // Display is completely OFF - no rendering needed (maximum power saving)
           // Just skip rendering entirely
+        } else if (isLowBatteryWarningActive) {
+          renderLowBatteryWarning(display, cachedBatteryPct);
+        } else if (petWarning) {
+          if (petWarning == 3) renderDeathWarning(display, ganamosConfig.petName);
+          else if (petWarning == 1) renderHungerWarning(display, ganamosConfig.petName, petStats.fullness);
+          else renderSadnessWarning(display, ganamosConfig.petName, petStats.happiness);
         } else if (showNewJobNotification) {
           // New job notification takes priority
           renderNewJobNotification(display);
@@ -1364,10 +1373,17 @@
     bool externalButtonState = digitalRead(BUTTON_PIN_EXTERNAL) == LOW;
     bool currentButtonState = prgButtonState || externalButtonState;
 
+    if (consumeButtonUntilRelease) {
+      if (!currentButtonState) consumeButtonUntilRelease = false;
+      delay(10);
+      return;
+    }
     if (currentButtonState && !buttonPressed) {
       buttonPressed = true;
       buttonPressTime = millis();
       lastButtonPress = millis();
+      notificationActive = notificationReturnToSleep = false;
+      petWarning = 0;
       if (prgButtonState && externalButtonState) {
         lastButtonSource = BUTTON_SOURCE_BOTH;
         Serial.println(F("Both buttons pressed"));
@@ -1390,6 +1406,7 @@
         
         // Reset button state
         buttonPressed = false;
+        consumeButtonUntilRelease = true;
         lastButtonSource = BUTTON_SOURCE_NONE;
         return; // Skip rest of button handling for this press
       }
@@ -1405,6 +1422,7 @@
         
         // Reset button state
         buttonPressed = false;
+        consumeButtonUntilRelease = true;
         lastButtonSource = BUTTON_SOURCE_NONE;
         return; // Skip rest of button handling for this press
       }
@@ -1431,11 +1449,13 @@
         // Button handling is local, so modem sleep can remain enabled after wake.
         if (WiFi.status() == WL_CONNECTED) WiFi.setSleep(true);
         isDisplayOff = false;
+        setOLEDContrast(NORMAL_BRIGHTNESS);
         int batteryPct = getBatteryPercentage();
         renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);
         Serial.println(F("Wake complete"));
         
         buttonPressed = false;
+        consumeButtonUntilRelease = true;
         lastButtonSource = BUTTON_SOURCE_NONE;
         return;
       }
@@ -1527,6 +1547,7 @@
                 unsigned long duration = millis() - buttonPressTime;
                 buttonPressed = false;
                 lastGameInput = millis();
+                lastButtonPress = lastGameInput;
                 if (duration <= SHORT_PRESS_MAX) {
                   selectedGame = (selectedGame + 1) % 4;
                   playButtonChirp();
@@ -1552,6 +1573,7 @@
                   }
                 }
               }
+              renderHoldProgress();
               esp_task_wdt_reset();
               delay(20);
             }
@@ -1566,6 +1588,7 @@
             renderFoodSelectionMenu(display, selectedFood);
 
             while (inFoodMenu) {
+              esp_task_wdt_reset();
               unsigned long now = millis();
 
               if (now - lastFoodCycle > 30000) { // 30 seconds timeout (was 10)
@@ -1580,6 +1603,7 @@
               if (currentStateFood && !buttonPressed) {
                 buttonPressed = true;
                 buttonPressTime = millis();
+                lastButtonPress = lastFoodCycle = buttonPressTime;
               }
 
               if (!currentStateFood && buttonPressed) {
@@ -1619,6 +1643,7 @@
                 }
               }
 
+              renderHoldProgress();
               delay(45);
             }
 
@@ -1681,7 +1706,7 @@
     }
     
     // Auto-exit menu after 10 seconds of inactivity
-    if (inMenuMode && (millis() - lastMenuCycle > 10000)) {
+    if (inMenuMode && !buttonPressed && (millis() - lastMenuCycle > 10000)) {
       inMenuMode = false;
       int batteryPct = getBatteryPercentage();
       renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);
@@ -1694,15 +1719,15 @@
         renderMenu(display, currentMenuOption);
         lastMenuRender = millis();
       }
+      renderHoldProgress();
     }
     
     // When both OLED and radio are off, light-sleep the CPU between button
-    // scans. The 100 ms timer keeps wake latency human-imperceptible and avoids
-    // the reliability risk of deep sleep while still removing most idle CPU
-    // draw. Wokwi omits this because it validates behavior, not current draw.
+    // scans. Buttons wake via GPIO; the one-second timer services the watchdog
+    // and scheduled work. RAM is retained. Wokwi cannot validate current draw.
 #ifndef WOKWI_SIMULATOR
     if (isDisplayOff && WiFi.getMode() == WIFI_OFF) {
-      esp_sleep_enable_timer_wakeup(100000);
+      esp_sleep_enable_timer_wakeup(1000000);
       esp_light_sleep_start();
     } else {
       delay(10);
