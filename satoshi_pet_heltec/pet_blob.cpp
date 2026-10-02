@@ -10,6 +10,9 @@
 #include "pet_blob.h"
 #include "config.h"
 #include <WiFi.h>
+#include "economy.h"
+extern void wakeForNotification();
+extern bool lastSyncSucceeded;
 #include "pet_sprites_simple.h"
 #include "display_assets.h"
 #include "food_bitmaps.h"
@@ -153,25 +156,8 @@ void triggerCelebration(int earnedSats, String message = "") {
     Serial.println("Message: " + message);
   }
   
-  // Reset screensaver timer on celebration (keep display bright during activity)
-  extern unsigned long lastButtonPress;
-  extern bool isScreensaverActive;
-  extern uint8_t NORMAL_BRIGHTNESS;
-  extern SSD1306Wire display;
-  
-  lastButtonPress = millis();
-  extern bool isDisplayOff;
-  if (isScreensaverActive) {
-    isScreensaverActive = false;
-    if (isDisplayOff) {
-      // Display wake-up is handled in main loop (VextON + display.init)
-      Serial.println("👁️ Waking from display OFF for celebration");
-    } else {
-      Serial.println("👁️ Waking from animated screensaver for celebration");
-    }
-    isDisplayOff = false;
-  }
-  
+  wakeForNotification();
+
   // Play the celebration sound!
   playSatsEarnedSound();
 }
@@ -184,28 +170,8 @@ void triggerNewJobNotification(String title, int reward) {
   
   Serial.println("📋 NEW JOB! " + title + " (" + String(reward) + " sats)");
   
-  // Reset screensaver timer and wake display
-  extern unsigned long lastButtonPress;
-  extern bool isScreensaverActive;
-  extern bool isDisplayOff;
-  extern bool isBitcoinFactsActive;
-  extern SSD1306Wire display;
-  
-  lastButtonPress = millis();
-  
-  if (isScreensaverActive || isDisplayOff || isBitcoinFactsActive) {
-    isScreensaverActive = false;
-    isBitcoinFactsActive = false;
-    if (isDisplayOff) {
-      extern void VextON(void);
-      VextON();
-      delay(100);
-      display.init();
-      Serial.println("👁️ Waking from display OFF for new job notification");
-    }
-    isDisplayOff = false;
-  }
-  
+  wakeForNotification();
+
   // Play the new job chirp
   extern void playNewJobChirp();
   playNewJobChirp();
@@ -254,19 +220,8 @@ void triggerRejection(String message) {
   rejectionMessage = message;
   Serial.println("❌ FIX REJECTED! " + message);
   
-  // Reset screensaver timer
-  extern unsigned long lastButtonPress;
-  extern bool isScreensaverActive;
-  extern uint8_t NORMAL_BRIGHTNESS;
-  
-  lastButtonPress = millis();
-  if (isScreensaverActive) {
-    isScreensaverActive = false;
-    extern SSD1306Wire display;
-    extern void setOLEDContrast(uint8_t);
-    setOLEDContrast(NORMAL_BRIGHTNESS);
-  }
-  
+  wakeForNotification();
+
   // Play the rejection sound
   playFixRejectedSound();
 }
@@ -682,7 +637,15 @@ void renderPet(SSD1306Wire &display, int btcPrice, int satoshis, int batteryPerc
   display.setTextAlignment(TEXT_ALIGN_LEFT);
   
   // Top left: Pet name
-  display.drawString(0, 0, ganamosConfig.petName);
+  String shortName = ganamosConfig.petName;
+  while (shortName.length() && display.getStringWidth(shortName) > 62) shortName.remove(shortName.length() - 1);
+  display.drawString(0, 0, shortName);
+  const char* syncStatus = WiFi.status() != WL_CONNECTED ? "Offline"
+    : getPendingSpendCount() || getPendingGameScoreCount() ? "Queued"
+    : !lastSyncSucceeded ? "Stale" : "";
+  display.setTextAlignment(TEXT_ALIGN_RIGHT);
+  display.drawString(106, 0, syncStatus);
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
   
   // // Top right: Lightning bolt icon + Battery percentage (above pet sprite which starts at y=12)
   // // Calculate position: text is right-aligned, icon is to the left of text
@@ -833,10 +796,10 @@ void renderMenu(SSD1306Wire &display, int menuOption) {
   // Row 0: y=12, Row 1: y=36 (vertically centered)
   // Col 0: x=8,  Col 1: x=68
   int positions[][2] = {
-    {8, 12},   // 0: Home (top-left)
-    {68, 12},  // 1: Play (top-right)
-    {8, 36},   // 2: Feed (bottom-left)
-    {68, 36}   // 3: Jobs (bottom-right)
+    {8, 9},    // 0: Home (top-left)
+    {68, 9},   // 1: Play (top-right)
+    {8, 30},   // 2: Feed (bottom-left)
+    {68, 30}   // 3: Jobs (bottom-right)
   };
   
   for (int i = 0; i < 4; i++) {
@@ -845,6 +808,9 @@ void renderMenu(SSD1306Wire &display, int menuOption) {
     display.drawString(positions[i][0], positions[i][1], line);
   }
   
+  display.setFont(ArialMT_Plain_10);
+  display.setTextAlignment(TEXT_ALIGN_CENTER);
+  display.drawString(64, 50, "Tap: next  Hold: pick");
   display.display();
 }
 
