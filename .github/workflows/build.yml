@@ -1,0 +1,57 @@
+name: Build firmware
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 4.x is current; 3.2.1 is the last core before ESP-IDF 5.5
+        core: ["4.0.0", "3.2.1"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install ESP32 core ${{ matrix.core }}
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@${{ matrix.core }}
+      - name: Install libraries
+        run: |
+          arduino-cli lib install "WiFiManager@2.0.17" "ArduinoJson@7.4.3"
+          LIBDIR="$HOME/Arduino/libraries"
+          mkdir -p "$LIBDIR"
+          git clone --depth 1 https://github.com/eiannone/Heltec_Esp32_Display "$LIBDIR/Heltec_Esp32_Display"
+          printf 'name=Heltec_Esp32_Display\nversion=0.1.0\nauthor=Emanuele Iannone\nmaintainer=Emanuele Iannone\nsentence=OLED library for Heltec ESP32 boards\nparagraph=\ncategory=Display\nurl=https://github.com/eiannone/Heltec_Esp32_Display\narchitectures=esp32\n' > "$LIBDIR/Heltec_Esp32_Display/library.properties"
+      - name: Compile
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:heltec_wifi_kit_32_V3 \
+            --warnings default satoshi_pet_heltec 2>&1 | tee build.log
+          grep -E "Sketch uses|Global variables" build.log
+
+  tls-roots:
+    # The firmware pins root CAs (satoshi_pet_heltec/ca_roots.h). Fail if the
+    # live server chain stops validating against them.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify www.ganamos.earth chains to a pinned root
+        run: |
+          grep '^  "' satoshi_pet_heltec/ca_roots.h | sed -e 's/^  "//' -e 's/\\n"$//' > pinned.pem
+          grep -c BEGIN pinned.pem
+          echo | openssl s_client -connect www.ganamos.earth:443 -servername www.ganamos.earth \
+            -CAfile pinned.pem -verify_return_error 2>&1 | tee tls.log | grep -E "Verify return code|issuer="
+          grep -q "Verify return code: 0 (ok)" tls.log
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Power/UX regression checks
+        run: python3 test/power_ux_regression.py
