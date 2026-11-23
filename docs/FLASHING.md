@@ -9,25 +9,39 @@ This guide walks you through flashing the Satoshi Pet firmware to a Heltec WiFi 
 1. **Download Arduino IDE 2.x**
    - [arduino.cc/en/software](https://www.arduino.cc/en/software)
 
-2. **Add Heltec Board Support**
+2. **Add ESP32 Board Support**
    - Open Arduino IDE
-   - Go to `File → Preferences`
+   - Go to `File → Preferences` (`Arduino IDE → Settings` on Mac)
    - In "Additional Board Manager URLs", add:
      ```
-     https://github.com/Heltec-Aaron-Lee/WiFi_Kit_series/releases/download/0.0.9/package_heltec_esp32_index.json
+     https://espressif.github.io/arduino-esp32/package_esp32_index.json
      ```
    - Click OK
+   - Use Espressif's official package, not Heltec's "Heltec ESP32 Series
+     Dev-Boards" 0.0.9: that one fails to link for the V3 (ESP32-S3) with
+     `undefined reference to temp_sensor_set_config`.
 
-3. **Install Heltec ESP32 Board Package**
+3. **Install the ESP32 Board Package**
    - Go to `Tools → Board → Boards Manager`
-   - Search for "Heltec"
-   - Install "Heltec ESP32 Series Dev-Boards"
+   - Search for "esp32"
+   - Install "esp32 by Espressif Systems" (3.x or 4.x both work)
 
 4. **Install Required Libraries**
    - Go to `Tools → Manage Libraries`
    - Install these libraries:
      - **WiFiManager** by tzapu (version 2.0.x)
      - **ArduinoJson** by Benoit Blanchon (version 7.x)
+   - Install the OLED library (provides `HT_SSD1306Wire.h`), which is not in
+     the Arduino Library Manager. On Mac/Linux:
+     ```bash
+     cd ~/Documents/Arduino/libraries
+     curl -L https://github.com/eiannone/Heltec_Esp32_Display/archive/refs/heads/main.zip -o d.zip
+     unzip -q d.zip && rm d.zip && mv Heltec_Esp32_Display-main Heltec_Esp32_Display
+     printf 'name=Heltec_Esp32_Display\nversion=0.1.0\nauthor=Emanuele Iannone\nmaintainer=Emanuele Iannone\nsentence=OLED library for Heltec ESP32 boards\nparagraph=\ncategory=Display\nurl=https://github.com/eiannone/Heltec_Esp32_Display\narchitectures=esp32\n' > Heltec_Esp32_Display/library.properties
+     ```
+     The `library.properties` file is needed because the library only ships
+     PlatformIO metadata; without it Arduino IDE reports
+     `HT_SSD1306Wire.h: No such file or directory`. Restart Arduino IDE after.
 
 ### Option 2: PlatformIO (Recommended for developers)
 
@@ -45,7 +59,7 @@ This guide walks you through flashing the Satoshi Pet firmware to a Heltec WiFi 
 ### Step 2: Select Board and Port
 
 **Arduino IDE:**
-- `Tools → Board → Heltec ESP32 Series Dev-Boards → WiFi Kit 32(V3)`
+- `Tools → Board → esp32 → Heltec WiFi Kit 32(V3)`
 - `Tools → Port → Select your port`
   - Mac: `/dev/cu.usbserial-*` or `/dev/cu.wchusbserial*`
   - Windows: `COM3`, `COM4`, etc.
@@ -56,7 +70,7 @@ This guide walks you through flashing the Satoshi Pet firmware to a Heltec WiFi 
 
 ### Step 3: Open the Firmware
 
-1. Open the `firmware/satoshi_pet_heltec.ino` file in Arduino IDE
+1. Open the `satoshi_pet_heltec/satoshi_pet_heltec.ino` file in Arduino IDE
 2. All the `.cpp` and `.h` files in the same folder will be included automatically
 
 ### Step 4: Upload
