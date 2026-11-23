@@ -23,7 +23,13 @@ static void _onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
 #endif
 
 // Internal send callback (optional, for debugging)
+// ESP-IDF 5.5 (arduino-esp32 3.3+) changed the first argument from the peer
+// MAC to a wifi_tx_info_t pointer.
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+static void _onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+#else
 static void _onDataSent(const uint8_t *mac, esp_now_send_status_t status) {
+#endif
   if (status != ESP_NOW_SEND_SUCCESS) {
     Serial.println(F("⚠️ ESP-NOW send failed"));
   }
