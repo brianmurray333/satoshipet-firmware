@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <string.h>
 #include "config.h"
+#include "sound.h"
 
 // Shared keep-alive HTTPS session (provided by config.cpp).
 bool ganamosHttpBegin(HTTPClient& http, const String& path);
@@ -248,41 +249,48 @@ static bool shouldAbortSync(int httpCode) {
   return httpCode <= 0 || httpCode == 429 || httpCode >= 500;
 }
 
-// Single NVS session: queue blob and (optionally) the coin balance.
-static void persistEconomy(bool writeQueue, bool writeCoins) {
-  if (!writeQueue && !writeCoins) return;
+// Single NVS session: coin balance first, then the queue blob. Writing coins
+// first means a power cut between the two writes can only lose a local queue
+// entry (the server balance later corrects upward), never refund a saved spend.
+// Returns true only if everything requested was written.
+static bool persistEconomy(bool writeQueue, bool writeCoins) {
+  if (!writeQueue && !writeCoins) return true;
   if (!economyPrefs.begin(ECON_NS, false)) {
     Serial.println("Economy: NVS open failed");
-    return;
+    return false;
+  }
+  bool ok = true;
+  if (writeCoins) {
+    if (economyPrefs.putInt(KEY_COINS, localCoinBalance) == sizeof(int32_t)) {
+      persistedCoinBalance = localCoinBalance;
+    } else {
+      Serial.println("Economy: failed to persist coin balance");
+      ok = false;
+    }
   }
   if (writeQueue) {
     sealQueue(spendState, SPEND_QUEUE_MAGIC);
     const size_t len = queueBytes(spendState);
     if (economyPrefs.putBytes(KEY_SPENDS_V3, &spendState, len) != len) {
       Serial.println("Economy: failed to persist spend queue");
-    }
-  }
-  if (writeCoins) {
-    if (economyPrefs.putInt(KEY_COINS, localCoinBalance) == sizeof(int32_t)) {
-      persistedCoinBalance = localCoinBalance;
-    } else {
-      Serial.println("Economy: failed to persist coin balance");
+      ok = false;
     }
   }
   economyPrefs.end();
+  return ok;
 }
 
-static void persistScores() {
+static bool persistScores() {
   if (!economyPrefs.begin(SCORE_NS, false)) {
     Serial.println("Scores: NVS open failed");
-    return;
+    return false;
   }
   sealQueue(scoreState, SCORE_QUEUE_MAGIC);
   const size_t len = queueBytes(scoreState);
-  if (economyPrefs.putBytes(KEY_SCORES_V3, &scoreState, len) != len) {
-    Serial.println("Scores: failed to persist score queue");
-  }
+  bool ok = economyPrefs.putBytes(KEY_SCORES_V3, &scoreState, len) == len;
+  if (!ok) Serial.println("Scores: failed to persist score queue");
   economyPrefs.end();
+  return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -472,8 +480,10 @@ void initEconomy() {
   }
   persistedCoinBalance = rewrite ? -1 : localCoinBalance;
   if (rewrite) {
-    persistEconomy(true, true);
-    removeLegacyKeys(ECON_NS, removeV2, "spendCount", "spend_", legacyCount);
+    // Only drop the old-format data once the new record is safely written
+    if (persistEconomy(true, true)) {
+      removeLegacyKeys(ECON_NS, removeV2, "spendCount", "spend_", legacyCount);
+    }
   }
   Serial.printf("Economy: %d pending spends, %d coins\n", spendState.hdr.count, localCoinBalance);
 
@@ -489,8 +499,9 @@ void initEconomy() {
     // Nothing stored yet; the first queued score creates the record.
   }
   if (rewrite) {
-    persistScores();
-    removeLegacyKeys(SCORE_NS, removeV2, "scoreCount", "score_", legacyCount);
+    if (persistScores()) {
+      removeLegacyKeys(SCORE_NS, removeV2, "scoreCount", "score_", legacyCount);
+    }
   }
   Serial.printf("Scores: %d pending scores\n", scoreState.hdr.count);
 }
@@ -563,6 +574,7 @@ int syncPendingSpends() {
 
   for (int i = 0; i < spendState.hdr.count && requests < MAX_SYNC_REQUESTS_PER_CALL; i++) {
     esp_task_wdt_reset();
+    soundUpdate();  // keep a playing chirp advancing during sync
     PendingSpend& spend = spendState.entries[i];
     if (spend.synced) continue;
 
@@ -573,7 +585,7 @@ int syncPendingSpends() {
     }
 
     HTTPClient http;
-    if (!ganamosHttpBegin(http, "/api/device/economy/sync")) {
+    if (!ganamosHttpBegin(http, "/api/device/economy/sync?deviceId=" + ganamosConfig.deviceId)) {
       Serial.println("Economy: HTTP begin failed");
       break;
     }
@@ -621,6 +633,7 @@ int getPendingSpendCount() {
 
 void clearSyncedSpends() {
   esp_task_wdt_reset();
+  soundUpdate();  // keep a playing chirp advancing during sync
   if (spendState.hdr.count > MAX_PENDING_SPENDS) spendState.hdr.count = MAX_PENDING_SPENDS;
 
   int writeIdx = 0;
@@ -637,6 +650,7 @@ void clearSyncedSpends() {
   if (removed > 0) {
     Serial.printf("Economy: cleared %d synced spends\n", removed);
     esp_task_wdt_reset();
+    soundUpdate();  // keep a playing chirp advancing during sync
     persistEconomy(true, false);
   }
 }
@@ -698,6 +712,7 @@ int syncPendingGameScores() {
 
   for (int i = 0; i < scoreState.hdr.count && requests < MAX_SYNC_REQUESTS_PER_CALL; i++) {
     esp_task_wdt_reset();
+    soundUpdate();  // keep a playing chirp advancing during sync
     PendingGameScore& entry = scoreState.entries[i];
     if (entry.synced) continue;
 
@@ -707,7 +722,7 @@ int syncPendingGameScores() {
     }
 
     HTTPClient http;
-    if (!ganamosHttpBegin(http, "/api/device/game-score")) {
+    if (!ganamosHttpBegin(http, "/api/device/game-score?deviceId=" + ganamosConfig.deviceId)) {
       Serial.println("Scores: HTTP begin failed");
       break;
     }

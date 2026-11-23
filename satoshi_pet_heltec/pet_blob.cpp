@@ -1048,7 +1048,8 @@ void handleJobsMenu(SSD1306Wire &display) {
   const unsigned long HOLD_PRESS_MIN = 700;
   
   while (inJobsMenu) {
-    esp_task_wdt_reset();  
+    esp_task_wdt_reset();
+    soundUpdate();
     unsigned long now = millis();
     
     // Timeout after 30 seconds
@@ -1123,6 +1124,7 @@ void handleJobsMenu(SSD1306Wire &display) {
         
         while (inDetailView && (millis() - detailStart < 30000)) {  // 30s timeout
           esp_task_wdt_reset();
+          soundUpdate();
           bool detailPrgState = digitalRead(0) == LOW;
           bool detailExtState = digitalRead(2) == LOW;
           bool detailState = detailPrgState || detailExtState;
@@ -1158,7 +1160,8 @@ void handleJobsMenu(SSD1306Wire &display) {
               unsigned long confirmStart = millis();
               
               while (millis() - confirmStart < 10000) {  // 10s timeout for confirm
-                esp_task_wdt_reset(); 
+                esp_task_wdt_reset();
+                soundUpdate();
                 bool confirmPrgState = digitalRead(0) == LOW;
                 bool confirmExtState = digitalRead(2) == LOW;
                 bool confirmState = confirmPrgState || confirmExtState;
@@ -1184,6 +1187,7 @@ void handleJobsMenu(SSD1306Wire &display) {
                     display.display();
                     
                     esp_task_wdt_reset();
+                    soundUpdate();
 
                     // Call the API
                     extern bool markJobComplete(String jobId);

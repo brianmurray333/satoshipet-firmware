@@ -956,12 +956,8 @@
     setLocalCoins(1000);
 #endif
     
-    // Check for corrupted economy data and clear if needed
-    int pendingCount = getPendingSpendCount();
-    if (pendingCount > 10) {
-      Serial.println("⚠️ Suspicious pending spend count (" + String(pendingCount) + ") - clearing economy data");
-      clearEconomyData();
-    }
+    // (Removed the boot-time wipe when >10 spends were pending: queue entries
+    //  are checksum-verified on load, and 11+ is a normal offline backlog.)
     
     loadPetStats();
     
@@ -1116,11 +1112,13 @@
       Serial.println("✅ Synced " + String(synced) + " pending spends");
     }
     esp_task_wdt_reset();
+    soundUpdate();
 
     // Upload game scores that were queued while offline
     syncPendingGameScores();
     clearSyncedGameScores();
     esp_task_wdt_reset();
+    soundUpdate();
 
     // Check how many pending spends are still unsynced
     int remainingPending = getPendingSpendCount();
@@ -1128,7 +1126,11 @@
     // After sync attempt, reconcile local balance with server
     // BUT only trust server if we have NO pending spends - otherwise our offline
     // spending hasn't been acknowledged by the server yet!
-    if (serverCoins != localCoins) {
+    // serverCoins was read before this round's spends were synced, so it is
+    // stale whenever we just synced something; reconcile on the next poll.
+    if (synced > 0) {
+      Serial.println("⏳ Spends synced this round - reconciling balance next poll");
+    } else if (serverCoins != localCoins) {
       int diff = localCoins - serverCoins;
 
       if (remainingPending > 0) {

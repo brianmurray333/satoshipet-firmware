@@ -649,6 +649,10 @@ int handlePickleballPractice(SSD1306Wire &display) {
 // Restores the radio on every exit path from handlePickleballGame():
 // ESP-NOW off; WiFi off again if the game turned it on, otherwise modem
 // sleep re-enabled (it is disabled during the game for ESP-NOW latency).
+// Defined in satoshi_pet_heltec.ino
+void wifiRadioOff();
+bool wifiReady();
+
 struct PbRadioSession {
   bool wifiStartedByGame = false;
   bool espnowActive = false;
@@ -656,8 +660,7 @@ struct PbRadioSession {
     soundStop();
     if (espnowActive) espnowDeinit();
     if (wifiStartedByGame) {
-      WiFi.disconnect(true);
-      WiFi.mode(WIFI_OFF);
+      wifiRadioOff();  // also resets the WiFi state machine + shared TLS client
     } else if (WiFi.getMode() != WIFI_OFF) {
       WiFi.setSleep(true);
     }
@@ -736,32 +739,12 @@ int handlePickleballGame(SSD1306Wire &display) {
 
   Serial.println(F("Starting Pickleball game..."));
 
-  // Ensure WiFi is available for lobby phase
-  if (WiFi.status() != WL_CONNECTED) {
+  // Ensure WiFi is available for lobby phase (through the main WiFi state
+  // machine, so it doesn't race a connect already in progress)
+  if (!wifiReady()) {
     pbShowMessage(display, "Connecting WiFi...", nullptr);
-
     radio.wifiStartedByGame = true;
-    WiFi.mode(WIFI_STA);
-    WiFi.begin();
-
-    unsigned long wifiStart = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 8000) {
-      esp_task_wdt_reset();
-      soundUpdate();
-      delay(250);
-      char dots[4];
-      int n = ((millis() - wifiStart) / 500) % 4;
-      for (int i = 0; i < n; i++) dots[i] = '.';
-      dots[n] = '\0';
-      display.clear();
-      display.setFont(ArialMT_Plain_10);
-      display.setTextAlignment(TEXT_ALIGN_CENTER);
-      display.drawString(64, 20, "Connecting WiFi...");
-      display.drawString(64, 35, dots);
-      display.display();
-    }
-
-    if (WiFi.status() != WL_CONNECTED) {
+    if (!wifiEnsureConnected(8000)) {
       pbShowMessage(display, "WiFi failed", "Try again later");
       pbWait(2000);
       return 0;
