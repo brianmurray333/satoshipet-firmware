@@ -1,52 +1,75 @@
 #include "pickleball.h"
 #include "config.h"
 #include "button_handler.h"
+#include "sound.h"
 #include <esp_task_wdt.h>
+#include <esp_timer.h>
+#include <esp_wifi.h>
 #include <HTTPClient.h>
-#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 
 // ============================================================================
 // Pickleball Game Implementation
 // ============================================================================
 
-// Global game state (accessible from ESP-NOW callback)
+// Global game state. Only the loop() task reads or writes it: the ESP-NOW
+// receive callback (WiFi task) just queues raw packets, which are applied by
+// pbProcessRx() from the game loop.
 static PickleballState pbState;
-struct PendingButtonPress { uint8_t playerIndex; uint32_t sequence; };
-static PendingButtonPress pbButtonQueue[8];
-static volatile uint8_t pbButtonQueueHead = 0;
-static volatile uint8_t pbButtonQueueTail = 0;
-static portMUX_TYPE pbButtonQueueMux = portMUX_INITIALIZER_UNLOCKED;
+
+// This device's STA MAC (filled at game start)
+static uint8_t pbMyMac[6] = {0, 0, 0, 0, 0, 0};
+
+// Countdown beep tracker (reset at every match start)
+static int pbLastBeep = -1;
+
+// ---- Pending button presses (host only; loop task only) ----
+struct PendingButtonPress { uint8_t playerIndex; uint32_t volleyId; };
+#define PB_PRESS_QUEUE_LEN 8
+static PendingButtonPress pbButtonQueue[PB_PRESS_QUEUE_LEN];
+static uint8_t pbButtonQueueHead = 0;
+static uint8_t pbButtonQueueTail = 0;
+
+static void flushButtonQueue() {
+  pbButtonQueueHead = 0;
+  pbButtonQueueTail = 0;
+}
+
+static bool queueButtonPress(uint8_t playerIndex, uint32_t volleyId) {
+  uint8_t next = (pbButtonQueueHead + 1) % PB_PRESS_QUEUE_LEN;
+  if (next == pbButtonQueueTail) return false;
+  pbButtonQueue[pbButtonQueueHead].playerIndex = playerIndex;
+  pbButtonQueue[pbButtonQueueHead].volleyId = volleyId;
+  pbButtonQueueHead = next;
+  return true;
+}
+
+static bool dequeueButtonPress(PendingButtonPress &press) {
+  if (pbButtonQueueTail == pbButtonQueueHead) return false;
+  press = pbButtonQueue[pbButtonQueueTail];
+  pbButtonQueueTail = (pbButtonQueueTail + 1) % PB_PRESS_QUEUE_LEN;
+  return true;
+}
 
 static int playerIndexForMac(const uint8_t *mac) {
-  for (int i = 0; i < pbState.playerCount; i++)
+  for (int i = 0; i < pbState.playerCount && i < MAX_GAME_PLAYERS; i++)
     if (memcmp(pbState.players[i].mac, mac, 6) == 0) return i;
   return -1;
 }
 
-static bool queueButtonPress(uint8_t playerIndex, uint32_t sequence) {
-  bool queued = false;
-  portENTER_CRITICAL(&pbButtonQueueMux);
-  uint8_t next = (pbButtonQueueHead + 1) % 8;
-  if (next != pbButtonQueueTail) {
-    pbButtonQueue[pbButtonQueueHead] = {playerIndex, sequence};
-    pbButtonQueueHead = next;
-    queued = true;
-  }
-  portEXIT_CRITICAL(&pbButtonQueueMux);
-  return queued;
+// Clients accept host messages only from players[0] (the lobby creator).
+static bool isFromHost(const uint8_t *mac) {
+  return pbState.playerCount > 0 && memcmp(pbState.players[0].mac, mac, 6) == 0;
 }
 
-static bool dequeueButtonPress(PendingButtonPress &press) {
-  bool found = false;
-  portENTER_CRITICAL(&pbButtonQueueMux);
-  if (pbButtonQueueTail != pbButtonQueueHead) {
-    press = pbButtonQueue[pbButtonQueueTail];
-    pbButtonQueueTail = (pbButtonQueueTail + 1) % 8;
-    found = true;
-  }
-  portEXIT_CRITICAL(&pbButtonQueueMux);
-  return found;
+static bool macIsZero(const uint8_t *mac) {
+  for (int i = 0; i < 6; i++) if (mac[i]) return false;
+  return true;
+}
+
+static uint8_t mySide() {
+  return pbState.myPlayerIndex < MAX_GAME_PLAYERS
+    ? pbState.players[pbState.myPlayerIndex].side : 0;
 }
 
 // Forward declarations
@@ -65,24 +88,16 @@ static bool startCountdownOnServer();
 static void reportGameComplete();
 static void updateGameWager(uint16_t wagerAmount);
 static bool setWagerConsent(bool accepted);
-static void hostAdvanceGameState();
 static void sendGameStateToPlayers();
 static void handleLocalButtonPress();
-static void assignSidesForPlayerCount();
 static void awardPoint(uint8_t scoringSide, uint8_t reason);
 
-// Sound effects (defined in main .ino)
+// Sound effects defined in main .ino (blocking, menu-only)
 extern void playButtonChirp();
 extern void playMenuSelectTone();
-extern bool isQuietHours();
 
 // Flag to suppress duplicate sats celebration after wager game
 bool suppressNextSatsCelebration = false;
-
-// Buzzer pin (defined in main .ino)
-#ifndef BUZZER_PIN
-#define BUZZER_PIN 48
-#endif
 
 #ifndef RGB_LED
 #define RGB_LED 35
@@ -96,229 +111,380 @@ bool suppressNextSatsCelebration = false;
 #define BUTTON_PIN_EXTERNAL 2
 #endif
 
-// ---- Sound Effects ----
+// ============================================================================
+// Sound Effects (non-blocking; see sound.h). All respect quiet hours.
+// ============================================================================
 
-static void playPickleballHit() {
-  if (isQuietHours()) return;
-  tone(BUZZER_PIN, 1200, 40);
-  delay(30);
-  tone(BUZZER_PIN, 1600, 60);
-  delay(40);
-  noTone(BUZZER_PIN);
-}
+#define PB_NOTE_COUNT(a) ((uint8_t)(sizeof(a) / sizeof((a)[0])))
 
-static void playPickleballPoint() {
-  if (isQuietHours()) return;
-  tone(BUZZER_PIN, 880, 100);
-  delay(80);
-  tone(BUZZER_PIN, 1100, 100);
-  delay(80);
-  tone(BUZZER_PIN, 1320, 200);
-  delay(150);
-  noTone(BUZZER_PIN);
-}
+static const ToneNote PB_SND_HIT[]   = {{1200, 30}, {1600, 40}};
+static const ToneNote PB_SND_POINT[] = {{880, 80}, {1100, 80}, {1320, 150}};
+static const ToneNote PB_SND_MISS[]  = {{400, 120}, {300, 150}};
+static const ToneNote PB_SND_BEEP[]  = {{800, 80}};
+static const ToneNote PB_SND_GO[]    = {{1200, 150}};
+// The plain win jingle is the first PB_SND_WIN_NOTES notes of the wager
+// victory fanfare; the fanfare adds two high notes at the end.
+static const ToneNote PB_SND_VICTORY[] = {
+  {523, 100}, {659, 100}, {784, 100}, {1047, 150}, {784, 80}, {1047, 150},
+  {1319, 200}, {1568, 400}
+};
+#define PB_SND_WIN_NOTES 6
 
-static void playPickleballMiss() {
-  if (isQuietHours()) return;
-  tone(BUZZER_PIN, 400, 150);
-  delay(120);
-  tone(BUZZER_PIN, 300, 200);
-  delay(150);
-  noTone(BUZZER_PIN);
-}
+static void playPickleballHit()       { soundPlay(PB_SND_HIT, PB_NOTE_COUNT(PB_SND_HIT)); }
+static void playPickleballPoint()     { soundPlay(PB_SND_POINT, PB_NOTE_COUNT(PB_SND_POINT)); }
+static void playPickleballMiss()      { soundPlay(PB_SND_MISS, PB_NOTE_COUNT(PB_SND_MISS)); }
+static void playCountdownBeep()       { soundPlay(PB_SND_BEEP, PB_NOTE_COUNT(PB_SND_BEEP)); }
+static void playCountdownGo()         { soundPlay(PB_SND_GO, PB_NOTE_COUNT(PB_SND_GO)); }
+static void playPickleballWin()       { soundPlay(PB_SND_VICTORY, PB_SND_WIN_NOTES); }
+static void playWagerVictoryFanfare() { soundPlay(PB_SND_VICTORY, PB_NOTE_COUNT(PB_SND_VICTORY)); }
 
-static void playPickleballWin() {
-  int melody[] = {523, 659, 784, 1047, 784, 1047};
-  for (int i = 0; i < 6; i++) {
-    tone(BUZZER_PIN, melody[i], 120);
-    delay(100);
-    noTone(BUZZER_PIN);
-  }
-}
-
-static void playCountdownBeep() {
-  if (isQuietHours()) return;
-  tone(BUZZER_PIN, 800, 100);
-  delay(80);
-  noTone(BUZZER_PIN);
-}
-
-static void playCountdownGo() {
-  if (isQuietHours()) return;
-  tone(BUZZER_PIN, 1200, 200);
-  delay(150);
-  noTone(BUZZER_PIN);
-}
-
-static void playWagerVictoryFanfare() {
-  int melody[] = {523, 659, 784, 1047, 784, 1047, 1319, 1568};
-  int durations[] = {100, 100, 100, 150, 80, 150, 200, 400};
-  for (int i = 0; i < 8; i++) {
-    tone(BUZZER_PIN, melody[i], durations[i]);
-    delay(durations[i] - 20);
-    noTone(BUZZER_PIN);
-    delay(20);
+// delay() replacement that keeps the sound sequencer and watchdog serviced
+static void pbWait(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    soundUpdate();
+    esp_task_wdt_reset();
+    delay(5);
   }
 }
 
 // ============================================================================
-// ESP-NOW Receive Callback
+// Input: both buttons debounced and combined into one logical button
 // ============================================================================
 
-void pickleballOnESPNowReceive(const uint8_t *mac, const uint8_t *data, int len) {
-  if (len < 1) return;
-  uint8_t msgType = data[0];
+struct PbInput {
+  DebouncedButton prg;
+  DebouncedButton ext;
+  bool down;
+};
 
-  if (pbState.isHost) {
-    // HOST receives button presses from players
-    if (msgType == MSG_BUTTON_PRESS && len >= sizeof(ButtonPressMessage)) {
-      ButtonPressMessage msg;
-      memcpy(&msg, data, sizeof(msg));
-      int sender = playerIndexForMac(mac);
-      if (sender < 0 || msg.generation != pbState.matchGeneration ||
-          msg.sequence <= pbState.playerButtonSequence[sender]) return;
-      pbState.playerButtonSequence[sender] = msg.sequence;
-      pbState.playerLastSeen[sender] = millis();
-      queueButtonPress((uint8_t)sender, msg.sequence);
-      Serial.printf("🏓 Button press from verified player %d\n", sender);
-    }
-    else if (msgType == MSG_LOBBY_READY && len >= sizeof(LobbyReadyMessage)) {
-      LobbyReadyMessage msg;
-      memcpy(&msg, data, sizeof(msg));
-      if (msg.generation != pbState.matchGeneration) return;
-      // Mark player as connected
-      for (int i = 0; i < pbState.playerCount; i++) {
-        if (memcmp(pbState.players[i].mac, mac, 6) == 0) {
-          pbState.players[i].ready = true;
-          pbState.playerLastSeen[i] = millis();
-          Serial.printf("✅ Player %d ESP-NOW ready\n", i);
-          break;
-        }
-      }
-    }
-    else if (msgType == MSG_GAME_START_ACK && len >= sizeof(GameStartAckMessage)) {
-      GameStartAckMessage msg;
-      memcpy(&msg, data, sizeof(msg));
-      int sender = playerIndexForMac(mac);
-      if (sender >= 0 && msg.generation == pbState.matchGeneration) {
-        pbState.startAcknowledged[sender] = true;
-        pbState.playerLastSeen[sender] = millis();
-      }
-    }
-    else if (msgType == MSG_PONG && len >= sizeof(PingMessage)) {
-      PingMessage msg;
-      memcpy(&msg, data, sizeof(msg));
-      int sender = playerIndexForMac(mac);
-      if (sender >= 0 && msg.generation == pbState.matchGeneration)
-        pbState.playerLastSeen[sender] = millis();
+static void pbInputInit(PbInput &in) {
+  debounceInit(in.prg, BUTTON_PIN_PRG);
+  debounceInit(in.ext, BUTTON_PIN_EXTERNAL);
+  in.down = debounceIsDown(in.prg) || debounceIsDown(in.ext);
+}
+
+// True once per debounced press of either button (both together = one press)
+static bool pbInputPressed(PbInput &in, unsigned long now) {
+  debounceUpdate(in.prg, now);
+  debounceUpdate(in.ext, now);
+  bool d = debounceIsDown(in.prg) || debounceIsDown(in.ext);
+  bool edge = d && !in.down;
+  in.down = d;
+  return edge;
+}
+
+static bool pbRawButtonDown() {
+  return digitalRead(BUTTON_PIN_PRG) == LOW || digitalRead(BUTTON_PIN_EXTERNAL) == LOW;
+}
+
+// ---- Press latch while a blocking HTTP request runs ----
+// A 10ms esp_timer samples the buttons so a press made during a lobby poll
+// is not lost. (No GPIO interrupts: the .ino configures these pins as
+// light-sleep wake sources and attach/detachInterrupt would clobber that.)
+static esp_timer_handle_t pbLatchTimer = nullptr;
+static volatile bool pbLatchedPress = false;
+static volatile bool pbLatchHeld = false;
+static volatile uint8_t pbLatchDownSamples = 0;
+
+static void pbLatchTimerCb(void *) {
+  if (pbRawButtonDown()) {
+    if (pbLatchDownSamples < 2) pbLatchDownSamples = pbLatchDownSamples + 1;
+    if (pbLatchDownSamples >= 2 && !pbLatchHeld) {   // stable ~20ms
+      pbLatchHeld = true;
+      pbLatchedPress = true;
     }
   } else {
-    // CLIENT receives game state from host
-    if (msgType == MSG_GAME_STATE && len >= sizeof(GameStateMessage)) {
-      GameStateMessage msg;
-      memcpy(&msg, data, sizeof(msg));
-      if (msg.generation != pbState.matchGeneration || msg.sequence <= pbState.lastReceivedSequence) return;
-      pbState.lastReceivedSequence = msg.sequence;
-      PickleballPhase newPhase = (PickleballPhase)msg.phase;
-      if (newPhase != pbState.phase) {
-        pbState.phaseStartTime = millis();
-        pbState.ballAnimFrame = 0;
-      }
-      pbState.phase = newPhase;
-      pbState.ballSide = msg.ballSide;
-      pbState.ballZone = msg.ballZone;
-      pbState.scoreLeft = msg.scoreLeft;
-      pbState.scoreRight = msg.scoreRight;
-      pbState.servingSide = msg.servingSide;
-      pbState.targetPlayerIdx = msg.targetPlayerIdx;
-      pbState.reactionDeadline = millis() + msg.reactionTimeMs;
-    }
-    else if (msgType == MSG_GAME_START && len >= sizeof(GameStartMessage)) {
-      GameStartMessage msg;
-      memcpy(&msg, data, sizeof(msg));
-      if (pbState.matchGeneration != 0 && msg.generation < pbState.matchGeneration) return;
-      pbState.matchGeneration = msg.generation;
-      pbState.lastReceivedSequence = msg.sequence;
-      pbState.myPlayerIndex = msg.yourIndex;
-      pbState.playerCount = msg.playerCount;
-      for (int i = 0; i < msg.playerCount && i < MAX_GAME_PLAYERS; i++) {
-        pbState.players[i].petInitial = msg.initials[i];
-        pbState.players[i].side = msg.sides[i];
-        pbState.players[i].position = msg.positions[i];
-      }
-      pbState.phase = PB_PHASE_COUNTDOWN;
-      pbState.phaseStartTime = millis();
-      GameStartAckMessage ack{MSG_GAME_START_ACK, pbState.matchGeneration, pbState.myPlayerIndex};
-      espnowSend(mac, (uint8_t*)&ack, sizeof(ack));
-      Serial.printf("🎮 Game starting! I'm player %d\n", msg.yourIndex);
-    }
-    else if (msgType == MSG_POINT_SCORED && len >= sizeof(PointScoredMessage)) {
-      PointScoredMessage msg;
-      memcpy(&msg, data, sizeof(msg));
-      if (msg.generation != pbState.matchGeneration || msg.sequence <= pbState.lastReceivedSequence) return;
-      pbState.lastReceivedSequence = msg.sequence;
-      pbState.scoreLeft = msg.scoreLeft;
-      pbState.scoreRight = msg.scoreRight;
-      pbState.lastPointWinner = msg.scoringSide;
-      pbState.lastPointReason = msg.reason;
-      pbState.phase = PB_PHASE_POINT_RESULT;
-      pbState.phaseStartTime = millis();
+    pbLatchDownSamples = 0;
+    pbLatchHeld = false;
+  }
+}
 
-      // Play sound based on whether our side scored
-      uint8_t mySide = pbState.players[pbState.myPlayerIndex].side;
-      if (msg.scoringSide == mySide) {
-        playPickleballPoint();
-      } else {
-        playPickleballMiss();
-      }
+static void pbLatchBegin() {
+  pbLatchedPress = false;
+  pbLatchDownSamples = 0;
+  pbLatchHeld = pbRawButtonDown();   // a press already in progress doesn't count
+  if (!pbLatchTimer) {
+    esp_timer_create_args_t args = {};
+    args.callback = &pbLatchTimerCb;
+    args.arg = nullptr;
+    args.dispatch_method = ESP_TIMER_TASK;
+    args.name = "pb_btn";
+    if (esp_timer_create(&args, &pbLatchTimer) != ESP_OK) {
+      pbLatchTimer = nullptr;
+      return;
     }
-    else if (msgType == MSG_GAME_OVER && len >= sizeof(GameOverMessage)) {
-      GameOverMessage msg;
-      memcpy(&msg, data, sizeof(msg));
-      if (msg.generation != pbState.matchGeneration || msg.sequence <= pbState.lastReceivedSequence) return;
-      pbState.lastReceivedSequence = msg.sequence;
-      pbState.scoreLeft = msg.scoreLeft;
-      pbState.scoreRight = msg.scoreRight;
-      pbState.phase = PB_PHASE_GAME_OVER;
-      pbState.phaseStartTime = millis();
+  }
+  esp_timer_start_periodic(pbLatchTimer, 10000);
+}
 
-      uint8_t mySide = pbState.players[pbState.myPlayerIndex].side;
-      bool iWon = (msg.winnerSide == mySide);
+static bool pbLatchEnd() {
+  if (pbLatchTimer) esp_timer_stop(pbLatchTimer);
+  bool pressed = pbLatchedPress;
+  pbLatchedPress = false;
+  return pressed;
+}
 
-      // Estimate wager result for display (host settles actual transfer)
-      if (pbState.wagerActive && pbState.wagerAmount > 0) {
-        pbState.wagerResult = iWon ? (int16_t)pbState.wagerAmount : -(int16_t)pbState.wagerAmount;
-      }
+// ============================================================================
+// Reliable host broadcasts (POINT_SCORED / GAME_OVER): 3 copies, same sequence
+// ============================================================================
 
-      if (iWon) {
-        if (pbState.wagerActive && pbState.wagerAmount > 0) {
-          playWagerVictoryFanfare();
-        } else {
-          playPickleballWin();
-        }
-      } else {
-        playPickleballMiss();
-      }
-    }
-    else if (msgType == MSG_PING) {
-      // Respond with pong
-      PingMessage pong;
-      pong.type = MSG_PONG;
-      pong.generation = pbState.matchGeneration;
-      pong.timestamp = millis();
-      espnowSend(mac, (uint8_t*)&pong, sizeof(pong));
-    }
+#define PB_RELIABLE_COPIES 3
+#define PB_RELIABLE_GAP_MS 30
+static uint8_t pbReliableBuf[32];
+static uint8_t pbReliableLen = 0;
+static uint8_t pbReliableRemaining = 0;
+static unsigned long pbReliableNextAt = 0;
+
+static void pbSendReliable(const void *msg, size_t len) {
+  espnowBroadcast((const uint8_t *)msg, len);
+  if (len > sizeof(pbReliableBuf)) { pbReliableRemaining = 0; return; }
+  memcpy(pbReliableBuf, msg, len);
+  pbReliableLen = (uint8_t)len;
+  pbReliableRemaining = PB_RELIABLE_COPIES - 1;
+  pbReliableNextAt = millis() + PB_RELIABLE_GAP_MS;
+}
+
+static void pbServiceReliable(unsigned long now) {
+  if (pbReliableRemaining && (long)(now - pbReliableNextAt) >= 0) {
+    espnowBroadcast(pbReliableBuf, pbReliableLen);
+    pbReliableRemaining--;
+    pbReliableNextAt = now + PB_RELIABLE_GAP_MS;
+  }
+}
+
+// Send any remaining copies now (before a blocking HTTP call)
+static void pbFlushReliable() {
+  while (pbReliableRemaining) {
+    delay(PB_RELIABLE_GAP_MS);
+    espnowBroadcast(pbReliableBuf, pbReliableLen);
+    pbReliableRemaining--;
   }
 }
 
 // ============================================================================
-// Main Game Entry Point
+// Match transitions
+// ============================================================================
+
+// Enter COUNTDOWN for a freshly confirmed match (host after all ACKs, client
+// on accepted GAME_START). Clears all per-match volatile tracking.
+static void pbStartMatch(unsigned long now) {
+  pbState.phase = PB_PHASE_COUNTDOWN;
+  pbState.phaseStartTime = now;
+  pbState.volleyId = 0;
+  pbState.buttonPressCount = 0;
+  pbState.hitConfirmed = false;
+  pbState.confirmDeadline = 0;
+  pbState.volleyCount = 0;
+  flushButtonQueue();
+  for (int i = 0; i < MAX_GAME_PLAYERS; i++) pbState.playerLastSeen[i] = now;
+  pbState.lastPresencePing = now;
+  pbState.lastHostRx = now;
+  pbLastBeep = -1;
+}
+
+// Enter GAME_OVER once (duplicate GAME_OVER packets are ignored) and play the
+// result sound. The host must have settled wagerResult before calling.
+static void pbEnterGameOver(uint8_t winnerSide) {
+  if (pbState.phase == PB_PHASE_GAME_OVER) return;
+  pbState.phase = PB_PHASE_GAME_OVER;
+  pbState.phaseStartTime = millis();
+
+  bool iWon = (winnerSide == mySide());
+  // Client: estimate wager result for display (host settles actual transfer)
+  if (!pbState.isHost && pbState.wagerActive && pbState.wagerAmount > 0) {
+    pbState.wagerResult = iWon ? (int16_t)pbState.wagerAmount : -(int16_t)pbState.wagerAmount;
+  }
+
+  if (iWon) {
+    if (pbState.wagerResult > 0) playWagerVictoryFanfare();
+    else playPickleballWin();
+  } else {
+    playPickleballMiss();
+  }
+}
+
+// ============================================================================
+// ESP-NOW packet handling (loop task; packets queued by espnow_comm)
+// ============================================================================
+
+static void pbHandleHostPacket(const uint8_t *mac, const uint8_t *data, unsigned long now) {
+  int sender = playerIndexForMac(mac);
+  if (sender <= 0) return;  // unknown device, or our own MAC
+  uint8_t msgType = data[0];
+
+  if (msgType == MSG_BUTTON_PRESS) {
+    ButtonPressMessage msg;
+    memcpy(&msg, data, sizeof(msg));
+    if (msg.generation != pbState.matchGeneration ||
+        msg.sequence <= pbState.playerButtonSequence[sender]) return;
+    pbState.playerButtonSequence[sender] = msg.sequence;
+    pbState.playerLastSeen[sender] = now;
+    // Presses only count for the volley currently waiting on a hit
+    if (pbState.phase == PB_PHASE_BALL_LANDED && msg.volleyId == pbState.volleyId) {
+      queueButtonPress((uint8_t)sender, msg.volleyId);
+    }
+  }
+  else if (msgType == MSG_LOBBY_READY) {
+    LobbyReadyMessage msg;
+    memcpy(&msg, data, sizeof(msg));
+    if (msg.generation != pbState.matchGeneration) return;
+    if (!pbState.players[sender].ready) Serial.printf("Player %d ESP-NOW ready\n", sender);
+    pbState.players[sender].ready = true;
+    pbState.playerLastSeen[sender] = now;
+  }
+  else if (msgType == MSG_GAME_START_ACK) {
+    GameStartAckMessage msg;
+    memcpy(&msg, data, sizeof(msg));
+    if (msg.generation != pbState.matchGeneration) return;
+    pbState.startAcknowledged[sender] = true;
+    pbState.playerLastSeen[sender] = now;
+  }
+  else if (msgType == MSG_PONG) {
+    PingMessage msg;
+    memcpy(&msg, data, sizeof(msg));
+    if (msg.generation == pbState.matchGeneration) pbState.playerLastSeen[sender] = now;
+  }
+}
+
+static void pbSendStartAck(const uint8_t *mac) {
+  GameStartAckMessage ack;
+  ack.type = MSG_GAME_START_ACK;
+  ack.generation = pbState.matchGeneration;
+  ack.playerIndex = pbState.myPlayerIndex;
+  espnowSend(mac, (uint8_t *)&ack, sizeof(ack));
+}
+
+static void pbHandleClientPacket(const uint8_t *mac, const uint8_t *data, unsigned long now) {
+  if (!isFromHost(mac)) return;
+  uint8_t msgType = data[0];
+
+  if (msgType == MSG_GAME_START) {
+    GameStartMessage msg;
+    memcpy(&msg, data, sizeof(msg));
+    if (msg.playerCount < 2 || msg.playerCount > MAX_GAME_PLAYERS) return;
+    if (msg.yourIndex == 0 || msg.yourIndex >= msg.playerCount) return;
+    for (int i = 0; i < msg.playerCount; i++) {
+      if (msg.sides[i] > 1 || msg.positions[i] > 1) return;
+    }
+    if (pbState.matchGeneration != 0 && msg.generation < pbState.matchGeneration) return;
+    if (pbState.startReceived && msg.generation == pbState.matchGeneration) {
+      pbSendStartAck(mac);  // duplicate (our ACK was lost): re-ACK only
+      return;
+    }
+    if (pbState.phase != PB_PHASE_LOBBY && pbState.phase != PB_PHASE_ESPNOW_SYNC) return;
+
+    pbState.matchGeneration = msg.generation;
+    pbState.lastReceivedSequence = msg.sequence;
+    pbState.myPlayerIndex = msg.yourIndex;
+    pbState.playerCount = msg.playerCount;
+    for (int i = 0; i < msg.playerCount; i++) {
+      pbState.players[i].petInitial = msg.initials[i];
+      pbState.players[i].side = msg.sides[i];
+      pbState.players[i].position = msg.positions[i];
+    }
+    pbState.startReceived = true;
+    pbStartMatch(now);
+    pbSendStartAck(mac);
+    Serial.printf("Game starting! I'm player %d of %d\n", msg.yourIndex, msg.playerCount);
+    return;
+  }
+
+  if (msgType == MSG_PING) {
+    PingMessage ping;
+    memcpy(&ping, data, sizeof(ping));
+    if (ping.generation != pbState.matchGeneration) return;
+    pbState.lastHostRx = now;
+    PingMessage pong;
+    pong.type = MSG_PONG;
+    pong.generation = pbState.matchGeneration;
+    pong.timestamp = now;
+    espnowSend(mac, (uint8_t *)&pong, sizeof(pong));
+    return;
+  }
+
+  // Everything below requires an accepted GAME_START for this generation
+  if (!pbState.startReceived) return;
+
+  if (msgType == MSG_GAME_STATE) {
+    GameStateMessage msg;
+    memcpy(&msg, data, sizeof(msg));
+    if (msg.generation != pbState.matchGeneration || msg.sequence <= pbState.lastReceivedSequence) return;
+    // Host only broadcasts state for COUNTDOWN..BALL_LANDED
+    if (msg.phase < PB_PHASE_COUNTDOWN || msg.phase > PB_PHASE_BALL_LANDED) return;
+    if (msg.targetPlayerIdx >= pbState.playerCount) return;
+    if (msg.ballSide > 1 || msg.ballZone > 1 || msg.servingSide > 1) return;
+    if (pbState.phase == PB_PHASE_GAME_OVER) return;
+    pbState.lastReceivedSequence = msg.sequence;
+    pbState.lastHostRx = now;
+
+    PickleballPhase newPhase = (PickleballPhase)msg.phase;
+    if (newPhase != pbState.phase) {
+      pbState.phaseStartTime = now;
+      pbState.ballAnimFrame = 0;
+    }
+    pbState.phase = newPhase;
+    pbState.ballSide = msg.ballSide;
+    pbState.ballZone = msg.ballZone;
+    pbState.scoreLeft = msg.scoreLeft;
+    pbState.scoreRight = msg.scoreRight;
+    pbState.servingSide = msg.servingSide;
+    pbState.targetPlayerIdx = msg.targetPlayerIdx;
+    pbState.volleyId = msg.volleyId;
+    pbState.reactionDeadline = now + msg.reactionTimeMs;
+  }
+  else if (msgType == MSG_POINT_SCORED) {
+    PointScoredMessage msg;
+    memcpy(&msg, data, sizeof(msg));
+    // Host sends 3 copies with one sequence; the sequence check drops repeats
+    if (msg.generation != pbState.matchGeneration || msg.sequence <= pbState.lastReceivedSequence) return;
+    if (msg.scoringSide > 1 || msg.reason > PB_MISS_DISCONNECTED) return;
+    if (pbState.phase == PB_PHASE_GAME_OVER) return;
+    pbState.lastReceivedSequence = msg.sequence;
+    pbState.lastHostRx = now;
+    pbState.scoreLeft = msg.scoreLeft;
+    pbState.scoreRight = msg.scoreRight;
+    pbState.lastPointWinner = msg.scoringSide;
+    pbState.lastPointReason = msg.reason;
+    pbState.phase = PB_PHASE_POINT_RESULT;
+    pbState.phaseStartTime = now;
+
+    if (msg.scoringSide == mySide()) playPickleballPoint();
+    else playPickleballMiss();
+  }
+  else if (msgType == MSG_GAME_OVER) {
+    GameOverMessage msg;
+    memcpy(&msg, data, sizeof(msg));
+    if (msg.generation != pbState.matchGeneration || msg.sequence <= pbState.lastReceivedSequence) return;
+    if (msg.winnerSide > 1) return;
+    pbState.lastReceivedSequence = msg.sequence;
+    pbState.lastHostRx = now;
+    pbState.scoreLeft = msg.scoreLeft;
+    pbState.scoreRight = msg.scoreRight;
+    pbEnterGameOver(msg.winnerSide);
+  }
+}
+
+// Drain the ESP-NOW receive queue (call from the game loop)
+static void pbProcessRx(unsigned long now) {
+  ESPNowRxPacket pkt;
+  uint8_t budget = ESPNOW_RX_QUEUE_LEN;
+  while (budget-- && espnowReceive(pkt)) {
+    if (pkt.len < 1) continue;   // lengths were validated per type on receive
+    if (pbState.isHost) pbHandleHostPacket(pkt.mac, pkt.data, now);
+    else pbHandleClientPacket(pkt.mac, pkt.data, now);
+  }
+}
+
+// ============================================================================
+// Practice (offline, single player)
 // ============================================================================
 
 int handlePickleballPractice(SSD1306Wire &display) {
   Serial.println(F("Starting Pickleball Practice!"));
-  pinMode(BUTTON_PIN_PRG, INPUT_PULLUP);
-  pinMode(BUTTON_PIN_EXTERNAL, INPUT_PULLUP);
+
+  PbInput input;
+  pbInputInit(input);  // also configures both pins as INPUT_PULLUP
 
   uint8_t playerScore = 0;
   uint8_t cpuScore = 0;
@@ -326,20 +492,17 @@ int handlePickleballPractice(SSD1306Wire &display) {
   bool ballAtPlayer = true;
   unsigned long practiceStart = millis();
 
-  auto buttonDown = []() {
-    return digitalRead(BUTTON_PIN_PRG) == LOW ||
-           digitalRead(BUTTON_PIN_EXTERNAL) == LOW;
-  };
-
-  auto drawPracticeCourt = [&](bool ballVisible, uint8_t zone,
-                               uint8_t requiredPresses, const String &status,
-                               int ballX, int ballY) {
+  auto drawPracticeCourt = [&](bool ballVisible, uint8_t requiredPresses,
+                               const char *status, int ballX, int ballY) {
+    char buf[16];
     display.clear();
     display.setFont(ArialMT_Plain_10);
     display.setTextAlignment(TEXT_ALIGN_LEFT);
-    display.drawString(2, 0, "YOU " + String(playerScore));
+    snprintf(buf, sizeof(buf), "YOU %u", (unsigned)playerScore);
+    display.drawString(2, 0, buf);
     display.setTextAlignment(TEXT_ALIGN_RIGHT);
-    display.drawString(126, 0, "CPU " + String(cpuScore));
+    snprintf(buf, sizeof(buf), "CPU %u", (unsigned)cpuScore);
+    display.drawString(126, 0, buf);
     display.drawRect(PB_COURT_X, PB_COURT_Y, PB_COURT_W, PB_COURT_H);
     display.drawLine(PB_NET_X, PB_COURT_Y, PB_NET_X, PB_COURT_Y + PB_COURT_H);
     display.drawLine(PB_COURT_X, PB_COURT_MID_Y,
@@ -351,7 +514,7 @@ int handlePickleballPractice(SSD1306Wire &display) {
         display.drawString(29, ballY - 7, requiredPresses == 1 ? "1" : "2");
       }
     }
-    if (status.length() > 0) {
+    if (status && status[0]) {
       display.setTextAlignment(TEXT_ALIGN_CENTER);
       display.drawString(64, 52, status);
     }
@@ -367,9 +530,13 @@ int handlePickleballPractice(SSD1306Wire &display) {
   display.drawString(64, 44, "Bottom: press twice");
   display.drawString(64, 56, "First to 6");
   display.display();
-  delay(1800);
+  pbWait(1800);
 
-  while (buttonDown()) delay(10);
+  while (pbRawButtonDown()) {
+    esp_task_wdt_reset();
+    delay(10);
+  }
+  pbInputInit(input);
 
   while (playerScore < PB_WINNING_SCORE && cpuScore < PB_WINNING_SCORE &&
          millis() - practiceStart < 90000UL) {
@@ -388,35 +555,39 @@ int handlePickleballPractice(SSD1306Wire &display) {
       int ballY = startY + ((endY - startY) * frame) / 8;
       int arc = (8 * frame * (8 - frame)) / 16;
       ballY -= arc;
-      drawPracticeCourt(true, zone, requiredPresses, "", ballX, ballY);
-      esp_task_wdt_reset();
-      delay(PB_BALL_TRAVEL_MS / 8);
+      drawPracticeCourt(true, requiredPresses, "", ballX, ballY);
+      pbInputPressed(input, millis());  // keep debouncer current; early presses don't count
+      pbWait(PB_BALL_TRAVEL_MS / 8);
     }
 
     if (ballAtPlayer) {
       unsigned long reactionWindow = max((int)PB_REACTION_TIME_MIN,
         (int)PB_REACTION_TIME_START - (int)volleyCount * PB_REACTION_STEP);
-      unsigned long deadline = millis() + reactionWindow;
+      unsigned long reactStart = millis();
       uint8_t pressCount = 0;
-      bool wasDown = false;
-      unsigned long confirmDeadline = 0;
-      drawPracticeCourt(true, zone, requiredPresses,
+      unsigned long confirmStart = 0;
+      bool confirming = false;
+      drawPracticeCourt(true, requiredPresses,
                         requiredPresses == 1 ? "PRESS 1" : "PRESS 2",
                         29, zone == 0 ? 23 : 48);
 
-      while (millis() < deadline || (confirmDeadline && millis() < confirmDeadline)) {
-        bool down = buttonDown();
-        if (down && !wasDown) {
+      while (true) {
+        unsigned long now = millis();
+        bool inWindow = now - reactStart < reactionWindow;
+        bool inConfirm = confirming && now - confirmStart < PB_CONFIRM_WINDOW_MS;
+        if (!inWindow && !inConfirm) break;
+        if (pbInputPressed(input, now)) {
           pressCount++;
           playPickleballHit();
           if (pressCount == requiredPresses) {
-            confirmDeadline = millis() + PB_CONFIRM_WINDOW_MS;
+            confirming = true;
+            confirmStart = now;
           }
         }
-        wasDown = down;
         if (pressCount > requiredPresses) break;
+        soundUpdate();
         esp_task_wdt_reset();
-        delay(10);
+        delay(5);
       }
 
       if (pressCount == requiredPresses) {
@@ -425,24 +596,24 @@ int handlePickleballPractice(SSD1306Wire &display) {
       } else {
         cpuScore++;
         volleyCount = 0;
-        drawPracticeCourt(false, zone, requiredPresses,
+        drawPracticeCourt(false, requiredPresses,
                           pressCount > requiredPresses ? "TOO MANY" : "MISSED",
                           0, 0);
         playPickleballMiss();
-        delay(PB_POINT_DISPLAY_MS);
+        pbWait(PB_POINT_DISPLAY_MS);
         ballAtPlayer = true;
       }
     } else {
       // CPU returns most balls, but occasionally misses so a practiced player
       // can win. Longer rallies slightly increase its miss chance.
       int missChance = min(38, 14 + (int)volleyCount * 3);
-      delay(max(180, 520 - (int)volleyCount * 25));
+      pbWait(max(180, 520 - (int)volleyCount * 25));
       if (random(0, 100) < missChance) {
         playerScore++;
         volleyCount = 0;
-        drawPracticeCourt(false, zone, requiredPresses, "CPU MISSED", 0, 0);
+        drawPracticeCourt(false, requiredPresses, "CPU MISSED", 0, 0);
         playPickleballPoint();
-        delay(PB_POINT_DISPLAY_MS);
+        pbWait(PB_POINT_DISPLAY_MS);
         ballAtPlayer = true;
       } else {
         volleyCount++;
@@ -452,116 +623,173 @@ int handlePickleballPractice(SSD1306Wire &display) {
   }
 
   bool won = playerScore > cpuScore;
-  Serial.println("Pickleball practice complete! Score: " +
-                 String(playerScore) + "-" + String(cpuScore));
+  Serial.printf("Pickleball practice complete! Score: %u-%u\n",
+                (unsigned)playerScore, (unsigned)cpuScore);
+  char buf[24];
   display.clear();
   display.setTextAlignment(TEXT_ALIGN_CENTER);
   display.setFont(ArialMT_Plain_16);
   display.drawString(64, 12, won ? "You win!" : "Practice over");
   display.setFont(ArialMT_Plain_10);
-  display.drawString(64, 36, "YOU " + String(playerScore) + " - " +
-                     String(cpuScore) + " CPU");
+  snprintf(buf, sizeof(buf), "YOU %u - %u CPU", (unsigned)playerScore, (unsigned)cpuScore);
+  display.drawString(64, 36, buf);
   display.drawString(64, 52, "Offline / no wager");
   display.display();
   if (won) playPickleballWin();
   else playPickleballMiss();
-  delay(1800);
+  pbWait(1800);
+  soundStop();
   return won ? 10 : 5;
 }
 
-int handlePickleballGame(SSD1306Wire &display) {
-  extern GanamosConfig ganamosConfig;
+// ============================================================================
+// Multiplayer
+// ============================================================================
 
-  // Initialize game state
-  memset(&pbState, 0, sizeof(pbState));
+// Restores the radio on every exit path from handlePickleballGame():
+// ESP-NOW off; WiFi off again if the game turned it on, otherwise modem
+// sleep re-enabled (it is disabled during the game for ESP-NOW latency).
+struct PbRadioSession {
+  bool wifiStartedByGame = false;
+  bool espnowActive = false;
+  ~PbRadioSession() {
+    soundStop();
+    if (espnowActive) espnowDeinit();
+    if (wifiStartedByGame) {
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+    } else if (WiFi.getMode() != WIFI_OFF) {
+      WiFi.setSleep(true);
+    }
+    digitalWrite(RGB_LED, LOW);
+  }
+};
+
+static void pbShowMessage(SSD1306Wire &display, const char *line1, const char *line2) {
+  display.clear();
+  display.setFont(ArialMT_Plain_10);
+  display.setTextAlignment(TEXT_ALIGN_CENTER);
+  if (line1) display.drawString(64, line2 ? 18 : 25, line1);
+  if (line2) display.drawString(64, 34, line2);
+  display.display();
+}
+
+// Cheap fingerprint of everything static screens show; a change => redraw.
+static uint32_t pbRenderSignature(unsigned long now) {
+  uint32_t h = 2166136261u;
+  auto mix = [&h](uint32_t v) { h = (h ^ v) * 16777619u; };
+  mix(pbState.phase);
+  mix(pbState.playerCount);
+  mix(pbState.myPlayerIndex);
+  mix(pbState.isHost);
+  mix(pbState.scoreLeft);
+  mix(pbState.scoreRight);
+  mix(pbState.wagerAmount);
+  mix(pbState.wagerActive);
+  mix((uint16_t)pbState.wagerResult);
+  mix(pbState.lastPointWinner);
+  mix(pbState.lastPointReason);
+  for (const char *c = pbState.roomCode.c_str(); c && *c; c++) mix((uint8_t)*c);
+  for (int i = 0; i < pbState.playerCount && i < MAX_GAME_PLAYERS; i++) {
+    mix((uint8_t)pbState.players[i].petInitial);
+    mix(pbState.players[i].side);
+    mix(pbState.players[i].position);
+  }
+  if (pbState.phase == PB_PHASE_LOBBY) {
+    mix((now - pbState.phaseStartTime) / 1000);  // "Waiting... Ns" countdown
+  } else if (pbState.phase == PB_PHASE_COUNTDOWN) {
+    mix((now - pbState.phaseStartTime) / 1000);
+  }
+  return h;
+}
+
+static void pbLogChannel() {
+  uint8_t primary = 0;
+  wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+  if (esp_wifi_get_channel(&primary, &second) == ESP_OK) {
+    Serial.printf("ESP-NOW on WiFi channel %u (all players must share it)\n", (unsigned)primary);
+  }
+}
+
+int handlePickleballGame(SSD1306Wire &display) {
+  // Initialize game state (assignment, not memset: the struct holds Strings)
+  pbState = PickleballState{};
   pbState.phase = PB_PHASE_LOBBY;
   pbState.isHost = true;  // Assume host until we discover we're joining
   pbState.myPlayerIndex = 0;
   pbState.phaseStartTime = millis();
+  flushButtonQueue();
+  pbReliableRemaining = 0;
+  pbLastBeep = -1;
 
-  // Check if we're joining an existing game (invite received via config)
+  PbRadioSession radio;  // restores WiFi/ESP-NOW/LED on every return below
+
+  // Join-by-invite path: NOT WIRED. pendingPickleballGameId is never assigned
+  // anywhere in the firmware, so this branch (and joinGameOnServer) is
+  // currently unreachable. Kept in place pending a product decision.
   extern String pendingPickleballGameId;
-  extern String pendingPickleballHostMac;
-
   if (pendingPickleballGameId.length() > 0) {
     pbState.isHost = false;
     pbState.gameId = pendingPickleballGameId;
-    Serial.println("🏓 Joining existing game: " + pbState.gameId);
+    Serial.println("Joining existing game: " + pbState.gameId);
   }
 
-  Serial.println(F("🏓 Starting Pickleball game..."));
+  Serial.println(F("Starting Pickleball game..."));
 
   // Ensure WiFi is available for lobby phase
   if (WiFi.status() != WL_CONNECTED) {
-    display.clear();
-    display.setFont(ArialMT_Plain_10);
-    display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 20, "Connecting WiFi...");
-    display.display();
+    pbShowMessage(display, "Connecting WiFi...", nullptr);
 
+    radio.wifiStartedByGame = true;
     WiFi.mode(WIFI_STA);
     WiFi.begin();
 
     unsigned long wifiStart = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 8000) {
       esp_task_wdt_reset();
+      soundUpdate();
       delay(250);
+      char dots[4];
+      int n = ((millis() - wifiStart) / 500) % 4;
+      for (int i = 0; i < n; i++) dots[i] = '.';
+      dots[n] = '\0';
       display.clear();
       display.setFont(ArialMT_Plain_10);
       display.setTextAlignment(TEXT_ALIGN_CENTER);
       display.drawString(64, 20, "Connecting WiFi...");
-      int dots = ((millis() - wifiStart) / 500) % 4;
-      String dotStr = "";
-      for (int i = 0; i < dots; i++) dotStr += ".";
-      display.drawString(64, 35, dotStr);
+      display.drawString(64, 35, dots);
       display.display();
     }
 
     if (WiFi.status() != WL_CONNECTED) {
-      display.clear();
-      display.setFont(ArialMT_Plain_10);
-      display.setTextAlignment(TEXT_ALIGN_CENTER);
-      display.drawString(64, 25, "WiFi failed");
-      display.drawString(64, 40, "Try again later");
-      display.display();
-      delay(2000);
+      pbShowMessage(display, "WiFi failed", "Try again later");
+      pbWait(2000);
       return 0;
     }
-    Serial.println(F("✅ WiFi connected for Pickleball"));
+    Serial.println(F("WiFi connected for Pickleball"));
   }
+
+  WiFi.macAddress(pbMyMac);
 
   // Initialize ESP-NOW (works alongside WiFi STA)
   if (!espnowInit()) {
-    display.clear();
-    display.setFont(ArialMT_Plain_10);
-    display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 25, "ESP-NOW init failed");
-    display.display();
-    delay(2000);
+    pbShowMessage(display, "ESP-NOW init failed", nullptr);
+    pbWait(2000);
     return 0;
   }
-
-  // Set our receive callback
-  espnowSetReceiveCallback(pickleballOnESPNowReceive);
+  radio.espnowActive = true;
+  WiFi.setSleep(false);  // modem sleep adds 100ms+ latency to ESP-NOW
+  pbLogChannel();
 
   String myMac = espnowGetMacString();
-  Serial.println("My MAC: " + myMac);
 
-  // --- JOIN MODE: Join existing game from invite ---
+  // --- JOIN MODE: Join existing game from invite (not wired, see above) ---
   if (!pbState.isHost) {
-    display.clear();
-    display.setFont(ArialMT_Plain_10);
-    display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 20, "Joining game...");
-    display.display();
+    pbShowMessage(display, "Joining game...", nullptr);
 
     if (!joinGameOnServer(pbState.gameId, myMac)) {
-      display.clear();
-      display.drawString(64, 25, "Failed to join");
-      display.drawString(64, 40, "game");
-      display.display();
-      delay(2000);
-      espnowDeinit();
+      pbShowMessage(display, "Failed to join", "game");
+      pbWait(2000);
       return 0;
     }
 
@@ -572,36 +800,26 @@ int handlePickleballGame(SSD1306Wire &display) {
 
   // --- No invite: try to find an existing game first, then create ---
   if (pbState.isHost) {
-    display.clear();
-    display.setFont(ArialMT_Plain_10);
-    display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 20, "Finding game...");
-    display.display();
+    pbShowMessage(display, "Finding game...", nullptr);
 
     // Try to find and join an existing lobby (wagerAmount=0 for discovery)
     pbState.wagerAmount = 0;
     if (!createGameOnServer()) {
-      display.clear();
-      display.drawString(64, 25, "Failed to connect");
-      display.display();
-      delay(2000);
-      espnowDeinit();
+      pbShowMessage(display, "Failed to connect", nullptr);
+      pbWait(2000);
       return 0;
     }
 
     if (!pbState.isHost) {
       // Found and joined an existing game
-      Serial.println("🏓 Joined existing game: " + pbState.gameId);
-      display.clear();
-      display.setFont(ArialMT_Plain_10);
-      display.setTextAlignment(TEXT_ALIGN_CENTER);
-      display.drawString(64, 20, "Found game!");
-      display.drawString(64, 35, String(pbState.playerCount) + " players");
-      display.display();
-      delay(800);
+      Serial.println("Joined existing game: " + pbState.gameId);
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%u players", (unsigned)pbState.playerCount);
+      pbShowMessage(display, "Found game!", buf);
+      pbWait(800);
     } else {
       // No game found — we're hosting. Now ask about wager.
-      Serial.println("🏓 No existing game found, hosting new one: " + pbState.gameId);
+      Serial.println("No existing game found, hosting new one: " + pbState.gameId);
 
       const uint16_t wagerOptions[] = {0, 100, 500, 1000};
       int wagerIdx = 0;
@@ -620,20 +838,22 @@ int handlePickleballGame(SSD1306Wire &display) {
         if (wagerOptions[wagerIdx] == 0) {
           display.drawString(64, 20, "FREE");
         } else {
-          display.drawString(64, 20, String(wagerOptions[wagerIdx]));
+          char buf[8];
+          snprintf(buf, sizeof(buf), "%u", (unsigned)wagerOptions[wagerIdx]);
+          display.drawString(64, 20, buf);
         }
 
         display.setFont(ArialMT_Plain_10);
         display.drawString(64, 50, "Tap=cycle  Hold=pick");
         display.display();
 
-        bool btn = digitalRead(BUTTON_PIN_PRG) == LOW || digitalRead(BUTTON_PIN_EXTERNAL) == LOW;
+        bool btn = pbRawButtonDown();
 
         if (btn && !lastWagerBtn) {
           unsigned long pressStart = millis();
-          while ((digitalRead(BUTTON_PIN_PRG) == LOW || digitalRead(BUTTON_PIN_EXTERNAL) == LOW)
-                 && millis() - pressStart < 2000) {
+          while (pbRawButtonDown() && millis() - pressStart < 2000) {
             esp_task_wdt_reset();
+            soundUpdate();
             delay(20);
           }
           unsigned long dur = millis() - pressStart;
@@ -647,11 +867,12 @@ int handlePickleballGame(SSD1306Wire &display) {
           }
         }
         lastWagerBtn = btn;
+        soundUpdate();
         delay(30);
       }
 
       uint16_t selectedWager = wagerOptions[wagerIdx];
-      Serial.printf("🏓 Wager selected: %d sats\n", selectedWager);
+      Serial.printf("Wager selected: %d sats\n", selectedWager);
 
       // Transition game from "setup" to "lobby" (also sets wager)
       pbState.wagerAmount = selectedWager;
@@ -665,6 +886,8 @@ int handlePickleballGame(SSD1306Wire &display) {
     bool wagerAccepted = false;
     bool lastAccBtn = false;
     unsigned long acceptTimeout = millis() + 15000;
+    char amountBuf[8];
+    snprintf(amountBuf, sizeof(amountBuf), "%u", (unsigned)pbState.wagerAmount);
 
     while (!wagerDecision && millis() < acceptTimeout) {
       esp_task_wdt_reset();
@@ -674,18 +897,18 @@ int handlePickleballGame(SSD1306Wire &display) {
       display.drawString(64, 0, "WAGER");
 
       display.setFont(ArialMT_Plain_24);
-      display.drawString(64, 18, String(pbState.wagerAmount));
+      display.drawString(64, 18, amountBuf);
 
       display.setFont(ArialMT_Plain_10);
       display.drawString(64, 46, "Hold=Accept  Tap=Decline");
       display.display();
 
-      bool btn = digitalRead(BUTTON_PIN_PRG) == LOW || digitalRead(BUTTON_PIN_EXTERNAL) == LOW;
+      bool btn = pbRawButtonDown();
       if (btn && !lastAccBtn) {
         unsigned long pressStart = millis();
-        while ((digitalRead(BUTTON_PIN_PRG) == LOW || digitalRead(BUTTON_PIN_EXTERNAL) == LOW)
-               && millis() - pressStart < 2000) {
+        while (pbRawButtonDown() && millis() - pressStart < 2000) {
           esp_task_wdt_reset();
+          soundUpdate();
           delay(20);
         }
         unsigned long dur = millis() - pressStart;
@@ -693,33 +916,25 @@ int handlePickleballGame(SSD1306Wire &display) {
         wagerAccepted = (dur >= 500);
       }
       lastAccBtn = btn;
+      soundUpdate();
       delay(30);
     }
 
     if (!wagerAccepted) {
-      Serial.println(F("🏓 Wager declined, exiting game"));
+      Serial.println(F("Wager declined, exiting game"));
       setWagerConsent(false); // Removes this device from the lobby atomically.
-      display.clear();
-      display.setFont(ArialMT_Plain_10);
-      display.setTextAlignment(TEXT_ALIGN_CENTER);
-      display.drawString(64, 25, "Wager declined");
-      display.display();
-      delay(1500);
-      espnowDeinit();
+      pbShowMessage(display, "Wager declined", nullptr);
+      pbWait(1500);
       return 0;
     }
 
     playMenuSelectTone();
     if (!setWagerConsent(true)) {
-      display.clear();
-      display.setTextAlignment(TEXT_ALIGN_CENTER);
-      display.drawString(64, 25, "Could not accept wager");
-      display.display();
-      delay(1500);
-      espnowDeinit();
+      pbShowMessage(display, "Could not accept wager", nullptr);
+      pbWait(1500);
       return 0;
     }
-    Serial.printf("🏓 Wager of %d sats accepted\n", pbState.wagerAmount);
+    Serial.printf("Wager of %d sats accepted\n", pbState.wagerAmount);
   }
 
   // ====================================================================
@@ -727,45 +942,63 @@ int handlePickleballGame(SSD1306Wire &display) {
   // ====================================================================
 
   bool gameRunning = true;
+  const char *exitLine1 = nullptr;  // shown briefly when the game aborts
+  const char *exitLine2 = nullptr;
   unsigned long lastRender = 0;
-  const unsigned long RENDER_INTERVAL = 50; // 20 FPS
+  const unsigned long RENDER_INTERVAL = 50; // 20 FPS while the ball moves
+  uint32_t lastSignature = 0;
+  bool forceRedraw = true;
+
+  PbInput input;
+  pbInputInit(input);
 
   while (gameRunning) {
     unsigned long now = millis();
     esp_task_wdt_reset(); // Feed watchdog
+    soundUpdate();
 
-    // --- Check for local button press ---
-    bool prgBtn = digitalRead(BUTTON_PIN_PRG) == LOW;
-    bool extBtn = digitalRead(BUTTON_PIN_EXTERNAL) == LOW;
-    static bool lastBtnState = false;
-    bool currentBtn = prgBtn || extBtn;
+    // --- Apply ESP-NOW packets queued by the WiFi-task callback ---
+    pbProcessRx(now);
 
-    if (currentBtn && !lastBtnState) {
-      // Button just pressed
+    // --- Check for local button press (debounced) ---
+    if (pbInputPressed(input, now)) {
       handleLocalButtonPress();
     }
-    lastBtnState = currentBtn;
 
     // --- Phase-specific logic ---
     switch (pbState.phase) {
       case PB_PHASE_LOBBY: {
-        // Poll server for player list
-        if (now - pbState.lastLobbyPoll > PB_LOBBY_POLL_MS) {
-          pbState.lastLobbyPoll = now;
+        // Poll server for player list. Presses made during the blocking
+        // request are latched and applied afterwards.
+        if (pbState.lastLobbyPoll == 0 || now - pbState.lastLobbyPoll >= PB_LOBBY_POLL_MS) {
+          pbLatchBegin();
           pollLobbyState();
+          bool latched = pbLatchEnd();
+          pbState.lastLobbyPoll = millis();
+          if (pbState.lobbyCancelled) {
+            exitLine1 = "Game cancelled";
+            gameRunning = false;
+            break;
+          }
+          if (latched) {
+            pbInputInit(input);  // adopt current level so a held press isn't counted twice
+            handleLocalButtonPress();
+          }
         }
 
-        // Check for lobby timeout (100 seconds)
-        if (now - pbState.phaseStartTime > 100000 && pbState.playerCount < 2) {
+        // Lobby timeout (matches the "Waiting... Ns" countdown on screen)
+        if (pbState.phase == PB_PHASE_LOBBY && pbState.playerCount < 2 &&
+            millis() - pbState.phaseStartTime > PB_LOBBY_TIMEOUT_MS) {
           Serial.println(F("Lobby timed out"));
+          exitLine1 = "No players joined";
           gameRunning = false;
         }
         break;
       }
 
       case PB_PHASE_ESPNOW_SYNC: {
-        // Host: wait for all players to send LOBBY_READY via ESP-NOW
         if (pbState.isHost) {
+          // Host: wait for all players to send LOBBY_READY via ESP-NOW
           bool allReady = true;
           bool allStartAcknowledged = true;
           for (int i = 1; i < pbState.playerCount; i++) { // Skip host (idx 0)
@@ -785,19 +1018,19 @@ int handlePickleballGame(SSD1306Wire &display) {
 
           // Never begin with missing players. A dropped start packet is retried
           // until every client acknowledges the current match generation.
-          if (allReady && allStartAcknowledged) {
+          if (pbState.playerCount >= 2 && allReady && allStartAcknowledged) {
             Serial.println(F("ESP-NOW sync complete, starting countdown"));
-            pbState.phase = PB_PHASE_COUNTDOWN;
-            pbState.phaseStartTime = now;
+            pbStartMatch(now);
           } else if (allReady && now - pbState.lastStateSend > 250) {
             pbState.lastStateSend = now;
             // Send GAME_START to each player with their index
             GameStartMessage startMsg;
+            memset(&startMsg, 0, sizeof(startMsg));
             startMsg.type = MSG_GAME_START;
             startMsg.generation = pbState.matchGeneration;
             startMsg.sequence = ++pbState.sendSequence;
             startMsg.playerCount = pbState.playerCount;
-            for (int i = 0; i < pbState.playerCount; i++) {
+            for (int i = 0; i < pbState.playerCount && i < MAX_GAME_PLAYERS; i++) {
               startMsg.initials[i] = pbState.players[i].petInitial;
               startMsg.sides[i] = pbState.players[i].side;
               startMsg.positions[i] = pbState.players[i].position;
@@ -811,25 +1044,31 @@ int handlePickleballGame(SSD1306Wire &display) {
               }
             }
           }
-          if (now - pbState.phaseStartTime > 15000 && !(allReady && allStartAcknowledged)) {
+          if (pbState.phase == PB_PHASE_ESPNOW_SYNC && now - pbState.phaseStartTime > 15000) {
             Serial.println(F("ESP-NOW sync failed: missing ready/start acknowledgement"));
+            pbLogChannel();
+            exitLine1 = "Can't reach other player";
+            exitLine2 = "(different WiFi channel?)";
             gameRunning = false;
           }
         } else {
-          // Client: send LOBBY_READY and wait for GAME_START
-          if (now - pbState.lastStateSend > 500) {
+          // Client: send LOBBY_READY to the host and wait for GAME_START
+          if (now - pbState.lastStateSend > 500 && pbState.playerCount > 0) {
             pbState.lastStateSend = now;
             LobbyReadyMessage ready;
             ready.type = MSG_LOBBY_READY;
             ready.generation = pbState.matchGeneration;
             ready.playerIndex = pbState.myPlayerIndex;
             ready.petInitial = ganamosConfig.petName.charAt(0);
-            espnowBroadcast((uint8_t*)&ready, sizeof(ready));
+            espnowSend(pbState.players[0].mac, (uint8_t*)&ready, sizeof(ready));
           }
 
           // Timeout waiting for game start
           if (now - pbState.phaseStartTime > 15000) {
-            Serial.println(F("ESP-NOW sync timeout"));
+            Serial.println(F("ESP-NOW sync timeout (no GAME_START from host)"));
+            pbLogChannel();
+            exitLine1 = "Can't reach other player";
+            exitLine2 = "(different WiFi channel?)";
             gameRunning = false;
           }
         }
@@ -846,12 +1085,9 @@ int handlePickleballGame(SSD1306Wire &display) {
           pbState.phaseStartTime = now;
           pbState.servingSide = 0; // Left serves first
           playCountdownGo();
-        } else {
-          static int lastBeep = -1;
-          if (secondsLeft != lastBeep) {
-            lastBeep = secondsLeft;
-            playCountdownBeep();
-          }
+        } else if (secondsLeft != pbLastBeep) {
+          pbLastBeep = secondsLeft;
+          playCountdownBeep();
         }
         break;
       }
@@ -883,7 +1119,16 @@ int handlePickleballGame(SSD1306Wire &display) {
             }
           }
 
-          // Reset button tracking for new volley
+          // Nobody on the receiving side (bad lobby assignment): can't play
+          if (pbState.targetPlayerIdx == 255) {
+            Serial.println(F("No player on receiving side; aborting game"));
+            exitLine1 = "Team setup error";
+            gameRunning = false;
+            break;
+          }
+
+          // New volley: presses tagged with an older volleyId are dropped
+          pbState.volleyId++;
           pbState.buttonPressCount = 0;
           pbState.hitConfirmed = false;
           pbState.confirmDeadline = 0;
@@ -916,6 +1161,7 @@ int handlePickleballGame(SSD1306Wire &display) {
         if (pbState.isHost && (now - pbState.phaseStartTime > PB_BALL_TRAVEL_MS)) {
           pbState.phase = PB_PHASE_BALL_LANDED;
           pbState.phaseStartTime = now;
+          flushButtonQueue();  // only presses made while the ball is down count
 
           // Progressive difficulty: reaction window shrinks each volley
           int reactionMs = PB_REACTION_TIME_START - (pbState.volleyCount * PB_REACTION_STEP);
@@ -933,12 +1179,20 @@ int handlePickleballGame(SSD1306Wire &display) {
 
       case PB_PHASE_BALL_LANDED: {
         if (pbState.isHost) {
+          if (pbState.targetPlayerIdx >= pbState.playerCount) {
+            // Should not happen (SERVING validates); re-serve safely
+            pbState.phase = PB_PHASE_SERVING;
+            pbState.phaseStartTime = now;
+            break;
+          }
           uint8_t targetSide = pbState.players[pbState.targetPlayerIdx].side;
 
-          // --- Handle incoming button press ---
+          // --- Handle incoming button presses for this volley ---
           PendingButtonPress pendingPress;
-          if (dequeueButtonPress(pendingPress)) {
+          while (pbState.phase == PB_PHASE_BALL_LANDED && dequeueButtonPress(pendingPress)) {
+            if (pendingPress.volleyId != pbState.volleyId) continue;   // stale
             uint8_t pressedIdx = pendingPress.playerIndex;
+            if (pressedIdx >= pbState.playerCount) continue;
             uint8_t presserSide = pbState.players[pressedIdx].side;
 
             if (presserSide != targetSide) {
@@ -946,13 +1200,11 @@ int handlePickleballGame(SSD1306Wire &display) {
               awardPoint(1 - presserSide, PB_MISS_WRONG_PLAYER);
             } else if (pbState.playerCount > 2 && pressedIdx != pbState.targetPlayerIdx) {
               // Doubles: wrong player on correct side
-              uint8_t scoringSide = 1 - targetSide;
-              awardPoint(scoringSide, PB_MISS_WRONG_PLAYER);
+              awardPoint(1 - targetSide, PB_MISS_WRONG_PLAYER);
             } else if (pbState.hitConfirmed) {
               // Already hit the required count — extra press is a fault
               pbState.hitConfirmed = false;
-              uint8_t scoringSide = 1 - targetSide;
-              awardPoint(scoringSide, PB_MISS_DOUBLE_FAULT);
+              awardPoint(1 - targetSide, PB_MISS_DOUBLE_FAULT);
             } else {
               pbState.buttonPressCount++;
 
@@ -962,27 +1214,27 @@ int handlePickleballGame(SSD1306Wire &display) {
                 pbState.confirmDeadline = now + PB_CONFIRM_WINDOW_MS;
                 playPickleballHit();
               } else if (pbState.buttonPressCount > pbState.requiredPresses) {
-                // Over-pressed before confirm even started (shouldn't happen, safety net)
-                uint8_t scoringSide = 1 - targetSide;
-                awardPoint(scoringSide, PB_MISS_DOUBLE_FAULT);
+                // Over-pressed before confirm even started (safety net)
+                awardPoint(1 - targetSide, PB_MISS_DOUBLE_FAULT);
               }
             }
           }
+          if (pbState.phase != PB_PHASE_BALL_LANDED) break;
 
           // --- Check confirm window expiry (successful hit!) ---
-          if (pbState.hitConfirmed && now >= pbState.confirmDeadline) {
+          if (pbState.hitConfirmed && (long)(now - pbState.confirmDeadline) >= 0) {
             pbState.hitConfirmed = false;
             pbState.volleyCount++;
             pbState.servingSide = targetSide;
             pbState.phase = PB_PHASE_SERVING;
             pbState.phaseStartTime = now;
             sendGameStateToPlayers();
+            break;
           }
 
           // --- Check reaction timeout (missed the ball) ---
-          if (!pbState.hitConfirmed && now > pbState.reactionDeadline) {
-            uint8_t scoringSide = 1 - targetSide;
-            awardPoint(scoringSide, PB_MISS_TIMEOUT);
+          if (!pbState.hitConfirmed && (long)(now - pbState.reactionDeadline) > 0) {
+            awardPoint(1 - targetSide, PB_MISS_TIMEOUT);
           }
         }
         break;
@@ -992,34 +1244,23 @@ int handlePickleballGame(SSD1306Wire &display) {
         if (now - pbState.phaseStartTime > PB_POINT_DISPLAY_MS) {
           // Check for game over
           if (pbState.scoreLeft >= PB_WINNING_SCORE || pbState.scoreRight >= PB_WINNING_SCORE) {
-            pbState.phase = PB_PHASE_GAME_OVER;
-            pbState.phaseStartTime = now;
-
+            uint8_t winnerSide = (pbState.scoreLeft >= PB_WINNING_SCORE) ? 0 : 1;
             if (pbState.isHost) {
-              // Send game over to all players
               GameOverMessage gameOver;
               gameOver.type = MSG_GAME_OVER;
               gameOver.generation = pbState.matchGeneration;
               gameOver.sequence = ++pbState.sendSequence;
-              gameOver.winnerSide = (pbState.scoreLeft >= PB_WINNING_SCORE) ? 0 : 1;
+              gameOver.winnerSide = winnerSide;
               gameOver.scoreLeft = pbState.scoreLeft;
               gameOver.scoreRight = pbState.scoreRight;
-              espnowBroadcast((uint8_t*)&gameOver, sizeof(gameOver));
+              pbSendReliable(&gameOver, sizeof(gameOver));
+              pbFlushReliable();  // all 3 copies out before the blocking HTTP call
 
               // Report to server (also parses wager settlement)
               reportGameComplete();
-
-              uint8_t mySide = pbState.players[pbState.myPlayerIndex].side;
-              if (gameOver.winnerSide == mySide) {
-                if (pbState.wagerResult > 0) {
-                  playWagerVictoryFanfare();
-                } else {
-                  playPickleballWin();
-                }
-              } else {
-                playPickleballMiss();
-              }
             }
+            // Clients also get here on their own if every GAME_OVER copy is lost
+            pbEnterGameOver(winnerSide);
           } else {
             // Next serve
             pbState.phase = PB_PHASE_SERVING;
@@ -1036,14 +1277,9 @@ int handlePickleballGame(SSD1306Wire &display) {
         }
 
         // Blink LED for winner during game-over display
-        uint8_t mySide = pbState.players[pbState.myPlayerIndex].side;
         uint8_t winSide = (pbState.scoreLeft >= PB_WINNING_SCORE) ? 0 : 1;
-        if (winSide == mySide) {
-          if ((now - pbState.phaseStartTime) % 500 < 250) {
-            digitalWrite(RGB_LED, HIGH);
-          } else {
-            digitalWrite(RGB_LED, LOW);
-          }
+        if (winSide == mySide()) {
+          digitalWrite(RGB_LED, ((now - pbState.phaseStartTime) % 500 < 250) ? HIGH : LOW);
         }
         break;
       }
@@ -1057,70 +1293,105 @@ int handlePickleballGame(SSD1306Wire &display) {
       }
     }
 
-    if (pbState.isHost && pbState.phase >= PB_PHASE_COUNTDOWN &&
+    // --- Host: presence pings + disconnect detection ---
+    if (gameRunning && pbState.isHost && pbState.phase >= PB_PHASE_COUNTDOWN &&
         pbState.phase < PB_PHASE_GAME_OVER && now - pbState.lastPresencePing > 2000) {
       pbState.lastPresencePing = now;
-      PingMessage ping{MSG_PING, pbState.matchGeneration, now};
+      PingMessage ping;
+      ping.type = MSG_PING;
+      ping.generation = pbState.matchGeneration;
+      ping.timestamp = now;
       espnowBroadcast((uint8_t*)&ping, sizeof(ping));
       for (int i = 1; i < pbState.playerCount; i++) {
         if (pbState.playerLastSeen[i] != 0 && now - pbState.playerLastSeen[i] > 8000) {
-          Serial.printf("🏓 Player %d disconnected\n", i);
+          Serial.printf("Player %d disconnected\n", i);
           uint8_t disconnectedSide = pbState.players[i].side;
-          if (disconnectedSide == 0) pbState.scoreRight = PB_WINNING_SCORE;
-          else pbState.scoreLeft = PB_WINNING_SCORE;
+          // Other side wins: set it one short, then award the final point
+          if (disconnectedSide == 0) pbState.scoreRight = PB_WINNING_SCORE - 1;
+          else pbState.scoreLeft = PB_WINNING_SCORE - 1;
           awardPoint(1 - disconnectedSide, PB_MISS_DISCONNECTED);
           break;
         }
       }
     }
 
-    // --- Render ---
-    if (now - lastRender > RENDER_INTERVAL) {
-      lastRender = now;
+    // --- Client: host-loss detection ---
+    if (gameRunning && !pbState.isHost && pbState.startReceived &&
+        pbState.phase >= PB_PHASE_COUNTDOWN && pbState.phase < PB_PHASE_GAME_OVER &&
+        now - pbState.lastHostRx > PB_HOST_LOST_MS) {
+      Serial.println(F("Host lost: no packets for 5s"));
+      exitLine1 = "Host lost";
+      exitLine2 = "Game ended";
+      gameRunning = false;
+    }
 
-      display.clear();
+    pbServiceReliable(now);
 
-      switch (pbState.phase) {
-        case PB_PHASE_LOBBY:
-          renderLobby(display);
-          break;
-        case PB_PHASE_ESPNOW_SYNC:
-          display.setFont(ArialMT_Plain_10);
-          display.setTextAlignment(TEXT_ALIGN_CENTER);
-          display.drawString(64, 20, "Connecting...");
-          display.drawString(64, 35, String(pbState.playerCount) + " players");
-          break;
-        case PB_PHASE_COUNTDOWN:
-          renderCountdown(display, PB_COUNTDOWN_SECS - (int)((now - pbState.phaseStartTime) / 1000));
-          break;
-        case PB_PHASE_SERVING:
-        case PB_PHASE_BALL_TRAVEL:
-        case PB_PHASE_BALL_LANDED:
-          renderCourt(display);
-          renderScore(display);
-          if (pbState.phase == PB_PHASE_BALL_TRAVEL) renderBallTravel(display);
-          if (pbState.phase == PB_PHASE_BALL_LANDED) renderBallLanded(display);
-          break;
-        case PB_PHASE_POINT_RESULT:
-          renderCourt(display);
-          renderScore(display);
-          renderPointResult(display);
-          break;
-        case PB_PHASE_GAME_OVER:
-          renderGameOver(display);
-          break;
+    // --- Render: 20fps only while the ball moves; static screens on change ---
+    if (gameRunning) {
+      now = millis();
+      bool animated = (pbState.phase == PB_PHASE_BALL_TRAVEL ||
+                       pbState.phase == PB_PHASE_BALL_LANDED);
+      bool draw = false;
+      uint32_t sig = pbRenderSignature(now);
+      if (forceRedraw || sig != lastSignature) {
+        draw = true;
+      } else if (animated && now - lastRender >= RENDER_INTERVAL) {
+        draw = true;
       }
 
-      display.display();
+      if (draw) {
+        lastRender = now;
+        lastSignature = sig;
+        forceRedraw = false;
+
+        display.clear();
+
+        switch (pbState.phase) {
+          case PB_PHASE_LOBBY:
+            renderLobby(display);
+            break;
+          case PB_PHASE_ESPNOW_SYNC: {
+            char buf[16];
+            display.setFont(ArialMT_Plain_10);
+            display.setTextAlignment(TEXT_ALIGN_CENTER);
+            display.drawString(64, 20, "Connecting...");
+            snprintf(buf, sizeof(buf), "%u players", (unsigned)pbState.playerCount);
+            display.drawString(64, 35, buf);
+            break;
+          }
+          case PB_PHASE_COUNTDOWN:
+            renderCountdown(display, PB_COUNTDOWN_SECS - (int)((now - pbState.phaseStartTime) / 1000));
+            break;
+          case PB_PHASE_SERVING:
+          case PB_PHASE_BALL_TRAVEL:
+          case PB_PHASE_BALL_LANDED:
+            renderCourt(display);
+            renderScore(display);
+            if (pbState.phase == PB_PHASE_BALL_TRAVEL) renderBallTravel(display);
+            if (pbState.phase == PB_PHASE_BALL_LANDED) renderBallLanded(display);
+            break;
+          case PB_PHASE_POINT_RESULT:
+            renderCourt(display);
+            renderScore(display);
+            renderPointResult(display);
+            break;
+          case PB_PHASE_GAME_OVER:
+            renderGameOver(display);
+            break;
+        }
+
+        display.display();
+      }
     }
 
     delay(5); // Small yield
-    yield();
   }
 
-  // Clean up
-  espnowDeinit();
-  digitalWrite(RGB_LED, LOW);
+  if (exitLine1) {
+    pbShowMessage(display, exitLine1, exitLine2);
+    pbWait(1500);
+  }
 
   // Suppress duplicate sats celebration if wager was involved
   if (pbState.wagerResult != 0) {
@@ -1129,21 +1400,17 @@ int handlePickleballGame(SSD1306Wire &display) {
 
   // Return happiness bonus. Wager pet coins arrive from the authoritative server
   // ledger on the next config sync; crediting locally here would double-mint them.
+  // (Radio/ESP-NOW/LED cleanup happens in PbRadioSession's destructor.)
   if (pbState.phase == PB_PHASE_GAME_OVER) {
-    uint8_t mySide = pbState.players[pbState.myPlayerIndex].side;
     uint8_t winnerSide = (pbState.scoreLeft >= PB_WINNING_SCORE) ? 0 : 1;
-    if (winnerSide == mySide) {
-      return 30;
-    } else {
-      return 15;
-    }
+    return (winnerSide == mySide()) ? 30 : 15;
   }
 
   return 0;
 }
 
 // ============================================================================
-// Helper: Award a point
+// Helper: Award a point (host only)
 // ============================================================================
 
 static void awardPoint(uint8_t scoringSide, uint8_t reason) {
@@ -1157,6 +1424,8 @@ static void awardPoint(uint8_t scoringSide, uint8_t reason) {
   pbState.lastPointReason = reason;
   pbState.phase = PB_PHASE_POINT_RESULT;
   pbState.phaseStartTime = millis();
+  pbState.hitConfirmed = false;
+  flushButtonQueue();
 
   // Reset rally volley count (difficulty resets each point)
   pbState.volleyCount = 0;
@@ -1164,7 +1433,7 @@ static void awardPoint(uint8_t scoringSide, uint8_t reason) {
   // Alternate serve
   pbState.servingSide = 1 - scoringSide;
 
-  // Send point scored to all players
+  // Send point scored to all players (3 copies, same sequence)
   PointScoredMessage msg;
   msg.type = MSG_POINT_SCORED;
   msg.generation = pbState.matchGeneration;
@@ -1173,17 +1442,16 @@ static void awardPoint(uint8_t scoringSide, uint8_t reason) {
   msg.scoreLeft = pbState.scoreLeft;
   msg.scoreRight = pbState.scoreRight;
   msg.reason = reason;
-  espnowBroadcast((uint8_t*)&msg, sizeof(msg));
+  pbSendReliable(&msg, sizeof(msg));
 
   // Sound on host
-  uint8_t mySide = pbState.players[pbState.myPlayerIndex].side;
-  if (scoringSide == mySide) {
+  if (scoringSide == mySide()) {
     playPickleballPoint();
   } else {
     playPickleballMiss();
   }
 
-  Serial.printf("🏓 Point! L:%d R:%d (reason:%d)\n", pbState.scoreLeft, pbState.scoreRight, reason);
+  Serial.printf("Point! L:%d R:%d (reason:%d)\n", pbState.scoreLeft, pbState.scoreRight, reason);
 }
 
 // ============================================================================
@@ -1194,11 +1462,11 @@ static void handleLocalButtonPress() {
   if (pbState.phase == PB_PHASE_LOBBY) {
     // In lobby: host can start game if 2+ players
     if (pbState.isHost && pbState.playerCount >= 2) {
-      pbState.lobbyStartRequested = true;
       Serial.println(F("Host starting game..."));
       if (startCountdownOnServer()) {
         pbState.phase = PB_PHASE_ESPNOW_SYNC;
         pbState.phaseStartTime = millis();
+        pbState.lastStateSend = 0;
       } else {
         Serial.println(F("Host start rejected; remaining in lobby"));
       }
@@ -1209,15 +1477,16 @@ static void handleLocalButtonPress() {
   if (pbState.phase == PB_PHASE_BALL_LANDED) {
     if (pbState.isHost) {
       // Host handles own button press directly
-      queueButtonPress(pbState.myPlayerIndex, ++pbState.playerButtonSequence[pbState.myPlayerIndex]);
-    } else {
-      // Client: send button press to host
+      queueButtonPress(pbState.myPlayerIndex, pbState.volleyId);
+    } else if (pbState.startReceived && pbState.playerCount > 0) {
+      // Client: send button press to host, tagged with the current volley
       ButtonPressMessage msg;
       msg.type = MSG_BUTTON_PRESS;
       msg.generation = pbState.matchGeneration;
       msg.sequence = ++pbState.playerButtonSequence[pbState.myPlayerIndex];
       msg.playerIndex = pbState.myPlayerIndex;
       msg.timestamp = millis();
+      msg.volleyId = pbState.volleyId;
       espnowSend(pbState.players[0].mac, (uint8_t*)&msg, sizeof(msg));
     }
     return;
@@ -1237,6 +1506,7 @@ static void handleLocalButtonPress() {
 static void sendGameStateToPlayers() {
   if (!pbState.isHost) return;
 
+  unsigned long now = millis();
   GameStateMessage msg;
   msg.type = MSG_GAME_STATE;
   msg.generation = pbState.matchGeneration;
@@ -1248,9 +1518,12 @@ static void sendGameStateToPlayers() {
   msg.scoreRight = pbState.scoreRight;
   msg.servingSide = pbState.servingSide;
   msg.targetPlayerIdx = pbState.targetPlayerIdx;
-  msg.reactionTimeMs = (pbState.reactionDeadline > millis())
-    ? (pbState.reactionDeadline - millis()) : 0;
-  msg.timestamp = millis();
+  long remaining = (long)(pbState.reactionDeadline - now);
+  if (remaining < 0) remaining = 0;
+  if (remaining > 65535) remaining = 65535;
+  msg.reactionTimeMs = (uint16_t)remaining;
+  msg.timestamp = now;
+  msg.volleyId = pbState.volleyId;
 
   espnowBroadcast((uint8_t*)&msg, sizeof(msg));
 }
@@ -1260,9 +1533,11 @@ static void sendGameStateToPlayers() {
 // ============================================================================
 
 static void renderScore(SSD1306Wire &display) {
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%u - %u", (unsigned)pbState.scoreLeft, (unsigned)pbState.scoreRight);
   display.setFont(ArialMT_Plain_10);
   display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.drawString(64, 0, String(pbState.scoreLeft) + " - " + String(pbState.scoreRight));
+  display.drawString(64, 0, buf);
 }
 
 static void renderCourt(SSD1306Wire &display) {
@@ -1275,39 +1550,30 @@ static void renderCourt(SSD1306Wire &display) {
   }
 
   // Horizontal splits on each side (top/bottom zones)
-  // Left side split
   display.drawLine(PB_COURT_X, PB_COURT_MID_Y, PB_NET_X - 1, PB_COURT_MID_Y);
-  // Right side split
   display.drawLine(PB_NET_X + 1, PB_COURT_MID_Y, PB_COURT_X + PB_COURT_W - 1, PB_COURT_MID_Y);
 
   // Player initials in their zones
   display.setFont(ArialMT_Plain_10);
 
-  for (int i = 0; i < pbState.playerCount; i++) {
+  for (int i = 0; i < pbState.playerCount && i < MAX_GAME_PLAYERS; i++) {
     ESPNowPlayer &p = pbState.players[i];
-    int x, y;
+    int x = (p.side == 0)
+      ? PB_COURT_X + (PB_NET_X - PB_COURT_X) / 2
+      : PB_NET_X + (PB_COURT_X + PB_COURT_W - PB_NET_X) / 2;
+    int y = (p.position == 0) ? PB_COURT_Y + 4 : PB_COURT_MID_Y + 4;
 
-    if (p.side == 0) { // Left
-      x = PB_COURT_X + (PB_NET_X - PB_COURT_X) / 2;
-    } else { // Right
-      x = PB_NET_X + (PB_COURT_X + PB_COURT_W - PB_NET_X) / 2;
-    }
-
-    if (p.position == 0) { // Top
-      y = PB_COURT_Y + 4;
-    } else { // Bottom
-      y = PB_COURT_MID_Y + 4;
-    }
-
+    char initial[2] = {p.petInitial ? p.petInitial : '?', '\0'};
     display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(x, y, String(p.petInitial));
+    display.drawString(x, y, initial);
   }
 
   // For solo player on a side: show "1" and "2" indicators
+  display.setTextAlignment(TEXT_ALIGN_CENTER);
   for (uint8_t side = 0; side <= 1; side++) {
     int playersOnSide = 0;
     int soloIdx = -1;
-    for (int i = 0; i < pbState.playerCount; i++) {
+    for (int i = 0; i < pbState.playerCount && i < MAX_GAME_PLAYERS; i++) {
       if (pbState.players[i].side == side) {
         playersOnSide++;
         soloIdx = i;
@@ -1315,15 +1581,11 @@ static void renderCourt(SSD1306Wire &display) {
     }
 
     if (playersOnSide == 1) {
-      // Show press count indicators
       int baseX = (side == 0) ? PB_COURT_X + 5 : PB_COURT_X + PB_COURT_W - 12;
       uint8_t playerPos = pbState.players[soloIdx].position;
 
-      // The zone matching the player's position = 1 press
-      // The other zone = 2 presses
-      display.setFont(ArialMT_Plain_10);
+      // The zone matching the player's position = 1 press, the other = 2
       if (playerPos == 0) {
-        // Player is in top: top=1 press, bottom=2 presses
         display.drawString(baseX, PB_COURT_Y + 2, "1");
         display.drawString(baseX, PB_COURT_MID_Y + 2, "2");
       } else {
@@ -1335,7 +1597,7 @@ static void renderCourt(SSD1306Wire &display) {
 }
 
 static void renderBallTravel(SSD1306Wire &display) {
-  // Animate ball from serving side's edge to the net, then from net to target zone
+  // Animate ball from serving side's edge to the target zone
   float progress = (float)(millis() - pbState.phaseStartTime) / PB_BALL_TRAVEL_MS;
   if (progress > 1.0f) progress = 1.0f;
 
@@ -1362,45 +1624,38 @@ static void renderBallTravel(SSD1306Wire &display) {
   int ballY = startY + (int)((targetY - startY) * reveal);
   ballY -= (int)(5.0f * 4.0f * progress * (1.0f - progress));
 
-  // Draw ball (filled circle)
   display.fillCircle(ballX, ballY, 3);
 }
 
 static void renderBallLanded(SSD1306Wire &display) {
   // Ball is in the target zone - flash it to indicate "HIT NOW!"
-  unsigned long elapsed = millis() - pbState.phaseStartTime;
+  unsigned long now = millis();
+  unsigned long elapsed = now - pbState.phaseStartTime;
   bool visible = (elapsed / 150) % 2 == 0; // Blink every 150ms
 
   if (visible) {
-    int zoneX;
-    if (pbState.ballSide == 0) {
-      zoneX = PB_COURT_X + (PB_NET_X - PB_COURT_X) / 2;
-    } else {
-      zoneX = PB_NET_X + (PB_COURT_X + PB_COURT_W - PB_NET_X) / 2;
-    }
-
-    int zoneY;
-    if (pbState.ballZone == 0) {
-      zoneY = PB_COURT_Y + (PB_COURT_MID_Y - PB_COURT_Y) / 2;
-    } else {
-      zoneY = PB_COURT_MID_Y + (PB_COURT_Y + PB_COURT_H - PB_COURT_MID_Y) / 2;
-    }
+    int zoneX = (pbState.ballSide == 0)
+      ? PB_COURT_X + (PB_NET_X - PB_COURT_X) / 2
+      : PB_NET_X + (PB_COURT_X + PB_COURT_W - PB_NET_X) / 2;
+    int zoneY = (pbState.ballZone == 0)
+      ? PB_COURT_Y + (PB_COURT_MID_Y - PB_COURT_Y) / 2
+      : PB_COURT_MID_Y + (PB_COURT_Y + PB_COURT_H - PB_COURT_MID_Y) / 2;
 
     display.fillCircle(zoneX, zoneY, 4);
 
     // Show remaining time bar at bottom
-    unsigned long remaining = 0;
-    if (pbState.reactionDeadline > millis()) {
-      remaining = pbState.reactionDeadline - millis();
-    }
+    long remaining = (long)(pbState.reactionDeadline - now);
+    if (remaining < 0) remaining = 0;
     int currentReaction = PB_REACTION_TIME_START - (pbState.volleyCount * PB_REACTION_STEP);
     if (currentReaction < PB_REACTION_TIME_MIN) currentReaction = PB_REACTION_TIME_MIN;
     int barWidth = (int)((float)remaining / currentReaction * PB_COURT_W);
+    if (barWidth > PB_COURT_W) barWidth = PB_COURT_W;
     display.fillRect(PB_COURT_X, PB_COURT_Y + PB_COURT_H + 1, barWidth, 2);
   }
 }
 
 static void renderLobby(SSD1306Wire &display) {
+  char buf[32];
   display.setFont(ArialMT_Plain_16);
   display.setTextAlignment(TEXT_ALIGN_CENTER);
   display.drawString(64, 0, "PICKLEBALL");
@@ -1408,13 +1663,16 @@ static void renderLobby(SSD1306Wire &display) {
   display.setFont(ArialMT_Plain_10);
 
   // Show wager info on same line as player count
-  String infoLine = "Players: " + String(pbState.playerCount) + "/4";
   if (pbState.wagerAmount > 0) {
-    infoLine += "  " + String(pbState.wagerAmount) + " sats";
+    snprintf(buf, sizeof(buf), "Players: %u/4  %u sats",
+             (unsigned)pbState.playerCount, (unsigned)pbState.wagerAmount);
+  } else {
+    snprintf(buf, sizeof(buf), "Players: %u/4", (unsigned)pbState.playerCount);
   }
-  display.drawString(64, 17, infoLine);
+  display.drawString(64, 17, buf);
   if (pbState.isHost && pbState.roomCode.length() > 0 && pbState.wagerAmount == 0) {
-    display.drawString(64, 28, "Room " + pbState.roomCode);
+    snprintf(buf, sizeof(buf), "Room %s", pbState.roomCode.c_str());
+    display.drawString(64, 28, buf);
   }
 
   // Show wager declined warning
@@ -1422,21 +1680,23 @@ static void renderLobby(SSD1306Wire &display) {
     display.drawString(64, 28, "Wager declined - FREE");
   }
 
-  // Show player names
+  // Show player initials
   int nameY = (pbState.wagerAmount > 0 && !pbState.wagerActive) ? 39 : 38;
-  for (int i = 0; i < pbState.playerCount && i < 4; i++) {
-    String name = String(pbState.players[i].petInitial);
-    int x = 20 + (i * 30);
-    display.drawString(x, nameY, name);
+  for (int i = 0; i < pbState.playerCount && i < MAX_GAME_PLAYERS; i++) {
+    char initial[2] = {pbState.players[i].petInitial ? pbState.players[i].petInitial : '?', '\0'};
+    display.drawString(20 + (i * 30), nameY, initial);
   }
 
   // Show instruction
   if (pbState.isHost) {
     if (pbState.playerCount >= 2) {
-      display.drawString(64, 52, "Hold to START");
+      display.drawString(64, 52, "Press to START");
     } else {
-      int elapsed = (millis() - pbState.phaseStartTime) / 1000;
-      display.drawString(64, 52, "Waiting... " + String(60 - elapsed) + "s");
+      long elapsed = (long)((millis() - pbState.phaseStartTime) / 1000);
+      long left = (long)(PB_LOBBY_TIMEOUT_MS / 1000) - elapsed;
+      if (left < 0) left = 0;
+      snprintf(buf, sizeof(buf), "Waiting... %lds", left);
+      display.drawString(64, 52, buf);
     }
   } else {
     display.drawString(64, 52, "Waiting for host...");
@@ -1451,53 +1711,59 @@ static void renderCountdown(SSD1306Wire &display, int secondsLeft) {
   display.setFont(ArialMT_Plain_24);
   display.setTextAlignment(TEXT_ALIGN_CENTER);
   if (secondsLeft > 0) {
-    display.drawString(64, 20, String(secondsLeft));
+    char buf[4];
+    snprintf(buf, sizeof(buf), "%d", secondsLeft);
+    display.drawString(64, 20, buf);
   } else {
     display.drawString(64, 20, "GO!");
   }
 }
 
 static void renderPointResult(SSD1306Wire &display) {
-  // Flash the zone that was missed/hit
   display.setFont(ArialMT_Plain_10);
   display.setTextAlignment(TEXT_ALIGN_CENTER);
 
-  String msg;
+  const char *msg;
   if (pbState.lastPointReason == PB_MISS_TIMEOUT) {
     msg = "Miss!";
   } else if (pbState.lastPointReason == PB_MISS_WRONG_PLAYER) {
     msg = "Wrong player!";
+  } else if (pbState.lastPointReason == PB_MISS_DISCONNECTED) {
+    msg = "Player left!";
   } else {
     msg = "Fault!";
   }
 
   // Show which side scored
-  String sideStr = (pbState.lastPointWinner == 0) ? "LEFT" : "RIGHT";
+  const char *side = (pbState.lastPointWinner == 0) ? "LEFT scores!" : "RIGHT scores!";
   display.drawString(64, PB_COURT_Y + PB_COURT_H / 2 - 10, msg);
-  display.drawString(64, PB_COURT_Y + PB_COURT_H / 2 + 2, sideStr + " scores!");
+  display.drawString(64, PB_COURT_Y + PB_COURT_H / 2 + 2, side);
 }
 
 static void renderGameOver(SSD1306Wire &display) {
+  char buf[28];
   display.setFont(ArialMT_Plain_16);
   display.setTextAlignment(TEXT_ALIGN_CENTER);
   display.drawString(64, 2, "GAME OVER");
 
   display.setFont(ArialMT_Plain_24);
-  display.drawString(64, 18, String(pbState.scoreLeft) + " - " + String(pbState.scoreRight));
+  snprintf(buf, sizeof(buf), "%u - %u", (unsigned)pbState.scoreLeft, (unsigned)pbState.scoreRight);
+  display.drawString(64, 18, buf);
 
   display.setFont(ArialMT_Plain_10);
-  uint8_t mySide = pbState.players[pbState.myPlayerIndex].side;
   uint8_t winnerSide = (pbState.scoreLeft >= PB_WINNING_SCORE) ? 0 : 1;
 
-  if (winnerSide == mySide) {
+  if (winnerSide == mySide()) {
     if (pbState.wagerResult > 0) {
-      display.drawString(64, 46, "YOU WON " + String(pbState.wagerResult) + " SATS!");
+      snprintf(buf, sizeof(buf), "YOU WON %d SATS!", (int)pbState.wagerResult);
+      display.drawString(64, 46, buf);
     } else {
       display.drawString(64, 50, "YOU WIN!");
     }
   } else {
     if (pbState.wagerResult < 0) {
-      display.drawString(64, 46, "Lost " + String(-pbState.wagerResult) + " sats");
+      snprintf(buf, sizeof(buf), "Lost %d sats", -(int)pbState.wagerResult);
+      display.drawString(64, 46, buf);
     } else {
       display.drawString(64, 50, "You lose");
     }
@@ -1508,462 +1774,303 @@ static void renderGameOver(SSD1306Wire &display) {
 // Server Communication (HTTP during lobby phase only)
 // ============================================================================
 
-static bool createGameOnServer() {
-  extern GanamosConfig ganamosConfig;
+// One HTTPClient for all pickleball requests, deliberately static: the
+// HTTPClient destructor stop()s its underlying client, which would close the
+// shared keep-alive TLS connection from ganamosHttpBegin() after every call.
+static HTTPClient &pbHttp() {
+  static HTTPClient http;
+  return http;
+}
 
-  WiFiClientSecure *client = new WiFiClientSecure;
-  if (!client) return false;
-  client->setInsecure();
-  client->setTimeout(5000);
-
-  HTTPClient http;
-  String url = "https://www.ganamos.earth/api/game/pickleball/create";
-
-  if (!http.begin(*client, url)) {
-    delete client;
-    return false;
-  }
-
+// GET (body == nullptr) or POST JSON to a server path. Returns the HTTP code
+// (negative on transport failure); on 200 the payload is stored in response.
+static int pbHttpRequest(const String &path, const JsonDocument *body, String &response) {
+  HTTPClient &http = pbHttp();
+  if (!ganamosHttpBegin(http, path)) return -1;
   http.setTimeout(5000);
-  http.addHeader("Content-Type", "application/json");
+  int code;
+  if (body) {
+    http.addHeader("Content-Type", "application/json");
+    String payload;
+    serializeJson(*body, payload);
+    code = http.POST(payload);
+  } else {
+    code = http.GET();
+  }
+  if (code == 200) response = http.getString();
+  http.end();
+  return code;
+}
 
-  StaticJsonDocument<256> doc;
+// Only the lobby fields we use are kept when parsing server responses.
+static void pbBuildLobbyFilter(JsonDocument &filter) {
+  filter["success"] = true;
+  filter["status"] = true;
+  filter["matchGeneration"] = true;
+  filter["gameId"] = true;
+  filter["roomCode"] = true;
+  filter["action"] = true;
+  filter["playerIndex"] = true;
+  filter["wagerAmount"] = true;
+  filter["wagerStatus"] = true;
+  filter["wagerAccepted"] = true;
+  filter["players"][0]["macAddress"] = true;
+  filter["players"][0]["petInitial"] = true;
+  filter["players"][0]["side"] = true;
+  filter["players"][0]["position"] = true;
+}
+
+static bool pbParseLobbyResponse(const String &payload, JsonDocument &resp) {
+  JsonDocument filter;
+  pbBuildLobbyFilter(filter);
+  return deserializeJson(resp, payload, DeserializationOption::Filter(filter)) ==
+         DeserializationError::Ok;
+}
+
+// Copy the server's player list into pbState and register ESP-NOW peers for
+// everyone except this device. Returns our index in the list, or -1.
+static int pbApplyServerPlayers(JsonArrayConst players) {
+  int count = 0;
+  int myIdx = -1;
+  for (JsonVariantConst p : players) {
+    if (count >= MAX_GAME_PLAYERS) break;
+    ESPNowPlayer &pl = pbState.players[count];
+    const char *mac = p["macAddress"] | "";
+    if (!espnowParseMac(mac, pl.mac)) memset(pl.mac, 0, sizeof(pl.mac));
+    const char *initial = p["petInitial"] | "";
+    if (initial[0]) pl.petInitial = initial[0];
+    const char *side = p["side"] | "";
+    pl.side = (strcmp(side, "right") == 0) ? 1 : 0;
+    const char *position = p["position"] | "";
+    pl.position = (strcmp(position, "bottom") == 0) ? 1 : 0;
+
+    if (memcmp(pl.mac, pbMyMac, 6) == 0) {
+      myIdx = count;
+    } else if (!macIsZero(pl.mac)) {
+      espnowAddPeer(pl.mac);
+    }
+    count++;
+  }
+  pbState.playerCount = (uint8_t)count;
+  return myIdx;
+}
+
+// Resolve this device's index: prefer our MAC in the list, else the server's
+// playerIndex if in range. Returns -1 if neither is usable.
+static int pbResolveMyIndex(int macIdx, int serverIdx) {
+  if (macIdx >= 0) return macIdx;
+  if (serverIdx >= 0 && serverIdx < pbState.playerCount && serverIdx < MAX_GAME_PLAYERS) return serverIdx;
+  return -1;
+}
+
+static void pbApplyWager(JsonDocument &resp) {
+  uint16_t serverWager = resp["wagerAmount"] | 0;
+  const char *wagerStatus = resp["wagerStatus"] | "";
+  pbState.wagerAmount = serverWager;
+  pbState.wagerActive = (strcmp(wagerStatus, "active") == 0 && serverWager > 0);
+}
+
+static bool createGameOnServer() {
+  JsonDocument doc;
   doc["deviceId"] = ganamosConfig.deviceId;
   doc["macAddress"] = espnowGetMacString();
   doc["wagerAmount"] = pbState.wagerAmount;
 
-  String body;
-  serializeJson(doc, body);
-
-  int httpCode = http.POST(body);
-  bool success = false;
-
-  if (httpCode == 200) {
-    String payload = http.getString();
-    StaticJsonDocument<1024> resp;
-    if (deserializeJson(resp, payload) == DeserializationError::Ok) {
-      if (resp["success"]) {
-        pbState.gameId = resp["gameId"].as<String>();
-        pbState.roomCode = resp["roomCode"].as<String>();
-        String action = resp["action"].as<String>();
-
-        // Parse wager fields from response
-        uint16_t serverWager = resp["wagerAmount"] | 0;
-        String wagerStatus = resp["wagerStatus"].as<String>();
-        pbState.wagerAmount = serverWager;
-        pbState.wagerActive = (wagerStatus == "active" && serverWager > 0);
-
-        if (action == "join") {
-          // Server found an existing lobby — auto-joined
-          pbState.isHost = false;
-          pbState.myPlayerIndex = resp["playerIndex"] | 0;
-          pbState.phase = PB_PHASE_LOBBY;
-          pbState.phaseStartTime = millis();
-
-          bool wagerAccepted = resp["wagerAccepted"] | true;
-          if (!wagerAccepted) pbState.wagerActive = false;
-
-          JsonArray players = resp["players"];
-          pbState.playerCount = min((int)players.size(), MAX_GAME_PLAYERS);
-
-          for (int i = 0; i < pbState.playerCount; i++) {
-            JsonObject p = players[i];
-            String mac = p["macAddress"].as<String>();
-            espnowParseMac(mac, pbState.players[i].mac);
-
-            String initial = p["petInitial"].as<String>();
-            if (initial.length() > 0) {
-              pbState.players[i].petInitial = initial.charAt(0);
-            }
-
-            String pSide = p["side"].as<String>();
-            pbState.players[i].side = (pSide == "right") ? 1 : 0;
-
-            String pPos = p["position"].as<String>();
-            pbState.players[i].position = (pPos == "bottom") ? 1 : 0;
-
-            if (i != pbState.myPlayerIndex) {
-              espnowAddPeer(pbState.players[i].mac);
-            }
-          }
-
-          Serial.printf("🏓 Auto-joined existing game as player %d (wager: %d, active: %d)\n",
-            pbState.myPlayerIndex, pbState.wagerAmount, pbState.wagerActive);
-          success = true;
-        } else {
-          // We are the host — new game created
-          String myMac = espnowGetMacString();
-          espnowParseMac(myMac, pbState.players[0].mac);
-          pbState.players[0].petInitial = ganamosConfig.petName.charAt(0);
-          pbState.players[0].side = 0;     // Left
-          pbState.players[0].position = 0; // Top
-          pbState.players[0].connected = true;
-          pbState.players[0].ready = true;
-          pbState.playerCount = 1;
-          Serial.printf("🏓 Hosting new game (wager: %d, status: %s)\n",
-            pbState.wagerAmount, wagerStatus.c_str());
-          success = true;
-        }
-      }
-    }
+  String payload;
+  int httpCode = pbHttpRequest("/api/game/pickleball/create", &doc, payload);
+  if (httpCode != 200) {
+    Serial.printf("Pickleball create failed: HTTP %d\n", httpCode);
+    return false;
   }
 
-  http.end();
-  client->stop();
-  delete client;
-  return success;
+  JsonDocument resp;
+  if (!pbParseLobbyResponse(payload, resp) || !(resp["success"] | false)) return false;
+
+  pbState.gameId = (const char *)(resp["gameId"] | "");
+  pbState.roomCode = (const char *)(resp["roomCode"] | "");
+  const char *action = resp["action"] | "";
+  pbApplyWager(resp);
+
+  if (strcmp(action, "join") == 0) {
+    // Server found an existing lobby — auto-joined
+    pbState.isHost = false;
+    pbState.phase = PB_PHASE_LOBBY;
+    pbState.phaseStartTime = millis();
+
+    bool wagerAccepted = resp["wagerAccepted"] | true;
+    if (!wagerAccepted) pbState.wagerActive = false;
+
+    int macIdx = pbApplyServerPlayers(resp["players"].as<JsonArrayConst>());
+    int myIdx = pbResolveMyIndex(macIdx, resp["playerIndex"] | -1);
+    if (myIdx <= 0) {
+      // Index 0 is the host; anything else invalid means we can't play
+      Serial.printf("Pickleball join: invalid player index (mac %d)\n", macIdx);
+      return false;
+    }
+    pbState.myPlayerIndex = (uint8_t)myIdx;
+
+    Serial.printf("Auto-joined existing game as player %d (wager: %d, active: %d)\n",
+      pbState.myPlayerIndex, pbState.wagerAmount, pbState.wagerActive);
+    return true;
+  }
+
+  // We are the host — new game created
+  memcpy(pbState.players[0].mac, pbMyMac, 6);
+  pbState.players[0].petInitial = ganamosConfig.petName.charAt(0);
+  pbState.players[0].side = 0;     // Left
+  pbState.players[0].position = 0; // Top
+  pbState.players[0].connected = true;
+  pbState.players[0].ready = true;
+  pbState.playerCount = 1;
+  Serial.printf("Hosting new game (wager: %d)\n", pbState.wagerAmount);
+  return true;
 }
 
 static bool pollLobbyState() {
   if (pbState.gameId.length() == 0) return false;
-  extern GanamosConfig ganamosConfig;
 
-  WiFiClientSecure *client = new WiFiClientSecure;
-  if (!client) return false;
-  client->setInsecure();
-  client->setTimeout(5000);
+  String path = "/api/game/pickleball/state?gameId=" + pbState.gameId +
+                "&deviceId=" + ganamosConfig.deviceId;
+  String payload;
+  if (pbHttpRequest(path, nullptr, payload) != 200) return false;
 
-  HTTPClient http;
-  String url = "https://www.ganamos.earth/api/game/pickleball/state?gameId=" + pbState.gameId + "&deviceId=" + ganamosConfig.deviceId;
+  JsonDocument resp;
+  if (!pbParseLobbyResponse(payload, resp) || !(resp["success"] | false)) return false;
 
-  if (!http.begin(*client, url)) {
-    delete client;
+  const char *status = resp["status"] | "";
+  if (strcmp(status, "cancelled") == 0) {
+    pbState.lobbyCancelled = true;
     return false;
   }
-
-  http.setTimeout(5000);
-  int httpCode = http.GET();
-  bool updated = false;
-
-  if (httpCode == 200) {
-    String payload = http.getString();
-    StaticJsonDocument<1024> resp;
-    if (deserializeJson(resp, payload) == DeserializationError::Ok && resp["success"]) {
-
-      String status = resp["status"].as<String>();
-      if (status == "cancelled") {
-        pbState.phase = PB_PHASE_GAME_OVER; // Exit
-        http.end(); client->stop(); delete client;
-        return false;
-      }
-      pbState.matchGeneration = resp["matchGeneration"] | pbState.matchGeneration;
-      if (!pbState.isHost && status == "countdown" && pbState.phase == PB_PHASE_LOBBY) {
-        pbState.phase = PB_PHASE_ESPNOW_SYNC;
-        pbState.phaseStartTime = millis();
-        pbState.lastStateSend = 0;
-        Serial.println(F("🏓 Host started; switching to ESP-NOW sync"));
-      }
-
-      JsonArray players = resp["players"];
-      pbState.playerCount = min((int)players.size(), MAX_GAME_PLAYERS);
-
-      for (int i = 0; i < pbState.playerCount; i++) {
-        JsonObject p = players[i];
-        String mac = p["macAddress"].as<String>();
-        espnowParseMac(mac, pbState.players[i].mac);
-
-        String initial = p["petInitial"].as<String>();
-        if (initial.length() > 0) {
-          pbState.players[i].petInitial = initial.charAt(0);
-        }
-
-        String side = p["side"].as<String>();
-        pbState.players[i].side = (side == "right") ? 1 : 0;
-
-        String position = p["position"].as<String>();
-        pbState.players[i].position = (position == "bottom") ? 1 : 0;
-
-        // Add as ESP-NOW peer
-        espnowAddPeer(pbState.players[i].mac);
-      }
-
-      // Parse wager fields
-      uint16_t serverWager = resp["wagerAmount"] | 0;
-      String wagerStatus = resp["wagerStatus"].as<String>();
-      pbState.wagerAmount = serverWager;
-      pbState.wagerActive = (wagerStatus == "active" && serverWager > 0);
-
-      updated = true;
-    }
+  pbState.matchGeneration = resp["matchGeneration"] | pbState.matchGeneration;
+  if (!pbState.isHost && strcmp(status, "countdown") == 0 && pbState.phase == PB_PHASE_LOBBY) {
+    pbState.phase = PB_PHASE_ESPNOW_SYNC;
+    pbState.phaseStartTime = millis();
+    pbState.lastStateSend = 0;
+    Serial.println(F("Host started; switching to ESP-NOW sync"));
   }
 
-  http.end();
-  client->stop();
-  delete client;
-  return updated;
+  int macIdx = pbApplyServerPlayers(resp["players"].as<JsonArrayConst>());
+  if (!pbState.isHost && macIdx > 0) {
+    // Indices shift if someone leaves the lobby; follow our MAC
+    pbState.myPlayerIndex = (uint8_t)macIdx;
+  }
+
+  pbApplyWager(resp);
+  return true;
 }
 
+// NOTE: only reachable via the invite path, which is not wired (see
+// handlePickleballGame). Kept pending a product decision.
 static bool joinGameOnServer(const String &gameId, const String &macAddr) {
-  extern GanamosConfig ganamosConfig;
-
-  WiFiClientSecure *client = new WiFiClientSecure;
-  if (!client) return false;
-  client->setInsecure();
-  client->setTimeout(5000);
-
-  HTTPClient http;
-  String url = "https://www.ganamos.earth/api/game/pickleball/join";
-
-  if (!http.begin(*client, url)) {
-    delete client;
-    return false;
-  }
-
-  http.setTimeout(5000);
-  http.addHeader("Content-Type", "application/json");
-
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
   doc["gameId"] = gameId;
   doc["deviceId"] = ganamosConfig.deviceId;
   doc["macAddress"] = macAddr;
 
-  String body;
-  serializeJson(doc, body);
+  String payload;
+  if (pbHttpRequest("/api/game/pickleball/join", &doc, payload) != 200) return false;
 
-  int httpCode = http.POST(body);
-  bool success = false;
+  JsonDocument resp;
+  if (!pbParseLobbyResponse(payload, resp) || !(resp["success"] | false)) return false;
 
-  if (httpCode == 200) {
-    String payload = http.getString();
-    StaticJsonDocument<512> resp;
-    if (deserializeJson(resp, payload) == DeserializationError::Ok && resp["success"]) {
-      // Get our player assignment
-      pbState.myPlayerIndex = resp["playerIndex"] | 0;
+  uint16_t serverWager = resp["wagerAmount"] | 0;
+  const char *wagerStatus = resp["wagerStatus"] | "";
+  bool wagerAccepted = resp["wagerAccepted"] | true;
+  pbState.wagerAmount = serverWager;
+  pbState.wagerActive = (strcmp(wagerStatus, "active") == 0 && serverWager > 0 && wagerAccepted);
 
-      String side = resp["side"].as<String>();
-      String position = resp["position"].as<String>();
+  int macIdx = pbApplyServerPlayers(resp["players"].as<JsonArrayConst>());
+  int myIdx = pbResolveMyIndex(macIdx, resp["playerIndex"] | -1);
+  if (myIdx <= 0) return false;
+  pbState.myPlayerIndex = (uint8_t)myIdx;
 
-      // Parse wager fields
-      uint16_t serverWager = resp["wagerAmount"] | 0;
-      String wagerStatus = resp["wagerStatus"].as<String>();
-      bool wagerAccepted = resp["wagerAccepted"] | true;
-      pbState.wagerAmount = serverWager;
-      pbState.wagerActive = (wagerStatus == "active" && serverWager > 0 && wagerAccepted);
-
-      success = true;
-      Serial.printf("🏓 Joined as player %d (%s/%s) wager: %d accepted: %d\n",
-        pbState.myPlayerIndex, side.c_str(), position.c_str(), serverWager, wagerAccepted);
-
-      // Parse all players from response
-      JsonArray players = resp["players"];
-      pbState.playerCount = min((int)players.size(), MAX_GAME_PLAYERS);
-
-      for (int i = 0; i < pbState.playerCount; i++) {
-        JsonObject p = players[i];
-        String mac = p["macAddress"].as<String>();
-        espnowParseMac(mac, pbState.players[i].mac);
-
-        String initial = p["petInitial"].as<String>();
-        if (initial.length() > 0) {
-          pbState.players[i].petInitial = initial.charAt(0);
-        }
-
-        String pSide = p["side"].as<String>();
-        pbState.players[i].side = (pSide == "right") ? 1 : 0;
-
-        String pPos = p["position"].as<String>();
-        pbState.players[i].position = (pPos == "bottom") ? 1 : 0;
-
-        // Add all other players as ESP-NOW peers
-        if (i != pbState.myPlayerIndex) {
-          espnowAddPeer(pbState.players[i].mac);
-        }
-      }
-    }
-  }
-
-  http.end();
-  client->stop();
-  delete client;
-  return success;
+  Serial.printf("Joined as player %d wager: %d accepted: %d\n",
+    pbState.myPlayerIndex, serverWager, wagerAccepted);
+  return true;
 }
 
 static bool startCountdownOnServer() {
   if (pbState.gameId.length() == 0) return false;
-  extern GanamosConfig ganamosConfig;
 
-  WiFiClientSecure *client = new WiFiClientSecure;
-  if (!client) return false;
-  client->setInsecure();
-  client->setTimeout(5000);
-
-  HTTPClient http;
-  String url = "https://www.ganamos.earth/api/game/pickleball/state";
-
-  if (!http.begin(*client, url)) {
-    delete client;
-    return false;
-  }
-
-  http.setTimeout(5000);
-  http.addHeader("Content-Type", "application/json");
-
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
   doc["gameId"] = pbState.gameId;
   doc["deviceId"] = ganamosConfig.deviceId;
   doc["action"] = "start_countdown";
 
-  String body;
-  serializeJson(doc, body);
-
-  int httpCode = http.POST(body);
+  String payload;
+  int httpCode = pbHttpRequest("/api/game/pickleball/state", &doc, payload);
   if (httpCode == 200) {
-    StaticJsonDocument<256> resp;
-    if (deserializeJson(resp, http.getString()) == DeserializationError::Ok) {
+    JsonDocument filter;
+    filter["matchGeneration"] = true;
+    JsonDocument resp;
+    if (deserializeJson(resp, payload, DeserializationOption::Filter(filter)) == DeserializationError::Ok) {
       pbState.matchGeneration = resp["matchGeneration"] | pbState.matchGeneration;
     }
   }
-  http.end();
-  client->stop();
-  delete client;
   return httpCode == 200 && pbState.matchGeneration > 0;
 }
 
 static bool setWagerConsent(bool accepted) {
   if (pbState.gameId.length() == 0) return false;
-  extern GanamosConfig ganamosConfig;
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(5000);
-  HTTPClient http;
-  if (!http.begin(client, "https://www.ganamos.earth/api/game/pickleball/state")) return false;
-  http.setTimeout(5000);
-  http.addHeader("Content-Type", "application/json");
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
   doc["gameId"] = pbState.gameId;
   doc["deviceId"] = ganamosConfig.deviceId;
   doc["action"] = "wager_consent";
   doc["accepted"] = accepted;
-  String body;
-  serializeJson(doc, body);
-  int code = http.POST(body);
-  http.end();
-  return code == 200;
+  String payload;
+  return pbHttpRequest("/api/game/pickleball/state", &doc, payload) == 200;
 }
 
 static void updateGameWager(uint16_t wagerAmount) {
   if (pbState.gameId.length() == 0) return;
-  extern GanamosConfig ganamosConfig;
 
-  WiFiClientSecure *client = new WiFiClientSecure;
-  if (!client) return;
-  client->setInsecure();
-  client->setTimeout(5000);
-
-  HTTPClient http;
-  String url = "https://www.ganamos.earth/api/game/pickleball/state";
-
-  if (!http.begin(*client, url)) {
-    delete client;
-    return;
-  }
-
-  http.setTimeout(5000);
-  http.addHeader("Content-Type", "application/json");
-
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
   doc["gameId"] = pbState.gameId;
   doc["deviceId"] = ganamosConfig.deviceId;
   doc["action"] = "set_wager";
   doc["wagerAmount"] = wagerAmount;
 
-  String body;
-  serializeJson(doc, body);
-
-  int httpCode = http.POST(body);
-  if (httpCode == 200) {
+  String payload;
+  if (pbHttpRequest("/api/game/pickleball/state", &doc, payload) == 200) {
     pbState.wagerActive = true;
-    Serial.printf("🏓 Wager updated to %d sats on server\n", wagerAmount);
+    Serial.printf("Wager updated to %d sats on server\n", wagerAmount);
   }
-
-  http.end();
-  client->stop();
-  delete client;
 }
 
 static void reportGameComplete() {
   if (pbState.gameId.length() == 0) return;
-  extern GanamosConfig ganamosConfig;
 
-  WiFiClientSecure *client = new WiFiClientSecure;
-  if (!client) return;
-  client->setInsecure();
-  client->setTimeout(5000);
-
-  HTTPClient http;
-  String url = "https://www.ganamos.earth/api/game/pickleball/complete";
-
-  if (!http.begin(*client, url)) {
-    delete client;
-    return;
-  }
-
-  http.setTimeout(5000);
-  http.addHeader("Content-Type", "application/json");
-
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
   doc["gameId"] = pbState.gameId;
   doc["deviceId"] = ganamosConfig.deviceId;
   doc["scoreLeft"] = pbState.scoreLeft;
   doc["scoreRight"] = pbState.scoreRight;
   doc["winnerSide"] = (pbState.scoreLeft >= PB_WINNING_SCORE) ? "left" : "right";
 
-  String body;
-  serializeJson(doc, body);
+  String payload;
+  if (pbHttpRequest("/api/game/pickleball/complete", &doc, payload) != 200) return;
 
-  int httpCode = http.POST(body);
+  JsonDocument filter;
+  filter["success"] = true;
+  filter["wagerSettled"] = true;
+  filter["payouts"][0]["amount"] = true;
+  filter["payouts"][0]["petName"] = true;
+  JsonDocument resp;
+  if (deserializeJson(resp, payload, DeserializationOption::Filter(filter)) != DeserializationError::Ok ||
+      !(resp["success"] | false)) return;
 
-  if (httpCode == 200) {
-    String payload = http.getString();
-    StaticJsonDocument<1024> resp;
-    if (deserializeJson(resp, payload) == DeserializationError::Ok && resp["success"]) {
-      bool wagerSettled = resp["wagerSettled"] | false;
-      if (wagerSettled) {
-        // Find this device's user payout
-        extern GanamosConfig ganamosConfig;
-        JsonArray payoutsArr = resp["payouts"];
-        for (JsonObject payout : payoutsArr) {
-          // Match by payout's userId — we need to find our own userId
-          // The host's userId is in the players array
-          int amount = payout["amount"] | 0;
-          String petName = payout["petName"].as<String>();
-          // Check if this payout matches our device's pet name
-          if (petName == ganamosConfig.petName) {
-            pbState.wagerResult = amount;
-            Serial.printf("🏓 Wager result for us: %d sats\n", amount);
-            break;
-          }
-        }
-      }
+  bool wagerSettled = resp["wagerSettled"] | false;
+  if (!wagerSettled) return;
+
+  // Find this device's payout by pet name
+  for (JsonVariantConst payout : resp["payouts"].as<JsonArrayConst>()) {
+    const char *petName = payout["petName"] | "";
+    if (ganamosConfig.petName == petName) {
+      int amount = payout["amount"] | 0;
+      pbState.wagerResult = (int16_t)amount;
+      Serial.printf("Wager result for us: %d sats\n", amount);
+      break;
     }
-  }
-
-  http.end();
-  client->stop();
-  delete client;
-}
-
-static void assignSidesForPlayerCount() {
-  // Assign players to sides based on count:
-  // 2 players: 1v1 (left top vs right top)
-  // 3 players: 1v2 (left top vs right top + right bottom)
-  // 4 players: 2v2 (left top + left bottom vs right top + right bottom)
-
-  switch (pbState.playerCount) {
-    case 2:
-      pbState.players[0].side = 0; pbState.players[0].position = 0; // Left top
-      pbState.players[1].side = 1; pbState.players[1].position = 0; // Right top
-      break;
-    case 3:
-      pbState.players[0].side = 0; pbState.players[0].position = 0; // Left top (solo)
-      pbState.players[1].side = 1; pbState.players[1].position = 0; // Right top
-      pbState.players[2].side = 1; pbState.players[2].position = 1; // Right bottom
-      break;
-    case 4:
-      pbState.players[0].side = 0; pbState.players[0].position = 0; // Left top
-      pbState.players[1].side = 0; pbState.players[1].position = 1; // Left bottom
-      pbState.players[2].side = 1; pbState.players[2].position = 0; // Right top
-      pbState.players[3].side = 1; pbState.players[3].position = 1; // Right bottom
-      break;
   }
 }

@@ -14,21 +14,22 @@ extern void playFixRejectedSound();
 struct PetStats {
   int happiness;     // 0-100 (0 = sad, 100 = very happy)
   int fullness;      // 0-100 (0 = starving, 100 = full)
-  int age;           // in hours
-  bool sleeping;     // sleep cycle
-  unsigned long lastFeed;
-  unsigned long lastActivity;
-  unsigned long lastUpdate;  // For entropy/decay calculations
-  
-  // Time-based decay tracking (milliseconds since boot)
-  unsigned long lastFeedTimestamp;    // When last fed
-  unsigned long lastPlayTimestamp;    // When last played game
-  unsigned long lastDecayUpdate;      // When decay was last calculated
-  
-  // Real-world timestamps (Unix epoch) for persistence across reboots
-  time_t lastFeedEpoch;
-  time_t lastPlayEpoch;
+  unsigned long lastUpdate;  // millis() of the last in-session decay step
+  unsigned long lastActivity; // millis() of the last game played (written by the .ino; not read)
 };
+
+// Pet species, resolved once from ganamosConfig.petType ("bunny" and "rabbit"
+// share PET_BUNNY; unknown types fall back to PET_CAT).
+enum PetKind : uint8_t {
+  PET_CAT = 0,
+  PET_DOG,
+  PET_SQUIRREL,
+  PET_TURTLE,
+  PET_BUNNY,
+  PET_OWL,
+  PET_KIND_COUNT
+};
+PetKind petKindFromString(const String& petType);
 extern PetStats petStats;
 extern bool showCelebration;
 extern bool showNewJobNotification;
@@ -39,11 +40,9 @@ extern unsigned long rejectionStart;
 extern String rejectionMessage;
 
 void updatePetStats(int newBalance, int oldBalance);
-String getPetAnimation();
-const uint8_t* getCurrentPetSprite(String animation);
 
 void initPet(String petType);
-void updatePetMood(int price, int sats);
+void updatePetMood(int price, int sats); // no-op, kept for the .ino call site
 void applyTimeBasedDecay(); // Apply fullness/happiness decay based on elapsed time
 void savePetStats(); // Save stats to NVS
 void loadPetStats(); // Load stats from NVS
