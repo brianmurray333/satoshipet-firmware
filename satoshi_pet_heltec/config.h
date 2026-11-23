@@ -105,6 +105,9 @@ String formatSatsShort(int sats);
 // (X-Device-Id, X-Pairing-Code, Content-Type: application/json).
 // Returns false if WiFi is not connected or begin() fails.
 // Callers then do http.GET()/http.POST(), read the response, and call http.end().
+// Keep-alive note: HTTPClient's destructor stops its client, so use a static /
+// long-lived HTTPClient to actually reuse the TLS connection across calls; a
+// local HTTPClient still works but reconnects (full TLS handshake) each time.
 bool ganamosHttpBegin(HTTPClient& http, const String& path);
 // Closes the shared TLS connection (call when WiFi goes down/off).
 void ganamosHttpReset();

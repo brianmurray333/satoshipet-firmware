@@ -100,7 +100,6 @@
 
   bool isPaired = false;  
   String pendingPickleballGameId = "";
-  String pendingPickleballHostMac = "";
   unsigned long lastUpdate = 0;
   // Server pollInterval is in seconds; clamp so config can't create a battery-heavy loop.
   const long DEFAULT_POLL_INTERVAL_S = 60;

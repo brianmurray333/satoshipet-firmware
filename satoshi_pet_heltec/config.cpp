@@ -31,6 +31,15 @@ int lastHttpCode = 0; // Track last HTTP response code
 static const char GANAMOS_BASE_URL[] = "https://www.ganamos.earth";
 static const uint16_t GANAMOS_HTTP_TIMEOUT_MS = 5000;
 static WiFiClientSecure* ganamosClient = nullptr;
+// One long-lived HTTPClient for this file's requests. HTTPClient's destructor
+// stops its client, so a function-local HTTPClient would close the shared
+// keep-alive connection every time it goes out of scope.
+static HTTPClient ganamosHttp;
+// Requests within one sync burst reuse the connection; after a longer idle
+// gap the server has likely closed it, so start fresh instead of failing on
+// a stale socket.
+static const unsigned long GANAMOS_KEEPALIVE_IDLE_MS = 10000;
+static unsigned long ganamosLastBegin = 0;
 
 // Attach device identity headers to a request
 void attachIdentityHeaders(HTTPClient& http) {
@@ -58,6 +67,12 @@ bool ganamosHttpBegin(HTTPClient& http, const String& path) {
     ganamosClient->setCACert(GANAMOS_ROOT_CAS);
     ganamosClient->setHandshakeTimeout(GANAMOS_HTTP_TIMEOUT_MS / 1000);
   }
+
+  unsigned long now = millis();
+  if (ganamosLastBegin != 0 && now - ganamosLastBegin > GANAMOS_KEEPALIVE_IDLE_MS) {
+    ganamosClient->stop();
+  }
+  ganamosLastBegin = now;
 
   if (!http.begin(*ganamosClient, String(GANAMOS_BASE_URL) + path)) {
     return false;
@@ -141,7 +156,7 @@ bool fetchJobs() {
     return false;
   }
 
-  HTTPClient http;
+  HTTPClient& http = ganamosHttp;
   if (!ganamosHttpBegin(http, "/api/device/jobs?deviceId=" + ganamosConfig.deviceId)) {
     Serial.println("fetchJobs: WiFi not connected");
     return false;
@@ -151,6 +166,7 @@ bool fetchJobs() {
   if (httpCode != 200) {
     Serial.println("fetchJobs: HTTP error " + String(httpCode));
     http.end();
+    if (httpCode < 0) ganamosHttpReset();
     return false;
   }
 
@@ -254,6 +270,9 @@ static bool requestConfig(HTTPClient& http, const String& path) {
     http.getString(); // Drain the error body so the connection stays reusable
   }
   http.end();
+  if (lastHttpCode < 0) {
+    ganamosHttpReset(); // Transport error: don't reuse this socket
+  }
   return false;
 }
 
@@ -349,7 +368,7 @@ bool fetchGanamosConfig() {
   }
 
   extern bool isPaired;
-  HTTPClient http;
+  HTTPClient& http = ganamosHttp;
   bool haveDeviceId = ganamosConfig.deviceId.length() > 0;
   bool ok = false;
 
@@ -530,7 +549,7 @@ bool submitGameScore(int score, GameScoreResponse &response) {
     return false;
   }
 
-  HTTPClient http;
+  HTTPClient& http = ganamosHttp;
   if (!ganamosHttpBegin(http, "/api/device/game-score?deviceId=" + ganamosConfig.deviceId)) {
     return false;
   }
@@ -543,6 +562,7 @@ bool submitGameScore(int score, GameScoreResponse &response) {
   int httpCode = http.POST(payload);
   if (httpCode != 200) {
     http.end();
+    if (httpCode < 0) ganamosHttpReset();
     return false;
   }
 
@@ -624,7 +644,7 @@ bool markJobComplete(String jobId) {
     return false;
   }
 
-  HTTPClient http;
+  HTTPClient& http = ganamosHttp;
   if (!ganamosHttpBegin(http, "/api/device/job-complete?deviceId=" + ganamosConfig.deviceId)) {
     Serial.println("markJobComplete: WiFi not connected");
     return false;
@@ -657,5 +677,6 @@ bool markJobComplete(String jobId) {
   }
 
   http.end();
+  if (httpCode < 0) ganamosHttpReset();
   return success;
 }
