@@ -257,15 +257,19 @@ static void applyServerTimezone(const char* tz) {
 }
 
 // ===== Device config =====
-static bool requestConfig(HTTPClient& http, const String& path) {
+static bool requestConfigOnce(HTTPClient& http, const String& path) {
   lastHttpCode = 0;
   if (!ganamosHttpBegin(http, path)) {
     return false;
   }
+  unsigned long started = millis();
   lastHttpCode = http.GET();
   if (lastHttpCode == 200) {
     return true;
   }
+  Serial.printf("Config request failed after %lums: %d %s\n", millis() - started,
+                lastHttpCode,
+                lastHttpCode < 0 ? HTTPClient::errorToString(lastHttpCode).c_str() : "");
   if (lastHttpCode > 0) {
     http.getString(); // Drain the error body so the connection stays reusable
   }
@@ -274,6 +278,18 @@ static bool requestConfig(HTTPClient& http, const String& path) {
     ganamosHttpReset(); // Transport error: don't reuse this socket
   }
   return false;
+}
+
+// A transport error (no HTTP response at all) is retried once on a fresh
+// connection: the first request after the radio wakes can fail while the
+// network path settles, and one retry is cheaper than showing a warning and
+// waiting for the next poll.
+static bool requestConfig(HTTPClient& http, const String& path) {
+  if (requestConfigOnce(http, path)) return true;
+  if (lastHttpCode >= 0 || WiFi.status() != WL_CONNECTED) return false;
+  esp_task_wdt_reset();
+  Serial.println(F("Retrying config request on a new connection"));
+  return requestConfigOnce(http, path);
 }
 
 static bool parseConfigResponse(HTTPClient& http) {
