@@ -1167,12 +1167,32 @@
     }
     lastBalance = ganamosConfig.balance;
 
-    // Check for fix rejection notification
-    static String lastSeenRejectionId = "";
+    // Check for fix rejection notification. The server keeps sending the
+    // last rejection, so remember which one was shown in flash: otherwise
+    // every reboot or re-flash would show an old rejection again.
+    static String lastSeenRejectionId;
+    static bool rejectionSeenLoaded = false;
+    if (!rejectionSeenLoaded) {
+      Preferences uiPrefs;
+      if (uiPrefs.begin("sp-ui", true)) {
+        lastSeenRejectionId = uiPrefs.getString("seenReject", "");
+        uiPrefs.end();
+      }
+      rejectionSeenLoaded = true;
+      // First run with this firmware: whatever rejection the server reports
+      // now is from before; record it without showing it.
+      if (lastSeenRejectionId.length() == 0 && ganamosConfig.lastRejectionId.length() > 0) {
+        lastSeenRejectionId = ganamosConfig.lastRejectionId;
+        Preferences w;
+        if (w.begin("sp-ui", false)) { w.putString("seenReject", lastSeenRejectionId); w.end(); }
+      }
+    }
     if (ganamosConfig.lastRejectionId.length() > 0 &&
         ganamosConfig.lastRejectionId != lastSeenRejectionId) {
       // New rejection detected!
       lastSeenRejectionId = ganamosConfig.lastRejectionId;
+      Preferences w;
+      if (w.begin("sp-ui", false)) { w.putString("seenReject", lastSeenRejectionId); w.end(); }
       triggerRejection(ganamosConfig.rejectionMessage);
     }
 
