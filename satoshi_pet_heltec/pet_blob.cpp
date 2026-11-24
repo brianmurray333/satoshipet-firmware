@@ -1176,8 +1176,13 @@ void handleJobsMenu(SSD1306Wire &display) {
                   confirmPressed = false;
                   
                   if (confirmDuration < SHORT_PRESS_MAX) {
-                    // Short press = Confirm!
-                    playMenuSelectTone();
+                    // Short press = Confirm! Finish the tone before the
+                    // network call: nothing services the sound sequencer
+                    // while the request blocks, so a non-blocking tone would
+                    // hold its first note until the server answers.
+                    extern void playMenuSelectToneBlocking();
+                    playMenuSelectToneBlocking();
+                    soundStop();
                     
                     // Show "Sending..." screen
                     display.clear();
@@ -1207,7 +1212,25 @@ void handleJobsMenu(SSD1306Wire &display) {
                     }
                     display.display();
                     delay(2500);
-                    
+
+                    if (success) {
+                      // The job now waits for the poster's review, and the
+                      // server stops listing it: drop it from the cached list
+                      // too instead of showing it until the next fetch.
+                      for (int i = selectedJob; i < cachedJobCount - 1; i++) {
+                        cachedJobs[i] = cachedJobs[i + 1];
+                      }
+                      cachedJobCount--;
+                      if (cachedJobCount == 0) {
+                        inDetailView = false;
+                        inJobsMenu = false;
+                        break;
+                      }
+                      if (selectedJob >= cachedJobCount) selectedJob = cachedJobCount - 1;
+                      if (scrollOffset > selectedJob) scrollOffset = selectedJob;
+                      lastSelectedJob = -1;  // reset the title marquee
+                    }
+
                     inDetailView = false;
                   } else {
                     // Long press = Cancel
