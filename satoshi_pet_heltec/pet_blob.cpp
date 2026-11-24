@@ -17,6 +17,7 @@ extern bool lastSyncSucceeded;
 #include "display_assets.h"
 #include "food_bitmaps.h"
 #include "sound.h"
+#include "hold_press.h"
 
 // Forward declarations
 void renderJobsList(SSD1306Wire &display, int selectedJob, int scrollOffset);
@@ -862,7 +863,7 @@ void renderMenu(SSD1306Wire &display, int menuOption) {
   
   display.setFont(ArialMT_Plain_10);
   display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.drawString(64, 50, "Tap: next  Hold: pick");
+  if (holdHintsVisible()) display.drawString(64, 50, "Tap: next  Hold: pick");
   display.display();
 }
 
@@ -1017,7 +1018,7 @@ void renderJobDetail(SSD1306Wire &display, int jobIndex) {
   
   // Bottom line: instructions
   display.setFont(ArialMT_Plain_10);
-  display.drawString(0, 54, "Press:Back  Hold:Done");  
+  if (holdHintsVisible()) display.drawString(0, 54, "Tap: back  Hold: done");
   display.display();
 }
 
@@ -1051,8 +1052,6 @@ void handleJobsMenu(SSD1306Wire &display) {
   int scrollOffset = 0;  // Which job is at the top of the visible list
   bool inJobsMenu = true;
   unsigned long lastJobCycle = millis();
-  bool buttonPressed = false;
-  unsigned long buttonPressTime = 0;
   
   // Reset marquee state
   jobsMarqueeOffset = 0;
@@ -1061,10 +1060,8 @@ void handleJobsMenu(SSD1306Wire &display) {
   
   renderJobsList(display, selectedJob, scrollOffset);
   
-  // Button handling constants (from main sketch)
-  const unsigned long SHORT_PRESS_MAX = 600;
-  const unsigned long HOLD_PRESS_MIN = 700;
-  
+  extern bool anyButtonDown();
+
   while (inJobsMenu) {
     esp_task_wdt_reset();
     soundUpdate();
@@ -1076,23 +1073,16 @@ void handleJobsMenu(SSD1306Wire &display) {
       break;
     }
     
-    // Read buttons
-    bool prgState = digitalRead(0) == LOW;      // BUTTON_PIN_PRG
-    bool externalState = digitalRead(2) == LOW;  // BUTTON_PIN_EXTERNAL
-    bool currentState = prgState || externalState;
-    
-    if (currentState && !buttonPressed) {
-      buttonPressed = true;
-      buttonPressTime = millis();
-    }
-    
-    if (!currentState && buttonPressed) {
-      unsigned long pressDuration = millis() - buttonPressTime;
-      buttonPressed = false;
+    // Tap = next, hold = open (counts as soon as the line fills)
+    PressEvent ev = holdPressUpdate(anyButtonDown());
+    if (holdPressActive()) lastJobCycle = millis();
+    holdPressDrawBar(display);
+
+    if (ev != PRESS_NONE) {
       lastJobCycle = millis();
-      
-      bool isShort = pressDuration <= SHORT_PRESS_MAX;
-      bool isHold = pressDuration >= HOLD_PRESS_MIN;
+
+      bool isShort = ev == PRESS_TAP;
+      bool isHold = ev == PRESS_HOLD;
       
             if (isShort) {
         // Cycle to next item (jobs + back option)
@@ -1131,32 +1121,21 @@ void handleJobsMenu(SSD1306Wire &display) {
         
         renderJobDetail(display, selectedJob);
         
-        // Wait for button press in detail view
-        // Short press = back to list
-        // Long press = mark as complete
-        delay(300);  // Debounce
-        bool detailButtonPressed = false;
-        unsigned long detailButtonPressTime = 0;
+        // Detail view: tap = back to list, hold = mark as complete.
+        // The hold that opened this screen is still down; holdPressUpdate
+        // ignores it until release.
         unsigned long detailStart = millis();
         bool inDetailView = true;
         
         while (inDetailView && (millis() - detailStart < 30000)) {  // 30s timeout
           esp_task_wdt_reset();
           soundUpdate();
-          bool detailPrgState = digitalRead(0) == LOW;
-          bool detailExtState = digitalRead(2) == LOW;
-          bool detailState = detailPrgState || detailExtState;
+          PressEvent detailEv = holdPressUpdate(anyButtonDown());
+          if (holdPressActive()) detailStart = millis();
+          holdPressDrawBar(display);
           
-          if (detailState && !detailButtonPressed) {
-            detailButtonPressed = true;
-            detailButtonPressTime = millis();
-          }
-          
-          if (!detailState && detailButtonPressed) {
-            unsigned long detailPressDuration = millis() - detailButtonPressTime;
-            detailButtonPressed = false;
-            
-            if (detailPressDuration >= HOLD_PRESS_MIN) {
+          if (detailEv != PRESS_NONE) {
+            if (detailEv == PRESS_HOLD) {
               // Long press - show confirmation for marking complete
               playMenuSelectTone();
               
@@ -1167,33 +1146,23 @@ void handleJobsMenu(SSD1306Wire &display) {
               display.drawString(64, 5, "Mark Done?");
               
               display.setFont(ArialMT_Plain_10);
-              display.drawString(64, 28, "Press: Yes");
+              display.drawString(64, 28, "Tap: Yes");
               display.drawString(64, 42, "Hold: Cancel");
               display.display();
               
-              // Wait for confirmation
-              delay(300);
-              bool confirmPressed = false;
-              unsigned long confirmPressTime = 0;
+              // Wait for confirmation (the hold that got here is ignored
+              // until it is released)
               unsigned long confirmStart = millis();
               
               while (millis() - confirmStart < 10000) {  // 10s timeout for confirm
                 esp_task_wdt_reset();
                 soundUpdate();
-                bool confirmPrgState = digitalRead(0) == LOW;
-                bool confirmExtState = digitalRead(2) == LOW;
-                bool confirmState = confirmPrgState || confirmExtState;
+                PressEvent confirmEv = holdPressUpdate(anyButtonDown());
+                if (holdPressActive()) confirmStart = millis();
+                holdPressDrawBar(display);
                 
-                if (confirmState && !confirmPressed) {
-                  confirmPressed = true;
-                  confirmPressTime = millis();
-                }
-                
-                if (!confirmState && confirmPressed) {
-                  unsigned long confirmDuration = millis() - confirmPressTime;
-                  confirmPressed = false;
-                  
-                  if (confirmDuration < SHORT_PRESS_MAX) {
+                if (confirmEv != PRESS_NONE) {
+                  if (confirmEv == PRESS_TAP) {
                     // Short press = Confirm! Finish the tone before the
                     // network call: nothing services the sound sequencer
                     // while the request blocks, so a non-blocking tone would
@@ -1281,7 +1250,8 @@ void handleJobsMenu(SSD1306Wire &display) {
     
     // Update marquee animation even when no button pressed
     // selectedJob == cachedJobCount is the "Back" row (no job behind it)
-    if (selectedJob >= 0 && selectedJob < cachedJobCount &&
+    // (not while the button is down: the redraw would wipe the hold line)
+    if (!holdPressActive() && selectedJob >= 0 && selectedJob < cachedJobCount &&
         cachedJobs[selectedJob].title.length() > JOB_TITLE_VISIBLE_CHARS) {
       static unsigned long lastMarqueeRender = 0;
       if (now - lastMarqueeRender > MARQUEE_SPEED_MS) {

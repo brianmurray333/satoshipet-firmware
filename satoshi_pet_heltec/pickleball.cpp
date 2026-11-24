@@ -2,6 +2,7 @@
 #include "config.h"
 #include "button_handler.h"
 #include "sound.h"
+#include "hold_press.h"
 #include <esp_task_wdt.h>
 #include <esp_timer.h>
 #include <esp_wifi.h>
@@ -95,6 +96,7 @@ static void awardPoint(uint8_t scoringSide, uint8_t reason);
 // Sound effects defined in main .ino (blocking, menu-only)
 extern void playButtonChirp();
 extern void playMenuSelectTone();
+extern bool anyButtonDown();
 
 // Flag to suppress duplicate sats celebration after wager game
 bool suppressNextSatsCelebration = false;
@@ -807,7 +809,6 @@ int handlePickleballGame(SSD1306Wire &display) {
       const uint16_t wagerOptions[] = {0, 100, 500, 1000};
       int wagerIdx = 0;
       bool wagerSelected = false;
-      bool lastWagerBtn = false;
       unsigned long wagerTimeout = millis() + 15000;
 
       while (!wagerSelected && millis() < wagerTimeout) {
@@ -827,29 +828,21 @@ int handlePickleballGame(SSD1306Wire &display) {
         }
 
         display.setFont(ArialMT_Plain_10);
-        display.drawString(64, 50, "Tap=cycle  Hold=pick");
+        if (holdHintsVisible()) display.drawString(64, 50, "Tap: next  Hold: pick");
+
+        // Tap = next amount, hold = pick (as soon as the line fills)
+        PressEvent ev = holdPressUpdate(anyButtonDown());
+        if (holdPressActive()) wagerTimeout = millis() + 15000;
+        holdPressDrawBar(display, false);
         display.display();
 
-        bool btn = pbRawButtonDown();
-
-        if (btn && !lastWagerBtn) {
-          unsigned long pressStart = millis();
-          while (pbRawButtonDown() && millis() - pressStart < 2000) {
-            esp_task_wdt_reset();
-            soundUpdate();
-            delay(20);
-          }
-          unsigned long dur = millis() - pressStart;
-
-          if (dur >= 500) {
-            playMenuSelectTone();
-            wagerSelected = true;
-          } else {
-            playButtonChirp();
-            wagerIdx = (wagerIdx + 1) % 4;
-          }
+        if (ev == PRESS_HOLD) {
+          playMenuSelectTone();
+          wagerSelected = true;
+        } else if (ev == PRESS_TAP) {
+          playButtonChirp();
+          wagerIdx = (wagerIdx + 1) % 4;
         }
-        lastWagerBtn = btn;
         soundUpdate();
         delay(30);
       }
@@ -867,7 +860,6 @@ int handlePickleballGame(SSD1306Wire &display) {
   if (!pbState.isHost && pbState.wagerAmount > 0) {
     bool wagerDecision = false;
     bool wagerAccepted = false;
-    bool lastAccBtn = false;
     unsigned long acceptTimeout = millis() + 15000;
     char amountBuf[8];
     snprintf(amountBuf, sizeof(amountBuf), "%u", (unsigned)pbState.wagerAmount);
@@ -883,22 +875,18 @@ int handlePickleballGame(SSD1306Wire &display) {
       display.drawString(64, 18, amountBuf);
 
       display.setFont(ArialMT_Plain_10);
-      display.drawString(64, 46, "Hold=Accept  Tap=Decline");
-      display.display();
+      // A money decision, so the hint always shows
+      display.drawString(64, 46, "Hold: Accept  Tap: Decline");
 
-      bool btn = pbRawButtonDown();
-      if (btn && !lastAccBtn) {
-        unsigned long pressStart = millis();
-        while (pbRawButtonDown() && millis() - pressStart < 2000) {
-          esp_task_wdt_reset();
-          soundUpdate();
-          delay(20);
-        }
-        unsigned long dur = millis() - pressStart;
+      // Hold = accept (as soon as the line fills), tap = decline
+      PressEvent ev = holdPressUpdate(anyButtonDown());
+      if (holdPressActive()) acceptTimeout = millis() + 15000;
+      holdPressDrawBar(display, false);
+      display.display();
+      if (ev != PRESS_NONE) {
         wagerDecision = true;
-        wagerAccepted = (dur >= 500);
+        wagerAccepted = (ev == PRESS_HOLD);
       }
-      lastAccBtn = btn;
       soundUpdate();
       delay(30);
     }

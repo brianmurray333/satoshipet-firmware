@@ -18,6 +18,7 @@
   #include <esp_wifi.h>
   #include <driver/gpio.h>
   #include "sound.h"
+  #include "hold_press.h"
 
   // Keep declarations explicit so this sketch builds consistently with both
   // Arduino IDE and non-IDE toolchains such as PlatformIO/Wokwi.
@@ -187,7 +188,7 @@
   unsigned long lowBatteryWarningStartTime = 0;
   bool lowBatteryAlertPlayed = false; // Prevent repeated alerts
 
-  const unsigned long HOLD_PRESS_MIN = 700;
+  const unsigned long HOLD_PRESS_MIN = HOLD_SELECT_MS;
   const unsigned long SHORT_PRESS_MAX = HOLD_PRESS_MIN - 1;
   const unsigned long VERY_LONG_PRESS = 10000; // 10 seconds to prevent accidental factory reset
 
@@ -208,23 +209,6 @@
     }
     isDisplayOff = isScreensaverActive = isBitcoinFactsActive = false;
     setOLEDContrast(NORMAL_BRIGHTNESS);
-  }
-
-  void renderHoldProgress() {
-    if (!buttonPressed) return;
-    static unsigned long lastFrame = 0;
-    unsigned long now = millis();
-    if (now - lastFrame < 50) return;
-    lastFrame = now;
-    unsigned long elapsed = now - buttonPressTime;
-    display.setColor(BLACK);
-    display.fillRect(0, 49, 128, 15);
-    display.setColor(WHITE);
-    display.setFont(ArialMT_Plain_10);
-    display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 49, elapsed < HOLD_PRESS_MIN ? "Hold to select" : "Release to select");
-    display.fillRect(0, 63, min(128UL, elapsed * 128 / HOLD_PRESS_MIN), 1);
-    display.display();
   }
 
   int getBatteryPercentage() {
@@ -1704,9 +1688,21 @@
       }
     }
     
-    if (!currentButtonState && buttonPressed) {
-      unsigned long pressDuration = millis() - buttonPressTime;
+    // In the menu a hold counts as soon as the line fills, without waiting
+    // for release; the rest of that press is ignored. Elsewhere (home screen)
+    // presses are still measured on release, so the 10 s factory-reset hold
+    // and the WiFi-setup hold stay reachable.
+    bool menuHoldReached = buttonPressed && currentButtonState && inMenuMode &&
+                           onboardingStep == 0 &&
+                           millis() - buttonPressTime >= HOLD_PRESS_MIN;
+    if ((!currentButtonState && buttonPressed) || menuHoldReached) {
+      unsigned long pressDuration = menuHoldReached ? HOLD_PRESS_MIN : millis() - buttonPressTime;
       buttonPressed = false;
+      if (menuHoldReached) {
+        consumeButtonUntilRelease = true;
+        holdPressSwallow();     // nested screens ignore this press too
+        holdHintsNoteHold();
+      }
       ButtonSource triggeredSource = lastButtonSource;
       lastButtonSource = BUTTON_SOURCE_NONE;
 
@@ -1781,21 +1777,16 @@
             renderGameMenu();
 
             while (inGameMenu && millis() - lastGameInput < 30000) {
-              bool gameButtonDown = anyButtonDown();
-              if (gameButtonDown && !buttonPressed) {
-                buttonPressed = true;
-                buttonPressTime = millis();
-              }
-              if (!gameButtonDown && buttonPressed) {
-                unsigned long duration = millis() - buttonPressTime;
-                buttonPressed = false;
+              PressEvent gameEv = holdPressUpdate(anyButtonDown());
+              if (holdPressActive()) lastGameInput = lastButtonPress = millis();
+              if (gameEv != PRESS_NONE) {
                 lastGameInput = millis();
                 lastButtonPress = lastGameInput;
-                if (duration <= SHORT_PRESS_MAX) {
+                if (gameEv == PRESS_TAP) {
                   selectedGame = (selectedGame + 1) % 4;
                   playButtonChirp();
                   renderGameMenu();
-                } else if (duration >= HOLD_PRESS_MIN && duration < VERY_LONG_PRESS) {
+                } else {
                   playMenuSelectToneBlocking();  // Games run their own blocking loops
                   inGameMenu = false;
                   if (selectedGame == 0) {
@@ -1816,7 +1807,7 @@
                   }
                 }
               }
-              renderHoldProgress();
+              holdPressDrawBar(display);
               esp_task_wdt_reset();
               soundUpdate();
               delay(20);
@@ -1841,20 +1832,12 @@
               }
 
               soundUpdate();
-              bool currentStateFood = anyButtonDown();
+              PressEvent foodEv = holdPressUpdate(anyButtonDown());
+              if (holdPressActive()) lastButtonPress = lastFoodCycle = millis();
 
-              if (currentStateFood && !buttonPressed) {
-                buttonPressed = true;
-                buttonPressTime = millis();
-                lastButtonPress = lastFoodCycle = buttonPressTime;
-              }
-
-              if (!currentStateFood && buttonPressed) {
-                unsigned long foodPressDuration = millis() - buttonPressTime;
-                buttonPressed = false;
-
-                bool foodShort = foodPressDuration <= SHORT_PRESS_MAX;
-                bool foodHold = (foodPressDuration >= HOLD_PRESS_MIN) && (foodPressDuration < VERY_LONG_PRESS);
+              if (foodEv != PRESS_NONE) {
+                bool foodShort = foodEv == PRESS_TAP;
+                bool foodHold = foodEv == PRESS_HOLD;
 
                 if (foodShort) {
                   selectedFood = (selectedFood + 1) % totalFoodItems;
@@ -1886,7 +1869,7 @@
                 }
               }
 
-              renderHoldProgress();
+              holdPressDrawBar(display);
               delay(45);
             }
 
@@ -1967,11 +1950,14 @@
     // If in menu mode, keep rendering menu
     if (inMenuMode) {
       static unsigned long lastMenuRender = 0;
-      if (millis() - lastMenuRender > 500) { // Update menu display every 500ms
+      // Not while the button is down: a redraw would wipe the hold line
+      if (!buttonPressed && millis() - lastMenuRender > 500) {
         renderMenu(display, currentMenuOption);
         lastMenuRender = millis();
       }
-      renderHoldProgress();
+      if (buttonPressed && !consumeButtonUntilRelease) {
+        drawHoldBar(display, millis() - buttonPressTime);
+      }
     }
     
     // When both OLED and radio are off, light-sleep the CPU until the next
