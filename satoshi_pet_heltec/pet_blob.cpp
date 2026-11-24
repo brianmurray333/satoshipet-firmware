@@ -716,8 +716,8 @@ void renderPet(SSD1306Wire &display, int btcPrice, int satoshis, int batteryPerc
   String shortName = ganamosConfig.petName;
   while (shortName.length() && display.getStringWidth(shortName) > 62) shortName.remove(shortName.length() - 1);
   display.drawString(0, 0, shortName);
-  // Sync status icon (9x8) just left of the battery. Nothing while all is
-  // well or while connecting/syncing (e.g. right after waking or booting).
+  // Sync status just left of the battery: nothing when synced, animated dots
+  // while connecting/syncing, an icon only once something actually failed.
   static const uint8_t ICON_WIFI_OFF[] = {  // WiFi with a slash: no WiFi
     0x7A, 0x00, 0x86, 0x00, 0x29, 0x01, 0x54, 0x00, 0x30, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x01 };
   static const uint8_t ICON_WARNING[] = {   // warning triangle: last sync failed
@@ -725,14 +725,19 @@ void renderPet(SSD1306Wire &display, int btcPrice, int satoshis, int batteryPerc
   static const uint8_t ICON_UPLOAD[] = {    // up arrow: feedings/scores waiting to upload
     0x10, 0x00, 0x38, 0x00, 0x54, 0x00, 0x92, 0x00, 0x10, 0x00, 0x10, 0x00, 0x00, 0x00, 0xFE, 0x00 };
   extern bool wifiConnecting;
+  extern bool syncPending;
   extern bool syncAttempted;
   const uint8_t* statusIcon = nullptr;
-  if (WiFi.status() != WL_CONNECTED) {
-    if (!wifiConnecting) statusIcon = ICON_WIFI_OFF;
+  if (syncPending || wifiConnecting) {
+    // Syncing (e.g. just woke up): animated ". .. ..." rather than a warning
+    int dots = (millis() / 400) % 3 + 1;
+    for (int i = 0; i < dots; i++) display.fillRect(128 - 18 - 11 + i * 3, 5, 2, 2);
+  } else if (WiFi.status() != WL_CONNECTED) {
+    statusIcon = ICON_WIFI_OFF;                 // couldn't connect
   } else if (getPendingSpendCount() || getPendingGameScoreCount()) {
     statusIcon = ICON_UPLOAD;
   } else if (syncAttempted && !lastSyncSucceeded) {
-    statusIcon = ICON_WARNING;
+    statusIcon = ICON_WARNING;                  // a sync was tried and failed
   }
   if (statusIcon) display.drawXbm(128 - 18 - 12, 0, 9, 8, statusIcon);
   

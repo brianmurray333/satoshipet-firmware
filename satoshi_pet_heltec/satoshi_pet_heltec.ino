@@ -1548,7 +1548,8 @@
           
           // One frame per second keeps the pet feeling alive while halving idle
           // OLED transfers compared with the previous 500 ms refresh cadence.
-          bool animationUpdate = (now - lastDisplayUpdate > 1000);
+          // While syncing, refresh faster so the "..." indicator animates.
+          bool animationUpdate = (now - lastDisplayUpdate > ((syncPending || wifiConnecting) ? 400UL : 1000UL));
           
           if (dataChanged || animationUpdate || screenChanged) {
             renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, cachedBatteryPct);
@@ -1656,6 +1657,13 @@
             lastWifiReconnectAttempt = millis();
             wifiStartConnect();
           }
+        }
+        // Refresh right away on wake (the screen shows "..." meanwhile) so
+        // new sats and jobs appear without waiting for the next poll.
+        if (isPaired && !syncPending && (wifiReady() || wifiConnecting)) {
+          lastUpdate = millis();
+          syncPending = true;
+          syncAttempted = false;
         }
         // Button handling is local, so modem sleep can remain enabled after wake.
         if (wifiReady()) WiFi.setSleep(WIFI_PS_MAX_MODEM);
