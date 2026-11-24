@@ -716,15 +716,25 @@ void renderPet(SSD1306Wire &display, int btcPrice, int satoshis, int batteryPerc
   String shortName = ganamosConfig.petName;
   while (shortName.length() && display.getStringWidth(shortName) > 62) shortName.remove(shortName.length() - 1);
   display.drawString(0, 0, shortName);
-  // While the radio is reconnecting (e.g. just after waking) show nothing:
-  // "Offline" only when a connection isn't in progress and isn't up.
+  // Sync status icon (9x8) just left of the battery. Nothing while all is
+  // well or while connecting/syncing (e.g. right after waking or booting).
+  static const uint8_t ICON_WIFI_OFF[] = {  // WiFi with a slash: no WiFi
+    0x7A, 0x00, 0x86, 0x00, 0x29, 0x01, 0x54, 0x00, 0x30, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x01 };
+  static const uint8_t ICON_WARNING[] = {   // warning triangle: last sync failed
+    0x10, 0x00, 0x28, 0x00, 0x28, 0x00, 0x54, 0x00, 0x54, 0x00, 0x82, 0x00, 0x92, 0x00, 0xFF, 0x01 };
+  static const uint8_t ICON_UPLOAD[] = {    // up arrow: feedings/scores waiting to upload
+    0x10, 0x00, 0x38, 0x00, 0x54, 0x00, 0x92, 0x00, 0x10, 0x00, 0x10, 0x00, 0x00, 0x00, 0xFE, 0x00 };
   extern bool wifiConnecting;
-  const char* syncStatus = WiFi.status() != WL_CONNECTED ? (wifiConnecting ? "" : "Offline")
-    : getPendingSpendCount() || getPendingGameScoreCount() ? "Queued"
-    : !lastSyncSucceeded ? "Stale" : "";
-  display.setTextAlignment(TEXT_ALIGN_RIGHT);
-  display.drawString(106, 0, syncStatus);
-  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  extern bool syncAttempted;
+  const uint8_t* statusIcon = nullptr;
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!wifiConnecting) statusIcon = ICON_WIFI_OFF;
+  } else if (getPendingSpendCount() || getPendingGameScoreCount()) {
+    statusIcon = ICON_UPLOAD;
+  } else if (syncAttempted && !lastSyncSucceeded) {
+    statusIcon = ICON_WARNING;
+  }
+  if (statusIcon) display.drawXbm(128 - 18 - 12, 0, 9, 8, statusIcon);
   
     // Top right: Battery icon (16x8 pixels, right-aligned)
   extern int getBatteryLevel();

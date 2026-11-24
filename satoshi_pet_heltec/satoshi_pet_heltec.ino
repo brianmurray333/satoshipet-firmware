@@ -112,6 +112,7 @@
   bool buttonPressed = false;
   bool consumeButtonUntilRelease = false;
   bool lastSyncSucceeded = false;
+  bool syncAttempted = false;  // a sync has been tried since boot (success or not)
   unsigned long buttonPressTime = 0;
   unsigned long lastButtonPress = 0;
   bool hadSavedConfigOnBoot = false; // Track if we loaded saved config on boot
@@ -1056,6 +1057,7 @@
     // Lighter power save while exchanging data keeps request latency low.
     WiFi.setSleep(WIFI_PS_MIN_MODEM);
     bool fetchSuccess = fetchGanamosConfig();
+    syncAttempted = true;
     lastSyncSucceeded = fetchSuccess;
     esp_task_wdt_reset();
 
@@ -1444,6 +1446,7 @@
         } else if (!wifiConnecting) {
           // Connect attempt gave up (radio already turned off by wifiService)
           syncPending = false;
+          syncAttempted = true;
           lastSyncSucceeded = false;
           Serial.println(F("❌ WiFi reconnect failed - sync skipped"));
         }
