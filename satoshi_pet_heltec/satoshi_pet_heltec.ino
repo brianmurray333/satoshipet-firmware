@@ -105,7 +105,9 @@
   const long DEFAULT_POLL_INTERVAL_S = 60;
   const long MIN_POLL_INTERVAL_S = 60;
   const long MAX_POLL_INTERVAL_S = 3600;
-  const unsigned long IDLE_POLL_INTERVAL_MS = 900000UL; // Display off/screensaver: every 15 min
+  // Display off/screensaver: check every 3 min so new jobs and earned sats
+  // wake the pet promptly (each check is a ~1 s fast reconnect + one request)
+  const unsigned long IDLE_POLL_INTERVAL_MS = 180000UL;
   const unsigned long DECAY_CHECK_INTERVAL_MS = 60000UL;
   bool buttonPressed = false;
   bool consumeButtonUntilRelease = false;
@@ -686,7 +688,7 @@
     return prgDown || externalDown;
   }
 
-  // Poll interval: server value is seconds, clamped; idle uses 15 minutes.
+  // Poll interval: server value is seconds, clamped; idle polls at least every 3 minutes.
   unsigned long currentPollIntervalMs() {
     long seconds = ganamosConfig.pollInterval > 0 ? ganamosConfig.pollInterval : DEFAULT_POLL_INTERVAL_S;
     seconds = constrain(seconds, MIN_POLL_INTERVAL_S, MAX_POLL_INTERVAL_S);

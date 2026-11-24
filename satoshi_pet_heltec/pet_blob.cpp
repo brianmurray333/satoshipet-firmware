@@ -716,7 +716,10 @@ void renderPet(SSD1306Wire &display, int btcPrice, int satoshis, int batteryPerc
   String shortName = ganamosConfig.petName;
   while (shortName.length() && display.getStringWidth(shortName) > 62) shortName.remove(shortName.length() - 1);
   display.drawString(0, 0, shortName);
-  const char* syncStatus = WiFi.status() != WL_CONNECTED ? "Offline"
+  // While the radio is reconnecting (e.g. just after waking) show nothing:
+  // "Offline" only when a connection isn't in progress and isn't up.
+  extern bool wifiConnecting;
+  const char* syncStatus = WiFi.status() != WL_CONNECTED ? (wifiConnecting ? "" : "Offline")
     : getPendingSpendCount() || getPendingGameScoreCount() ? "Queued"
     : !lastSyncSucceeded ? "Stale" : "";
   display.setTextAlignment(TEXT_ALIGN_RIGHT);
