@@ -11,14 +11,14 @@ what didn't work in v1.
 | | v1 | v2 |
 |---|---|---|
 | Closed thickness | ~27 mm | **21.5 mm** |
-| Screen window | 15.5 × 26.5 mm straight-walled, 2 mm wall | 13.5 × 27 mm sized to the OLED's dark area, 1.6 mm wall bevelled 45° |
+| Screen window | 15.5 × 26.5 mm straight-walled, 2 mm wall | 13.5 × 25 mm over the OLED's dark area, 1.6 mm wall bevelled 45° |
 | Lip fit | 0 mm clearance (lip 29.0 × 66.3 into a 29.0 × 66.2 opening) | 0.2 mm per side (`clr`) |
 | Closing | friction only | snap ridges on both long sides (`snap`) |
-| USB-C opening | 10 × 4 mm (most cable plugs don't seat) | 12.5 × 6.6 mm, centred on the socket |
+| USB-C opening | 10 × 4 mm (most cable plugs don't seat) | 9.8 × 4.2 mm around the socket, which reaches to 0.9 mm from the outside |
 | Battery | loose in the back cavity | corner ribs hold an 802540 (8 × 25 × 40 mm) |
 | Buzzer | glued | ring holder + 7-hole sound grille |
 | Button | glued | socket for a 6 × 6 mm tactile switch |
-| Board | 0.7 mm pin holes in rails | rails + side guides + end stops, board drops in |
+| Board | 0.7 mm pin holes in rails | rails + side guides; end stops under the board's cut-back corners hold it against the USB-C wall (0.2 mm play) |
 
 ## Files
 

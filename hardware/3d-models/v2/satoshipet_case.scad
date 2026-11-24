@@ -36,7 +36,11 @@ snap_len = 14;   // snap ridge length on each long side
 
 /* ---------- board ---------- */
 board_w   = 25.5;  // Heltec V3 PCB width
-board_l   = 50.6;  // PCB length incl. USB-C + clearance
+board_l   = 50.2;  // Heltec V3 PCB length (datasheet), measured through the middle of the ends.
+                   // The USB-C end of the PCB rests against the inside of the end wall; the
+                   // socket sticks out 0.9 mm past the PCB into the USB opening.
+pcb_notch = 1.1;   // the PCB's corners are cut back 1.1 mm at each end (long edges are 48.0)
+stop_play = 0.2;   // lengthwise play between the board and the end stops
 pcb_t     = 1.6;
 oled_stack= 5.2;   // gap from the front wall to the PCB: the OLED glass and
                    // the USB-C socket sit on this side. Measured glass on a
@@ -44,8 +48,9 @@ oled_stack= 5.2;   // gap from the front wall to the PCB: the OLED glass and
 rail_w    = 2.0;   // PCB rests on these along its long edges
 
 /* ---------- screen window ---------- */
-win_cx = 13.3; win_cy = 38.3;  // centre of the OLED's dark area (~20.5 mm from the board's pointed end, ~3 mm toward one pin row)
-win_x  = 13.5; win_y  = 27;    // a little inside the dark area (~14 x 28 mm) so no glass edge shows
+win_cx = 13.3;                 // across: ~3 mm toward one pin row (fit confirmed on the v2 print)
+win_cy = L - wall - 31.0 - stop_play/2;  // along: OLED centre is 31.0 mm from the PCB's USB-C end
+win_x  = 13.5; win_y  = 25;    // the OLED's dark area measured 25 mm long on the board
 win_chamfer = true;            // 45 deg bevel out to the front face
 
 /* ---------- other parts ---------- */
@@ -53,7 +58,7 @@ key_c   = [6, 6.6];  key_d = 5.5; key_od = 9;    // keyring tube through both ha
 buz_c   = [16.3, 9.6]; buz_d = 12.4; buz_h = 4;  // buzzer ring, sound grille in front
 btn_c   = [27, 13];  btn_hole = 3.8; btn_sock = 6.4; btn_sock_h = 3.0; // 6x6 tactile
 pin_c   = [25, 63.6]; pin_d = 2.0;               // pinhole (kept from v1)
-usb_w   = 12.5; usb_h = 6.6;                      // USB-C opening, fits most cable plugs
+usb_w   = 9.8;  usb_h = 4.2;                      // USB-C opening: the socket's metal shell (8.9 x 3.2) + ~0.45 mm a side
 usb_z0  = floor_f + oled_stack - 1.6 - usb_h/2;   // centred on the socket (3.2 mm tall, under the PCB)
 bat     = [25.6, 40.6, 8.6];                     // battery pocket (802540 + clearance)
 bat_cy  = 43;                                    // pocket centre along y
@@ -129,8 +134,10 @@ module front_half() {
         xg = s == 0 ? wall - eps : board_x0 + board_w + 0.15;
         gw = s == 0 ? board_x0 - 0.15 - wall + eps : W - wall - xg + eps;
         translate([xg, board_y0, floor_f - eps]) cube([gw, board_l, min(oled_stack + pcb_t, split - lip_h - 0.3 - floor_f) + eps]);
-        // end stops on the buzzer side of the board
-        translate([xr - (s == 0 ? 0 : 0), board_y0 - 1.5, floor_f - eps]) cube([rail_w, 1.5, oled_stack + pcb_t + eps]);
+        // end stops at the keyring end of the board, under its cut-back corners:
+        // they meet the corner edge (pcb_notch in from the end), so the board
+        // can't slide away from the USB-C wall
+        translate([xr, board_y0 + pcb_notch - stop_play - 1.5, floor_f - eps]) cube([rail_w, 1.5, oled_stack + pcb_t + eps]);
       }
       // keyring tube
       translate([key_c[0], key_c[1], 0]) cylinder(d = key_od, h = split);
