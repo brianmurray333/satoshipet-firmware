@@ -19,7 +19,7 @@ STYLE = "classic";
 W      = 33;     // outer width  (same as v1)
 L      = 70.2;   // outer length (same as v1)
 R      = 3;      // corner radius (top view)
-T      = 20;     // total closed thickness (v1 was ~27)
+T      = 21.5;   // total closed thickness (v1 was ~27)
 split  = 9.5;    // front-half height; back half = T - split
 wall   = 1.8;    // side walls
 floor_f= 1.6;    // front wall (thinner = screen closer to the surface)
@@ -38,15 +38,14 @@ snap_len = 14;   // snap ridge length on each long side
 board_w   = 25.5;  // Heltec V3 PCB width
 board_l   = 50.6;  // PCB length incl. USB-C + clearance
 pcb_t     = 1.6;
-oled_stack= 3.8;   // gap from the front wall to the PCB: must clear the OLED
-                   // glass and the USB-C socket (both on the screen side).
-                   // v1 used 5.2. Measure PCB -> top of screen glass and set
-                   // this to that + 0.3 if your board differs.
+oled_stack= 5.2;   // gap from the front wall to the PCB: the OLED glass and
+                   // the USB-C socket sit on this side. Measured glass on a
+                   // V3: 5 mm tall x 33 x 19 mm, plus 0.2 mm clearance.
 rail_w    = 2.0;   // PCB rests on these along its long edges
 
 /* ---------- screen window ---------- */
-win_cx = 13.5; win_cy = 36.5;  // window centre (same place as v1)
-win_x  = 13.5; win_y  = 24;    // inner opening (OLED active area is ~10.9 x 21.7)
+win_cx = 13.3; win_cy = 38.3;  // centre of the OLED's dark area (~20.5 mm from the board's pointed end, ~3 mm toward one pin row)
+win_x  = 13.5; win_y  = 27;    // a little inside the dark area (~14 x 28 mm) so no glass edge shows
 win_chamfer = true;            // 45 deg bevel out to the front face
 
 /* ---------- other parts ---------- */
@@ -54,7 +53,8 @@ key_c   = [6, 6.6];  key_d = 5.5; key_od = 9;    // keyring tube through both ha
 buz_c   = [16.3, 9.6]; buz_d = 12.4; buz_h = 4;  // buzzer ring, sound grille in front
 btn_c   = [27, 13];  btn_hole = 3.8; btn_sock = 6.4; btn_sock_h = 3.0; // 6x6 tactile
 pin_c   = [25, 63.6]; pin_d = 2.0;               // pinhole (kept from v1)
-usb_w   = 12.5; usb_h = 6.8; usb_z0 = 0.6;       // USB-C opening, fits most cable plugs
+usb_w   = 12.5; usb_h = 6.6;                      // USB-C opening, fits most cable plugs
+usb_z0  = floor_f + oled_stack - 1.6 - usb_h/2;   // centred on the socket (3.2 mm tall, under the PCB)
 bat     = [25.6, 40.6, 8.6];                     // battery pocket (802540 + clearance)
 bat_cy  = 43;                                    // pocket centre along y
 engrave = 0.7;                                   // artwork depth

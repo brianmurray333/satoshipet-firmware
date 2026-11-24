@@ -10,11 +10,11 @@ what didn't work in v1.
 
 | | v1 | v2 |
 |---|---|---|
-| Closed thickness | ~27 mm | **20 mm** |
-| Screen depth (front face → board) | 2 mm wall + 5.2 mm gap | 1.6 mm wall + 3.8 mm gap, window bevelled 45° |
+| Closed thickness | ~27 mm | **21.5 mm** |
+| Screen window | 15.5 × 26.5 mm straight-walled, 2 mm wall | 13.5 × 27 mm sized to the OLED's dark area, 1.6 mm wall bevelled 45° |
 | Lip fit | 0 mm clearance (lip 29.0 × 66.3 into a 29.0 × 66.2 opening) | 0.2 mm per side (`clr`) |
 | Closing | friction only | snap ridges on both long sides (`snap`) |
-| USB-C opening | 10 × 4 mm (most cable plugs don't seat) | 12.5 × 6.8 mm |
+| USB-C opening | 10 × 4 mm (most cable plugs don't seat) | 12.5 × 6.6 mm, centred on the socket |
 | Battery | loose in the back cavity | corner ribs hold an 802540 (8 × 25 × 40 mm) |
 | Buzzer | glued | ring holder + 7-hole sound grille |
 | Button | glued | socket for a 6 × 6 mm tactile switch |
@@ -36,9 +36,10 @@ All parts are already oriented for printing (outside face down, no supports need
 
 - PLA or PETG, 0.2 mm layers, 3 walls, 15–20 % infill, no supports.
 - Print the two test pieces first:
-  1. **screen-test**: the board's screen should sit just behind the front wall with the
-     display centred in the window. If the board doesn't sit flat on the rails, raise
-     `oled_stack`; if the screen sits far back, lower it (measure PCB → top of the screen glass + 0.3 mm).
+  1. **screen-test**: the board should sit flat on the rails (screen glass just touching the
+     front wall) with only the dark screen area showing in the window. If the board rocks on
+     the glass, raise `oled_stack` (measured glass height + 0.2 mm). Adjust `win_cx`/`win_cy`
+     if the window is off-centre.
   2. **fit-test**: the halves should press together with a click and pull apart by hand.
      Too tight → raise `clr` to 0.25–0.3 or lower `snap`; too loose → lower `clr` to 0.15 or raise `snap` to 0.45.
 - Then print the front and back in the style you like.
