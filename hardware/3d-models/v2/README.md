@@ -28,6 +28,7 @@ what didn't work in v1.
 | `stl/pebble-front.stl`, `stl/pebble-back.stl` | Same internals, rounded front/back edges and corners |
 | `stl/pebble-front-prg-key.stl` | Pebble front with a flexing key over the Heltec's own PRG button instead of a wired button (use with `stl/pebble-back.stl`) |
 | `stl/prg-test-A.stl`, `-B`, `-C` | The USB-C end of that front (~12 min each), with the key's nub 0.3 / 0.6 / 0.9 mm above the button. Pick the one that clicks when pressed and not at rest |
+| `stl/pebble-back-button-stopper.stl` | Pebble back with a post that holds the wired button's switch against the front wall, so it can't sink (use with `stl/pebble-front.stl`) |
 | `stl/screen-test.stl` | Front wall + rails only (~10 min). Drop the board in to check screen depth and window position before printing a full case |
 | `stl/fit-test.stl` | The USB-C end of both halves (~15 min). Checks the lip/snap fit and the USB-C opening |
 | `satoshipet_case.scad`, `artwork.scad` | OpenSCAD source; every dimension is a named parameter at the top |
@@ -53,6 +54,17 @@ All parts are already oriented for printing (outside face down, no supports need
 3. Drop the board in screen-first; it rests on the rails with the USB-C socket at the opening.
 4. Put the battery in the back half between the corner ribs (a thin foam pad on top keeps it from rattling), plug it in.
 5. Snap the halves together and thread the keyring through the corner tube.
+
+## Button stopper (wired button)
+
+![side cut](previews/pebble-button-stopper-side.png)
+
+`pebble-back-button-stopper.stl` adds a tapered post (3.2 mm tip) that comes
+down from the back wall to 0.3 mm above the switch body when the case is
+closed. Pressing the button pushes against the post instead of glue. The
+post sits at the keyring end, past the end of the board and about 6 mm
+short of the battery pocket. Bend the switch's two legs flat (sideways),
+not straight back, so they lie beside the post.
 
 ## PRG key variant (no wired button)
 

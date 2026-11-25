@@ -10,11 +10,14 @@
 //   PART: front | back | screen_test | fit_test | prg_test | assembly
 //   STYLE: classic | pebble
 //   PRG_KEY: false | true   (openscad -D 'PRG_KEY=true' ...)
+//   BTN_BACKSTOP: false | true  (back half: post that holds the wired button)
 
 include <artwork.scad>
 
 PART  = "assembly";
 STYLE = "classic";
+BTN_BACKSTOP = false;  // true: a post on the back half presses the wired button's
+                       // switch against the front wall so it can't sink
 PRG_KEY = false;   // true: a flexing key in the front wall presses the Heltec's own
                    // PRG button (no wired button, no button hole or socket)
 
@@ -60,6 +63,9 @@ win_chamfer = true;            // 45 deg bevel out to the front face
 key_c   = [6, 6.6];  key_d = 5.5; key_od = 9;    // keyring tube through both halves
 buz_c   = [16.3, 9.6]; buz_d = 12.4; buz_h = 4;  // buzzer ring, sound grille in front
 btn_c   = [27, 13];  btn_hole = 3.8; btn_sock = 6.4; btn_sock_h = 3.0; // 6x6 tactile
+btn_body_h = 3.5;    // switch body height (6x6 switches: 3.5 mm whatever the plunger length)
+stop_gap   = 0.3;    // backstop clearance above the switch body when closed
+stop_tip   = 3.2;    // backstop tip (square); fits between the 2 legs at the body's edges
 pin_c   = [25, 63.6]; pin_d = 2.0;               // pinhole (kept from v1)
 usb_w   = 9.8;  usb_h = 4.2;                      // USB-C opening: the socket's metal shell (8.9 x 3.2) + ~0.45 mm a side
 usb_z0  = floor_f + oled_stack - 1.6 - usb_h/2;   // centred on the socket (3.2 mm tall, under the PCB)
@@ -259,6 +265,12 @@ module back_half() {
       snap_ridges();
       // keyring tube
       translate([key_c[0], key_c[1], split]) cylinder(d = key_od, h = T - split);
+      // button backstop: tapered post from the back wall down to just above the
+      // switch body, between its legs (the battery pocket starts ~6 mm further in)
+      if (BTN_BACKSTOP) hull() {
+        translate([btn_c[0] - stop_tip/2, btn_c[1] - stop_tip/2, floor_f + btn_body_h + stop_gap]) cube([stop_tip, stop_tip, 1]);
+        translate([btn_c[0] - 2.5, btn_c[1] - 2.5, T - floor_b - 1]) cube([5, 5, 1 + eps]);
+      }
       // battery pocket: four corner ribs (gaps let wires pass)
       translate([W/2 - bat[0]/2, bat_cy - bat[1]/2, T - floor_b - 3]) {
         for (cx = [0, 1], cy = [0, 1])
