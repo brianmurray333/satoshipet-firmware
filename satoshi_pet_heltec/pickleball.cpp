@@ -133,13 +133,13 @@ static const ToneNote PB_SND_VICTORY[] = {
 };
 #define PB_SND_WIN_NOTES 6
 
-static void playPickleballHit()       { soundPlay(PB_SND_HIT, PB_NOTE_COUNT(PB_SND_HIT)); }
-static void playPickleballPoint()     { soundPlay(PB_SND_POINT, PB_NOTE_COUNT(PB_SND_POINT)); }
-static void playPickleballMiss()      { soundPlay(PB_SND_MISS, PB_NOTE_COUNT(PB_SND_MISS)); }
-static void playCountdownBeep()       { soundPlay(PB_SND_BEEP, PB_NOTE_COUNT(PB_SND_BEEP)); }
-static void playCountdownGo()         { soundPlay(PB_SND_GO, PB_NOTE_COUNT(PB_SND_GO)); }
-static void playPickleballWin()       { soundPlay(PB_SND_VICTORY, PB_SND_WIN_NOTES); }
-static void playWagerVictoryFanfare() { soundPlay(PB_SND_VICTORY, PB_NOTE_COUNT(PB_SND_VICTORY)); }
+static void playPickleballHit()       { soundPlay(PB_SND_HIT, PB_NOTE_COUNT(PB_SND_HIT), false); }
+static void playPickleballPoint()     { soundPlay(PB_SND_POINT, PB_NOTE_COUNT(PB_SND_POINT), false); }
+static void playPickleballMiss()      { soundPlay(PB_SND_MISS, PB_NOTE_COUNT(PB_SND_MISS), false); }
+static void playCountdownBeep()       { soundPlay(PB_SND_BEEP, PB_NOTE_COUNT(PB_SND_BEEP), false); }
+static void playCountdownGo()         { soundPlay(PB_SND_GO, PB_NOTE_COUNT(PB_SND_GO), false); }
+static void playPickleballWin()       { soundPlay(PB_SND_VICTORY, PB_SND_WIN_NOTES, false); }
+static void playWagerVictoryFanfare() { soundPlay(PB_SND_VICTORY, PB_NOTE_COUNT(PB_SND_VICTORY), false); }
 
 // delay() replacement that keeps the sound sequencer and watchdog serviced
 static void pbWait(unsigned long ms) {

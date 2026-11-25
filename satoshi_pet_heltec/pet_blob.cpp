@@ -1497,13 +1497,14 @@ static const ToneNote GAME_OVER_WOMP[] = {
 
 // The game-over sequence is a blocking UI flow (delay()-based LED flashes and
 // result screens), so the loop-driven sequencer would not advance during it;
-// play these to completion like before. Now respects quiet hours.
+// play these to completion like before. Game sounds play during quiet hours:
+// someone is playing, so they aren't an unprompted alert.
 static void playHighScoreCelebrationTone() {
-  soundPlayBlocking(HIGH_SCORE_MELODY, (uint8_t)(sizeof(HIGH_SCORE_MELODY) / sizeof(HIGH_SCORE_MELODY[0])));
+  soundPlayBlocking(HIGH_SCORE_MELODY, (uint8_t)(sizeof(HIGH_SCORE_MELODY) / sizeof(HIGH_SCORE_MELODY[0])), false);
 }
 
 static void playGameOverWomp() {
-  soundPlayBlocking(GAME_OVER_WOMP, (uint8_t)(sizeof(GAME_OVER_WOMP) / sizeof(GAME_OVER_WOMP[0])));
+  soundPlayBlocking(GAME_OVER_WOMP, (uint8_t)(sizeof(GAME_OVER_WOMP) / sizeof(GAME_OVER_WOMP[0])), false);
 }
 
 static void renderLeaderboard(SSD1306Wire &display, const GameScoreResponse &response) {
@@ -2034,7 +2035,7 @@ static bool anyButtonDownForGame() {
 // fall faster and more often as the score climbs. Costs a game like Flappy.
 // ============================================================================
 
-static const ToneNote SC_CATCH[] = {{1568, 35}, {2093, 45}};
+static const ToneNote SC_CATCH[] = {{1568, 45}, {2093, 70}};
 static const ToneNote SC_HIT[]   = {{196, 90}, {147, 140}};
 
 // 7x6 heart for the lives counter
@@ -2145,11 +2146,11 @@ int handleSatCatcherGame(SSD1306Wire &display) {
           if ((long)(now - hurtUntil) >= 0) {   // no double hits while blinking
             lives--;
             hurtUntil = now + 900;
-            soundPlay(SC_HIT, 2);
+            soundPlay(SC_HIT, 2, false);
           }
         } else {
           score++;
-          soundPlay(SC_CATCH, 2);
+          soundPlay(SC_CATCH, 2, false);
         }
       } else if (it.y > GROUND_Y) {
         it.active = false;  // landed
