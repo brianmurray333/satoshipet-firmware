@@ -940,7 +940,8 @@ void renderPet(SSD1306Wire &display, int btcPrice, int satoshis, int batteryPerc
   int spriteY = 64 - anim.height + petBreathOffset(millis());
   display.drawXbm(spriteX, spriteY, anim.width, anim.height, sprite);
   if (currentAnimState == ANIM_EAT && eatFoodIndex >= 0) {
-    drawEatenFood(display, centreX - 8, 64 - 18);
+    // At the chin; the owl's beak sits higher on its taller body
+    drawEatenFood(display, centreX - 8, kind == PET_OWL ? 64 - 28 : 64 - 18);
   }
 
   unsigned long drawTime = millis() - drawStart;
