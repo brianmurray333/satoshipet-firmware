@@ -26,6 +26,8 @@ what didn't work in v1.
 |---|---|
 | `stl/classic-front.stl`, `stl/classic-back.stl` | Box shape like v1 with small edge chamfers |
 | `stl/pebble-front.stl`, `stl/pebble-back.stl` | Same internals, rounded front/back edges and corners |
+| `stl/pebble-front-prg-key.stl` | Pebble front with a flexing key over the Heltec's own PRG button instead of a wired button (use with `stl/pebble-back.stl`) |
+| `stl/prg-test-A.stl`, `-B`, `-C` | The USB-C end of that front (~12 min each), with the key's nub 0.3 / 0.6 / 0.9 mm above the button. Pick the one that clicks when pressed and not at rest |
 | `stl/screen-test.stl` | Front wall + rails only (~10 min). Drop the board in to check screen depth and window position before printing a full case |
 | `stl/fit-test.stl` | The USB-C end of both halves (~15 min). Checks the lip/snap fit and the USB-C opening |
 | `satoshipet_case.scad`, `artwork.scad` | OpenSCAD source; every dimension is a named parameter at the top |
@@ -52,6 +54,28 @@ All parts are already oriented for printing (outside face down, no supports need
 4. Put the battery in the back half between the corner ribs (a thin foam pad on top keeps it from rattling), plug it in.
 5. Snap the halves together and thread the keyring through the corner tube.
 
+## PRG key variant (no wired button)
+
+![pebble front with PRG key](previews/pebble-prg-key-front.png)
+
+The Heltec already has a PRG button beside its USB-C port, and the firmware
+reads it as well as the wired button. In `pebble-front-prg-key.stl` a round pad
+is cut free from the front wall on three sides and hangs off a thinned arm; a
+nub under it presses PRG. No button to solder or glue. The Bitcoin logo moves
+right and shrinks a little to make room, and the v1 pinhole is dropped.
+
+1. Print `prg-test-B` first. Set it over the USB-C end of the board (screen
+   side down, USB-C against the end wall) and press the pad.
+   - Clicks when pressed, nothing at rest: print `pebble-front-prg-key.stl`.
+   - Needs a hard press or doesn't click: try `prg-test-A` (longer nub).
+   - Clicks without pressing: try `prg-test-C` (shorter nub).
+2. If A or C was the right one, rebuild the front with that clearance:
+   `openscad -D 'PART="front"' -D 'STYLE="pebble"' -D 'PRG_KEY=true' -D 'prg_gap=0.3' -o front.stl satoshipet_case.scad`
+   (`0.3` for A, `0.9` for C).
+
+Holding PRG while plugging in USB starts the ESP32's flashing mode, so don't
+press the key while connecting the cable.
+
 ## Changing it
 
 Install [OpenSCAD](https://openscad.org) (free), open `satoshipet_case.scad`, change a parameter,
@@ -61,4 +85,4 @@ press F6 then File → Export → STL. Or from a terminal:
 openscad -D 'PART="front"' -D 'STYLE="pebble"' -o front.stl satoshipet_case.scad
 ```
 
-`PART` is `front`, `back`, `screen_test`, `fit_test` or `assembly`; `STYLE` is `classic` or `pebble`.
+`PART` is `front`, `back`, `screen_test`, `fit_test`, `prg_test` or `assembly`; `STYLE` is `classic` or `pebble`; `PRG_KEY` is `true` or `false`.

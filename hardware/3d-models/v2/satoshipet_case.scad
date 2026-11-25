@@ -7,13 +7,16 @@
 //
 // Render one part at a time:
 //   openscad -D 'PART="front"'  -D 'STYLE="classic"' -o front.stl satoshipet_case.scad
-//   PART: front | back | screen_test | fit_test | assembly
+//   PART: front | back | screen_test | fit_test | prg_test | assembly
 //   STYLE: classic | pebble
+//   PRG_KEY: false | true   (openscad -D 'PRG_KEY=true' ...)
 
 include <artwork.scad>
 
 PART  = "assembly";
 STYLE = "classic";
+PRG_KEY = false;   // true: a flexing key in the front wall presses the Heltec's own
+                   // PRG button (no wired button, no button hole or socket)
 
 /* ---------- main dimensions ---------- */
 W      = 33;     // outer width  (same as v1)
@@ -64,12 +67,34 @@ bat     = [25.6, 40.6, 8.6];                     // battery pocket (802540 + cle
 bat_cy  = 43;                                    // pocket centre along y
 engrave = 0.7;                                   // artwork depth
 
+/* ---------- PRG key (PRG_KEY = true) ---------- */
+// The Heltec V3's PRG button sits on the screen side, 3.7 mm from the PCB's
+// USB-C end and 4.7 mm in from the long edge the screen is offset toward
+// (Heltec HTIT-WB32LA V3.2 drawing). A round pad cut free from the front wall
+// on three sides hangs off a thinned arm; a nub under the pad reaches down to
+// the button.
+prg_btn_h = 1.5;    // PRG button height above the PCB (measure yours; see prg_test)
+prg_gap   = 0.6;    // nub clearance above the button at rest (prg-test-B)
+key_pad_d = 6.5;    // pad you press
+key_slot  = 0.6;    // cut around pad and arm
+key_arm_w = 3.5;
+key_arm_l = 6;      // arm length from the pad edge to where it joins the wall
+key_arm_t = 0.9;    // arm thickness (front wall is floor_f); thinner = softer
+key_nub_d = 2.4;
+logo_shift_prg = 3.6;   // logo moves right by this much with the key...
+logo_scale_prg = 0.85;  // ...and shrinks to fit (the v1 pinhole is dropped)
+
 $fn = 48;
 eps = 0.01;
 
 board_x0 = (W - board_w) / 2;
 board_y0 = L - wall - board_l;
 pcb_z0   = floor_f + oled_stack;
+
+prg_c   = [board_x0 + 4.7, L - wall - 3.7];      // PRG button centre
+pad_c   = [prg_c[0] + 0.15, prg_c[1] - 1.7];     // pad moved off the rounded corner; nub stays over PRG
+arm_y0  = pad_c[1] - key_pad_d/2 - key_arm_l;    // where the arm joins the wall
+nub_end = pcb_z0 - prg_btn_h - prg_gap;          // nub tip (z)
 
 /* ---------- helpers ---------- */
 module rrect(w, l, r, h) {
@@ -119,8 +144,30 @@ module snap_ridges(extra = 0) {  // on the outside of the lip's long sides
     }
 }
 
+/* ---------- PRG key pieces ---------- */
+module key_2d() {  // pad + arm outline
+  translate(pad_c) circle(d = key_pad_d);
+  translate([pad_c[0] - key_arm_w/2, arm_y0]) square([key_arm_w, pad_c[1] - arm_y0]);
+}
+module key_slot_cut() {  // U-shaped cut through the front wall, open at the arm root
+  translate([0, 0, -1]) linear_extrude(floor_f + 2) difference() {
+    offset(delta = key_slot) key_2d();
+    key_2d();
+    translate([pad_c[0] - key_arm_w/2 - key_slot - 1, arm_y0 - key_slot - 1]) square([key_arm_w + 2*key_slot + 2, key_slot + 1.05]);
+  }
+  // thin the arm from the inside so it flexes
+  translate([pad_c[0] - key_arm_w/2, arm_y0 - 0.05, key_arm_t]) cube([key_arm_w, pad_c[1] - arm_y0 - key_pad_d/2 + 0.6, floor_f]);
+  // keep the board rail off the pad and arm (the side guide outboard of it stays)
+  translate([board_x0 - 0.1, arm_y0 - key_slot, floor_f + eps])
+    cube([pad_c[0] + key_pad_d/2 + key_slot - board_x0 + 0.1, pad_c[1] + key_pad_d/2 + key_slot - arm_y0 + key_slot, oled_stack]);
+}
+module key_nub() {
+  translate([prg_c[0], prg_c[1], floor_f - eps]) cylinder(d = key_nub_d, h = nub_end - floor_f + eps, $fn = 24);
+}
+
 /* ---------- front half (screen side) ---------- */
 module front_half() {
+  union() {
   difference() {
     union() {
       difference() {
@@ -147,8 +194,8 @@ module front_half() {
         translate([0, 0, -eps]) cylinder(d = buz_d, h = buz_h + 1);
         translate([-1.5, 0, 1]) cube([3, 10, buz_h]);  // wire exit
       }
-      // tactile button socket
-      translate([btn_c[0] - btn_sock/2 - 1, btn_c[1] - btn_sock/2 - 1, floor_f - eps])
+      // tactile button socket (not needed with the PRG key)
+      if (!PRG_KEY) translate([btn_c[0] - btn_sock/2 - 1, btn_c[1] - btn_sock/2 - 1, floor_f - eps])
         difference() {
           cube([btn_sock + 2, btn_sock + 2, btn_sock_h]);
           translate([1, 1, -eps]) cube([btn_sock, btn_sock, btn_sock_h + 1]);
@@ -171,14 +218,19 @@ module front_half() {
       for (a = [0:60:359]) rotate(a) translate([3, 0, 0]) cylinder(d = 1.4, h = floor_f + 2, $fn = 12);
     translate([buz_c[0], buz_c[1], -1]) cylinder(d = 1.4, h = floor_f + 2, $fn = 12);
     // button hole + pinhole
-    translate([btn_c[0], btn_c[1], -1]) cylinder(d = btn_hole, h = floor_f + 2);
-    translate([pin_c[0], pin_c[1], -1]) cylinder(d = pin_d, h = floor_f + 2, $fn = 16);
+    if (!PRG_KEY) translate([btn_c[0], btn_c[1], -1]) cylinder(d = btn_hole, h = floor_f + 2);
+    if (PRG_KEY) key_slot_cut();
+    if (!PRG_KEY) translate([pin_c[0], pin_c[1], -1]) cylinder(d = pin_d, h = floor_f + 2, $fn = 16);
     // USB-C opening in the end wall
     translate([W/2 - usb_w/2, L - wall - 1, usb_z0]) cube([usb_w, wall + 2, usb_h]);
     // groove for the snap ridges
     snap_ridges(extra = 0.1);
     // Bitcoin logo, engraved in the front face
-    translate([W/2, L/2, -eps]) mirror([0, 0, 0]) linear_extrude(engrave) btc_logo();
+    // (with the PRG key the logo moves right and shrinks a little to clear the key)
+    translate([W/2 + (PRG_KEY ? logo_shift_prg : 0), L/2, -eps])
+      linear_extrude(engrave) translate([0, 25.2]) scale(PRG_KEY ? logo_scale_prg : 1) translate([0, -25.2]) btc_logo();  // scale about the logo's centre
+  }
+  if (PRG_KEY) key_nub();
   }
 }
 
@@ -241,8 +293,15 @@ module fit_test() {
     intersection() { print_back(); translate([-1, -1, -1]) cube([W + 2, 21, T + 2]); }
 }
 
+// quick check of the PRG key: the USB-C end of the front half (~12 min).
+// Lay it over the board's USB-C end and press: one click, and no click at rest.
+module prg_test() {
+  intersection() { front_half(); translate([-1, arm_y0 - 4, -1]) cube([W + 2, L, split + 2]); }
+}
+
 if (PART == "front") print_front();
 else if (PART == "back") print_back();
 else if (PART == "screen_test") screen_test();
 else if (PART == "fit_test") fit_test();
+else if (PART == "prg_test") prg_test();
 else { color("hotpink") front_half(); color("lightsteelblue") translate([0, 0, 6]) back_half(); }
