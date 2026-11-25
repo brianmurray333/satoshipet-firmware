@@ -88,6 +88,8 @@ bool ganamosHttpBegin(HTTPClient& http, const String& path) {
   return true;
 }
 
+HTTPClient& ganamosSharedHttp() { return ganamosHttp; }
+
 void ganamosHttpReset() {
   if (ganamosClient) {
     ganamosClient->stop();

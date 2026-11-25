@@ -52,7 +52,9 @@ static const char* const KEY_LEGACY_V2 = "stateV2";      // fixed-size blob (bot
 
 // Upper bound on requests per sync call so a long offline backlog cannot block
 // the main loop for a long time; the rest is sent on the next sync.
-static const int MAX_SYNC_REQUESTS_PER_CALL = 10;
+// Requests per sync round. The sync blocks the pet screen, so a long queue is
+// sent a few at a time over the next polls instead of all at once.
+static const int MAX_SYNC_REQUESTS_PER_CALL = 4;
 
 static Preferences economyPrefs;
 static SpendQueueState spendState;
@@ -584,7 +586,7 @@ int syncPendingSpends() {
       continue;
     }
 
-    HTTPClient http;
+    HTTPClient& http = ganamosSharedHttp();  // shared keep-alive connection
     if (!ganamosHttpBegin(http, "/api/device/economy/sync?deviceId=" + ganamosConfig.deviceId)) {
       Serial.println("Economy: HTTP begin failed");
       break;
@@ -604,7 +606,9 @@ int syncPendingSpends() {
 
     int httpCode = http.POST((uint8_t*)payload, (size_t)len);
     bool ok = httpCode == 200 && responseSucceeded(http);
+    if (httpCode > 0 && httpCode != 200) http.getString();  // drain so the connection stays reusable
     http.end();
+    if (httpCode < 0) ganamosHttpReset();  // transport error: don't reuse this socket
 
     if (ok) {
       spend.synced = 1;
@@ -730,7 +734,7 @@ int syncPendingGameScores() {
       continue;
     }
 
-    HTTPClient http;
+    HTTPClient& http = ganamosSharedHttp();  // shared keep-alive connection
     if (!ganamosHttpBegin(http, "/api/device/game-score?deviceId=" + ganamosConfig.deviceId)) {
       Serial.println("Scores: HTTP begin failed");
       break;
@@ -751,7 +755,9 @@ int syncPendingGameScores() {
 
     int httpCode = http.POST((uint8_t*)payload, (size_t)len);
     bool ok = httpCode == 200 && responseSucceeded(http);
+    if (httpCode > 0 && httpCode != 200) http.getString();  // drain so the connection stays reusable
     http.end();
+    if (httpCode < 0) ganamosHttpReset();  // transport error: don't reuse this socket
 
     if (ok) {
       entry.synced = 1;

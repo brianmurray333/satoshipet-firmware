@@ -723,7 +723,9 @@ int handlePickleballGame(SSD1306Wire &display) {
   if (!wifiReady()) {
     pbShowMessage(display, "Connecting WiFi...", nullptr);
     radio.wifiStartedByGame = true;
-    if (!wifiEnsureConnected(8000)) {
+    // Long enough for the fast reconnect (4 s) plus a full scan (10 s): after
+    // waking, the background connect may have just fallen back to a scan.
+    if (!wifiEnsureConnected(15000)) {
       pbShowMessage(display, "WiFi failed", "Try again later");
       pbWait(2000);
       return 0;

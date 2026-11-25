@@ -36,6 +36,7 @@
   void playDeathSound();
   void playSadSound();
   void wifiRadioOff();
+  float getBatteryVoltage();
   void wifiStartConnect();
   void wifiService();
   bool wifiReady();
@@ -267,6 +268,13 @@
   }
 
   // Charging detection requires a hardware status signal, not a voltage guess.
+  // A LiPo never reads below ~3 V while it can power the board, so a reading
+  // under 2.5 V means no battery voltage reaches the sense pin (no battery
+  // plugged in, or a bad battery lead) and the board is running on USB.
+  bool batteryPresent() {
+    return getBatteryVoltage() >= 2.5f;
+  }
+
   bool isBatteryCharging() {
     // Voltage alone cannot distinguish a full battery from active charging.
     return false;
@@ -1286,7 +1294,7 @@
       lastBatteryCheck = now;
       
       // Trigger low battery warning at 10% (only once per charge cycle)
-      if (cachedBatteryPct <= 10 && !lowBatteryAlertPlayed && !isLowBatteryWarningActive) {
+      if (cachedBatteryPct <= 10 && batteryPresent() && !lowBatteryAlertPlayed && !isLowBatteryWarningActive) {
         Serial.println("🔋 LOW BATTERY WARNING - waking display to show warning");
         
         wakeForNotification();
@@ -1310,7 +1318,9 @@
     // Enter ultra-low-power mode only at 5% (critical battery)
     // BUT only if user hasn't interacted recently - let normal screensaver flow handle sleep
     // This ensures button press always wakes device for full timeout period
-    if (cachedBatteryPct <= 5 && !isDisplayOff && !isLowBatteryWarningActive) {
+    // Not when no battery reads at all: that's USB power with no battery, and
+    // shutting the radio off there only breaks syncing and multiplayer.
+    if (cachedBatteryPct <= 5 && batteryPresent() && !isDisplayOff && !isLowBatteryWarningActive) {
       // Only force low-power if we've already gone through the screensaver timeout
       // (i.e., user hasn't pressed a button recently)
       if (!notificationActive && !inMenuMode && now - lastButtonPress > SCREENSAVER_DISPLAY_OFF_TIMEOUT) {

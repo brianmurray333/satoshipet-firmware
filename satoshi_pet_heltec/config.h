@@ -111,6 +111,11 @@ String formatSatsShort(int sats);
 bool ganamosHttpBegin(HTTPClient& http, const String& path);
 // Closes the shared TLS connection (call when WiFi goes down/off).
 void ganamosHttpReset();
+// The one long-lived HTTPClient for Ganamos requests. Use it (not a local
+// HTTPClient) so back-to-back requests share one TLS connection: a local
+// HTTPClient closes the shared connection when it goes out of scope, which
+// makes every request pay a ~2 s TLS handshake.
+HTTPClient& ganamosSharedHttp();
 
 // === HTTP identity handling ===
 // Attaches device identity headers to every HTTP request.
