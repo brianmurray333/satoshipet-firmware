@@ -245,6 +245,13 @@ static bool responseSucceeded(HTTPClient& http) {
   return doc["success"] | false;
 }
 
+// The sync blocks the screen and buttons, so a press ends the round early;
+// whatever is left goes on the next sync.
+static bool userIsPressing() {
+  extern bool anyButtonDown();
+  return anyButtonDown();
+}
+
 // Transient failures (no connection, rate limit, server error): stop this
 // sync round and retry on the next one instead of hammering every entry.
 static bool shouldAbortSync(int httpCode) {
@@ -577,6 +584,10 @@ int syncPendingSpends() {
   for (int i = 0; i < spendState.hdr.count && requests < MAX_SYNC_REQUESTS_PER_CALL; i++) {
     esp_task_wdt_reset();
     soundUpdate();  // keep a playing chirp advancing during sync
+    if (requests > 0 && userIsPressing()) {  // don't keep the pet frozen while someone uses it
+      Serial.println("Sync paused for button press; the rest go next sync");
+      break;
+    }
     PendingSpend& spend = spendState.entries[i];
     if (spend.synced) continue;
 
@@ -726,6 +737,10 @@ int syncPendingGameScores() {
   for (int i = 0; i < scoreState.hdr.count && requests < MAX_SYNC_REQUESTS_PER_CALL; i++) {
     esp_task_wdt_reset();
     soundUpdate();  // keep a playing chirp advancing during sync
+    if (requests > 0 && userIsPressing()) {  // don't keep the pet frozen while someone uses it
+      Serial.println("Sync paused for button press; the rest go next sync");
+      break;
+    }
     PendingGameScore& entry = scoreState.entries[i];
     if (entry.synced) continue;
 
