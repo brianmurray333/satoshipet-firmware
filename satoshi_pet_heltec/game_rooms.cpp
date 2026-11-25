@@ -757,6 +757,52 @@ static int playPickleball(SSD1306Wire &d, Room &room) {
 }
 
 // ============================================================================
+// Linking: the owner approves this pet for games with friends, once
+// ============================================================================
+
+extern String pairingCode;
+
+// Shows a fresh code for the owner to enter in Ganamos (Connect Pet), and
+// waits until the server accepts this pet's secret. Returns true when linked.
+static bool linkPetForBets(SSD1306Wire &d) {
+  generatePairingCode();  // sent with every config request (X-Pairing-Code)
+  String code = pairingCode;
+  unsigned long start = millis();
+  unsigned long lastCheck = millis();
+  holdPressSwallow();
+  while (millis() - start < 300000UL) {
+    esp_task_wdt_reset();
+    soundUpdate();
+    d.clear();
+    d.setFont(ArialMT_Plain_10);
+    d.setTextAlignment(TEXT_ALIGN_LEFT);
+    d.drawString(0, 0, "LINK YOUR PET");
+    d.drawLine(0, 12, 127, 12);
+    d.drawString(0, 14, "In Ganamos: Connect Pet");
+    d.setFont(ArialMT_Plain_16);
+    d.setTextAlignment(TEXT_ALIGN_CENTER);
+    d.drawString(64, 27, code);
+    d.setFont(ArialMT_Plain_10);
+    d.drawString(64, 50, "Tap: cancel");
+    d.display();
+    if (holdPressUpdate(anyButtonDown()) != PRESS_NONE) break;
+    if (millis() - lastCheck > 5000) {
+      fetchGanamosConfig();
+      lastCheck = millis();
+      if (hasGameSecret()) {
+        saveDeviceConfig();  // keep the code the server now has on file
+        soundPlay(SND_TURN, NOTES(SND_TURN), false);
+        showMessage(d, "Linked!", "Ready to play with friends", 1800);
+        return true;
+      }
+    }
+    delay(30);
+  }
+  showMessage(d, "Not linked yet", "Try again any time", 1600);
+  return false;
+}
+
+// ============================================================================
 // Entry point
 // ============================================================================
 
@@ -775,15 +821,16 @@ int runFriendsGame(SSD1306Wire &d, uint8_t game) {
     ~WifiRestore() { if (off) wifiRadioOff(); }
   } wifiRestore{startedWifi};
 
-  // The game secret is claimed through the config request
+  // The game secret is claimed through the config request; the server takes it
+  // only with the pairing code the owner entered in the app (proof it's theirs)
   if (!hasGameSecret()) {
     showMessage(d, "Getting ready...", nullptr, 10);
     bool ok = fetchGanamosConfig();
-    if (!hasGameSecret()) {
-      if (ok) showMessage(d, "Pair your pet again", "to play with friends", 3000);
-      else showMessage(d, "Can't reach Ganamos", "Try again later");
+    if (!ok) {
+      showMessage(d, "Can't reach Ganamos", "Try again later");
       return 0;
     }
+    if (!hasGameSecret() && !linkPetForBets(d)) return 0;
   }
 
   int bonus = 0;
