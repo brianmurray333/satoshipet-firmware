@@ -2059,7 +2059,7 @@ static const unsigned char SC_ROCK[] PROGMEM = {0x1C, 0x3E, 0x7B, 0x7F, 0x6F, 0x
 
 // One Sat Catcher run on the current course (courseRngSeed first). Returns
 // the score; no coin cost, happiness or leaderboard.
-static int satCatcherRun(SSD1306Wire &display) {
+static int satCatcherRun(SSD1306Wire &display, bool sharedCourse) {
   Serial.println(F("Starting Sat Catcher"));
 
   const int GROUND_Y = 62;             // ground line
@@ -2100,6 +2100,7 @@ static int satCatcherRun(SSD1306Wire &display) {
   unsigned long hurtUntil = 0;   // brief blink after a rock hit
   unsigned long nextSpawn = millis() + 600;
   unsigned long lastFrame = millis();
+  int spawned = 0;  // items dropped so far (shared-course difficulty)
 
   while (lives > 0) {
     unsigned long now = millis();
@@ -2116,11 +2117,14 @@ static int satCatcherRun(SSD1306Wire &display) {
     bool pressed = (debounceUpdate(bExt, now) == 1) | (debounceUpdate(bPrg, now) == 1);
     if (pressed) dir = -dir;
 
-    // Difficulty ramps with the score
-    float petSpeed  = min(2.8f, 1.5f + score * 0.04f);
-    float fallSpeed = min(2.2f, 0.8f + score * 0.04f);
-    unsigned long spawnMs = (unsigned long)max(320, 950 - score * 18);
-    int rockChance = min(45, 22 + score);
+    // Difficulty ramps with the score. On a shared (room) course it ramps with
+    // the number of items dropped instead, so every player gets the same
+    // sequence of sats and rocks at the same pace whatever they catch.
+    float level = sharedCourse ? spawned * 0.6f : (float)score;
+    float petSpeed  = min(2.8f, 1.5f + level * 0.04f);
+    float fallSpeed = min(2.2f, 0.8f + level * 0.04f);
+    unsigned long spawnMs = (unsigned long)max(320, 950 - (int)(level * 18));
+    int rockChance = min(45, 22 + (int)level);
 
     petX += dir * petSpeed;
     if (petX <= 0) { petX = 0; dir = 1; }
@@ -2132,6 +2136,7 @@ static int satCatcherRun(SSD1306Wire &display) {
           items[i].active = true;
           items[i].rock = courseRandom(0, 100) < rockChance;
           items[i].x = courseRandom(0, 128 - ITEM);
+          spawned++;
           items[i].y = 12 - ITEM;
           break;
         }
@@ -2217,13 +2222,13 @@ int handleSatCatcherGame(SSD1306Wire &display) {
   extern bool spendCoinsLocal(int amount, const char* action);
   if (!spendCoinsLocal(ganamosConfig.gameCost, "game")) return 0;
   courseRngSeed(0);  // solo: a fresh course
-  int score = satCatcherRun(display);
+  int score = satCatcherRun(display, false);
   return finishGameWithScore(display, GAME_SATCATCHER, score);
 }
 
 int playSatCatcherRoomTurn(SSD1306Wire &display, uint32_t seed) {
   courseRngSeed(seed);
-  return satCatcherRun(display);
+  return satCatcherRun(display, true);
 }
 
 // Pet stats persistence (single checksummed NVS record)

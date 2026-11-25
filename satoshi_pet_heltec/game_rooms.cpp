@@ -752,6 +752,11 @@ static int playPickleball(SSD1306Wire &d, Room &room) {
     showVoid(d, room);
     return 0;
   }
+  if (!isStatus(room, "finished")) {
+    // No word from the server: don't show a result it hasn't settled
+    showMessage(d, "Result not confirmed", "Check Ganamos later", 3000);
+    return 0;
+  }
   showPickleballResult(d, room, m);
   return bonus;
 }
