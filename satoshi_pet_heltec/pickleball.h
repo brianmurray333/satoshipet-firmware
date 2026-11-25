@@ -19,7 +19,9 @@
 #define PB_POINT_DISPLAY_MS    1500  // Show point result (ms)
 #define PB_COUNTDOWN_SECS      3     // 3-2-1 countdown before game
 #define PB_SERVE_DELAY_MS      800   // Pause before next serve
-#define PB_LOBBY_POLL_MS       1500  // Poll server for lobby state every 1.5s
+#define PB_LOBBY_POLL_MS       2500  // Poll server for lobby state every 2.5s
+#define PB_LOBBY_TIMEOUT_MS    100000UL // Host gives up if nobody joins in 100s
+#define PB_HOST_LOST_MS        5000  // Client ends game after 5s without host packets
 #define PB_ESPNOW_STATE_MS     50    // Send game state every 50ms via ESP-NOW
 
 // Court layout coordinates for 128x64 display
@@ -51,64 +53,70 @@ enum PointLossReason : uint8_t {
   PB_MISS_DISCONNECTED,   // Player stopped responding to presence checks
 };
 
-// Game state (shared across host and clients)
+// Game state (shared across host and clients). Owned by the loop() task only:
+// the ESP-NOW callback never touches it (packets are queued, see espnow_comm).
+// Every member has a default initializer so `pbState = PickleballState{};`
+// resets it safely (the String members must not be memset).
 struct PickleballState {
-  PickleballPhase phase;
+  PickleballPhase phase = PB_PHASE_LOBBY;
 
   // Players
   ESPNowPlayer players[MAX_GAME_PLAYERS];
-  uint8_t playerCount;
-  uint8_t myPlayerIndex;    // This device's index in the players array
-  bool isHost;
-  uint32_t matchGeneration;
-  uint32_t sendSequence;
-  uint32_t lastReceivedSequence;
-  uint32_t playerButtonSequence[MAX_GAME_PLAYERS];
-  bool startAcknowledged[MAX_GAME_PLAYERS];
-  unsigned long playerLastSeen[MAX_GAME_PLAYERS];
-  unsigned long lastPresencePing;
+  uint8_t playerCount = 0;
+  uint8_t myPlayerIndex = 0;    // This device's index in the players array
+  bool isHost = false;
+  bool startReceived = false;   // Client: accepted GAME_START for matchGeneration
+  uint32_t matchGeneration = 0;
+  uint32_t sendSequence = 0;
+  uint32_t lastReceivedSequence = 0;
+  uint32_t playerButtonSequence[MAX_GAME_PLAYERS] = {0, 0, 0, 0};
+  bool startAcknowledged[MAX_GAME_PLAYERS] = {false, false, false, false};
+  unsigned long playerLastSeen[MAX_GAME_PLAYERS] = {0, 0, 0, 0};
+  unsigned long lastPresencePing = 0;
+  unsigned long lastHostRx = 0;  // Client: last valid packet from the host
 
   // Ball state
-  uint8_t ballSide;         // 0=left, 1=right
-  uint8_t ballZone;         // 0=top, 1=bottom
-  uint8_t targetPlayerIdx;  // Who needs to hit
+  uint32_t volleyId = 0;        // Host increments per serve; presses carry it
+  uint8_t ballSide = 0;         // 0=left, 1=right
+  uint8_t ballZone = 0;         // 0=top, 1=bottom
+  uint8_t targetPlayerIdx = 0;  // Who needs to hit
 
   // Score
-  uint8_t scoreLeft;
-  uint8_t scoreRight;
-  uint8_t servingSide;      // Who serves next (0=left, 1=right)
+  uint8_t scoreLeft = 0;
+  uint8_t scoreRight = 0;
+  uint8_t servingSide = 0;      // Who serves next (0=left, 1=right)
 
   // Timing
-  unsigned long phaseStartTime;
-  unsigned long lastStateSend;     // Last ESP-NOW state broadcast (host only)
-  unsigned long lastLobbyPoll;     // Last server poll during lobby
-  unsigned long reactionDeadline;  // When reaction window closes
+  unsigned long phaseStartTime = 0;
+  unsigned long lastStateSend = 0;     // Last ESP-NOW state broadcast (host only)
+  unsigned long lastLobbyPoll = 0;     // Last server poll during lobby
+  unsigned long reactionDeadline = 0;  // When reaction window closes
 
   // Lobby
   String gameId;            // Server-side game ID
   String roomCode;          // Short code for optional cross-group joining
-  bool lobbyStartRequested; // Host pressed button to start
+  bool lobbyCancelled = false;  // Server reported the lobby as cancelled
 
   // Animation
-  uint8_t ballAnimFrame;
+  uint8_t ballAnimFrame = 0;
 
   // Point result
-  uint8_t lastPointWinner;  // 0=left, 1=right
-  uint8_t lastPointReason;  // PointLossReason
+  uint8_t lastPointWinner = 0;  // 0=left, 1=right
+  uint8_t lastPointReason = 0;  // PointLossReason
 
   // Button tracking for press-count validation
-  uint8_t buttonPressCount;       // Presses received this volley
-  uint8_t requiredPresses;        // 1 for top zone, 2 for bottom zone
-  bool hitConfirmed;              // Required presses reached, in confirm window
-  unsigned long confirmDeadline;  // End of over-press detection window
+  uint8_t buttonPressCount = 0;       // Presses received this volley
+  uint8_t requiredPresses = 1;        // 1 for top zone, 2 for bottom zone
+  bool hitConfirmed = false;          // Required presses reached, in confirm window
+  unsigned long confirmDeadline = 0;  // End of over-press detection window
 
   // Rally difficulty
-  uint8_t volleyCount;            // Volleys in current rally (resets on point)
+  uint8_t volleyCount = 0;            // Volleys in current rally (resets on point)
 
   // Wagering
-  uint16_t wagerAmount;           // 0 = free, 100/500/1000 sats
-  bool wagerActive;               // All players accepted the wager
-  int16_t wagerResult;            // Sats won (+) or lost (-), set after game over
+  uint16_t wagerAmount = 0;           // 0 = free, 100/500/1000 sats
+  bool wagerActive = false;           // All players accepted the wager
+  int16_t wagerResult = 0;            // Sats won (+) or lost (-), set after game over
 };
 
 // ---- Public API ----
@@ -118,11 +126,9 @@ struct PickleballState {
 // Returns happiness bonus (0 if no game played)
 int handlePickleballGame(SSD1306Wire &display);
 
-// Offline practice using the same reaction-window and 1/2-press rules as
-// multiplayer. Does not create a lobby, initialize ESP-NOW, or use wagers.
+// Solo rally streak using the same reaction-window and 1/2-press rules as
+// multiplayer; one miss ends it and the streak goes to the Pickleball
+// leaderboard. No lobby, ESP-NOW or wagers. Applies its own happiness.
 int handlePickleballPractice(SSD1306Wire &display);
-
-// ---- Internal (but needed for ESP-NOW callbacks) ----
-void pickleballOnESPNowReceive(const uint8_t *mac, const uint8_t *data, int len);
 
 #endif

@@ -1,32 +1,20 @@
 #ifndef CONFIG_H
-#include <Preferences.h>
 #define CONFIG_H
 
-
+#include <Arduino.h>
+#include <Preferences.h>
 #include <ArduinoJson.h>
 
 // Forward declaration to avoid pulling HTTPClient into all includers
 class HTTPClient;
 
-struct DeviceConfig {
-  String pet;
-  String lnurl;
-  int pollInterval;
-};
-
-extern DeviceConfig config;
-extern String currentPet;
 extern String pairingCode;
-bool displayPairingMode();
 String generatePairingCode();
 
-bool loadConfig();
 bool saveDeviceConfig();
 bool loadDeviceConfig();
 bool markJobComplete(String jobId);
 void clearDeviceConfig();
-int fetchBTCPrice();
-int fetchSatoshiBalance(String lnurl);
 
 struct GanamosConfig {
   String deviceId;
@@ -36,8 +24,7 @@ struct GanamosConfig {
   int balance;
   int coins;           // Pet coins for pet care (separate from balance)
   float btcPrice;
-  int pollInterval;
-  String serverUrl;
+  int pollInterval;    // Seconds (server sends seconds); clamped by the sketch
   String lastMessage;  // Message from last transaction
   String lastMessageType;    // "fix" for fix rewards, "transfer" for internal transfers
   String lastPostTitle;      // Post title for fix rewards
@@ -74,15 +61,12 @@ struct GameScoreResponse {
   LeaderboardEntry personalEntry;
 };
 
-bool submitGameScore(int score, GameScoreResponse &response);
+bool submitGameScore(int score, GameScoreResponse &response, uint8_t game = 0);  // game: PetGame
 
 // Balance and coins persistence to prevent false celebrations on restart
 int loadLastKnownBalance();
 void saveLastKnownBalance(int balance);
 void saveLastKnownCoins(int coins);
-
-// Pet care functions
-bool spendCoins(int amount, String action); // Spend coins for feed/heal/game actions
 
 // Economy config parameters
 struct EconomyConfig {
@@ -107,13 +91,31 @@ struct Job {
 
 extern Job cachedJobs[MAX_JOBS];
 extern int cachedJobCount;
-extern String lastSeenJobId;  // Track newest job for notifications
 
 // Fetch jobs from server - returns true if successful
 bool fetchJobs();
 
 // Format sats with k/M suffix (e.g., 1500 -> "1.5k", 2000000 -> "2M")
 String formatSatsShort(int sats);
+
+// === Shared HTTPS client for the Ganamos API ===
+// Prepares `http` for a request to https://www.ganamos.earth<path> using one
+// persistent, CA-verified WiFiClientSecure (ca_roots.h), keep-alive enabled,
+// ~5 s connect/read timeouts, and the standard device headers
+// (X-Device-Id, X-Pairing-Code, Content-Type: application/json).
+// Returns false if WiFi is not connected or begin() fails.
+// Callers then do http.GET()/http.POST(), read the response, and call http.end().
+// Keep-alive note: HTTPClient's destructor stops its client, so use a static /
+// long-lived HTTPClient to actually reuse the TLS connection across calls; a
+// local HTTPClient still works but reconnects (full TLS handshake) each time.
+bool ganamosHttpBegin(HTTPClient& http, const String& path);
+// Closes the shared TLS connection (call when WiFi goes down/off).
+void ganamosHttpReset();
+// The one long-lived HTTPClient for Ganamos requests. Use it (not a local
+// HTTPClient) so back-to-back requests share one TLS connection: a local
+// HTTPClient closes the shared connection when it goes out of scope, which
+// makes every request pay a ~2 s TLS handshake.
+HTTPClient& ganamosSharedHttp();
 
 // === HTTP identity handling ===
 // Attaches device identity headers to every HTTP request.
@@ -124,5 +126,20 @@ void attachIdentityHeaders(HTTPClient& http);
 
 // Returns a redacted form of a secret for logs (first 4 chars + "****")
 String maskForLog(const String& value);
+
+// === Time zone / NTP ===
+// Starts SNTP with the saved POSIX TZ (NVS) or the default US Pacific rule.
+void startTimeSync();
+
+// === WiFi fast-reconnect cache (BSSID + channel of the last good AP) ===
+bool loadWifiFastConnect(uint8_t bssid[6], int32_t& channel);
+void saveWifiFastConnect(const uint8_t* bssid, int32_t channel);
+void clearWifiFastConnect();
+
+// Defined in satoshi_pet_heltec.ino: starts (if needed) a non-blocking WiFi
+// connect and waits up to timeoutMs for an IP, feeding the watchdog. Never
+// calls WiFi.begin() while a connect is already pending. For user-initiated
+// network actions only.
+bool wifiEnsureConnected(unsigned long timeoutMs);
 
 #endif

@@ -1,4 +1,5 @@
   #include <Wire.h>
+  #include <WiFi.h>
   #include "HT_SSD1306Wire.h"
   #include <WiFiManager.h>
   #include <HTTPClient.h>
@@ -14,7 +15,10 @@
   #include <esp_task_wdt.h>  // Watchdog timer support (framework auto-initializes)
   #include <esp_idf_version.h>
   #include <esp_sleep.h>
+  #include <esp_wifi.h>
   #include <driver/gpio.h>
+  #include "sound.h"
+  #include "hold_press.h"
 
   // Keep declarations explicit so this sketch builds consistently with both
   // Arduino IDE and non-IDE toolchains such as PlatformIO/Wokwi.
@@ -31,6 +35,14 @@
   void VextON();
   void playDeathSound();
   void playSadSound();
+  void wifiRadioOff();
+  float getBatteryVoltage();
+  void wifiStartConnect();
+  void wifiService();
+  bool wifiReady();
+  void invalidateRender();
+  void playMenuSelectToneBlocking();
+  void readButtons(bool &prgDown, bool &externalDown);
 
   // Debug logging - comment out to disable verbose logs and save memory
   // #define DEBUG_LOGGING
@@ -90,13 +102,19 @@
 
   bool isPaired = false;  
   String pendingPickleballGameId = "";
-  String pendingPickleballHostMac = "";
   unsigned long lastUpdate = 0;
-  const unsigned long DEFAULT_UPDATE_INTERVAL = 60000; // Default to one poll/minute to reduce radio wakeups
-  const unsigned long MIN_UPDATE_INTERVAL = 60000;     // Never let server config create a battery-heavy poll loop
+  // Server pollInterval is in seconds; clamp so config can't create a battery-heavy loop.
+  const long DEFAULT_POLL_INTERVAL_S = 60;
+  const long MIN_POLL_INTERVAL_S = 60;
+  const long MAX_POLL_INTERVAL_S = 3600;
+  // Display off/screensaver: check every 5 min so new jobs and earned sats
+  // wake the pet (each check is a ~1 s fast reconnect + one request)
+  const unsigned long IDLE_POLL_INTERVAL_MS = 300000UL;
+  const unsigned long DECAY_CHECK_INTERVAL_MS = 60000UL;
   bool buttonPressed = false;
   bool consumeButtonUntilRelease = false;
   bool lastSyncSucceeded = false;
+  bool syncAttempted = false;  // a sync has been tried since boot (success or not)
   unsigned long buttonPressTime = 0;
   unsigned long lastButtonPress = 0;
   bool hadSavedConfigOnBoot = false; // Track if we loaded saved config on boot
@@ -109,6 +127,23 @@
   const unsigned long WIFI_MIN_BACKOFF_MS = 5000;  // Start with 5 seconds between attempts
   const unsigned long WIFI_MAX_BACKOFF_MS = 300000;  // Max 5 minutes between attempts
   bool wifiConfigPortalRequested = false;  // Flag to enter WiFi setup mode
+  // Non-blocking WiFi connection state (driven by WiFi.onEvent + wifiService())
+  volatile bool wifiHasIp = false;
+  volatile bool wifiDisconnectEvt = false;
+  bool wifiConnecting = false;
+  bool wifiFastAttempt = false;
+  unsigned long wifiConnectStart = 0;
+  const unsigned long WIFI_CONNECT_TIMEOUT_MS = 10000;
+  const unsigned long WIFI_FAST_CONNECT_TIMEOUT_MS = 4000;
+  bool syncPending = false;            // A scheduled sync is waiting for an IP
+  unsigned long lastDecayCheck = 0;
+  unsigned long lastBatteryCheck = 0;
+  // Debounced buttons (button_handler.h)
+  DebouncedButton dbPrg;
+  DebouncedButton dbExt;
+  // Redraw throttling for the main render chain
+  uint32_t lastRenderKey = 0;
+  unsigned long lastRenderAt = 0;
   enum ButtonSource {
     BUTTON_SOURCE_NONE,
     BUTTON_SOURCE_EXTERNAL,
@@ -154,7 +189,7 @@
   unsigned long lowBatteryWarningStartTime = 0;
   bool lowBatteryAlertPlayed = false; // Prevent repeated alerts
 
-  const unsigned long HOLD_PRESS_MIN = 700;
+  const unsigned long HOLD_PRESS_MIN = HOLD_SELECT_MS;
   const unsigned long SHORT_PRESS_MAX = HOLD_PRESS_MIN - 1;
   const unsigned long VERY_LONG_PRESS = 10000; // 10 seconds to prevent accidental factory reset
 
@@ -175,23 +210,6 @@
     }
     isDisplayOff = isScreensaverActive = isBitcoinFactsActive = false;
     setOLEDContrast(NORMAL_BRIGHTNESS);
-  }
-
-  void renderHoldProgress() {
-    if (!buttonPressed) return;
-    static unsigned long lastFrame = 0;
-    unsigned long now = millis();
-    if (now - lastFrame < 50) return;
-    lastFrame = now;
-    unsigned long elapsed = now - buttonPressTime;
-    display.setColor(BLACK);
-    display.fillRect(0, 49, 128, 15);
-    display.setColor(WHITE);
-    display.setFont(ArialMT_Plain_10);
-    display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 49, elapsed < HOLD_PRESS_MIN ? "Hold to select" : "Release to select");
-    display.fillRect(0, 63, min(128UL, elapsed * 128 / HOLD_PRESS_MIN), 1);
-    display.display();
   }
 
   int getBatteryPercentage() {
@@ -250,6 +268,13 @@
   }
 
   // Charging detection requires a hardware status signal, not a voltage guess.
+  // A LiPo never reads below ~3 V while it can power the board, so a reading
+  // under 2.5 V means no battery voltage reaches the sense pin (no battery
+  // plugged in, or a bad battery lead) and the board is running on USB.
+  bool batteryPresent() {
+    return getBatteryVoltage() >= 2.5f;
+  }
+
   bool isBatteryCharging() {
     // Voltage alone cannot distinguish a full battery from active charging.
     return false;
@@ -332,30 +357,32 @@
     return voltage;
   }
 
+  // Melodies are static so the non-blocking sound player can keep pointers.
+  // freq 0 = rest. Quiet hours are enforced inside soundPlay().
+  static const ToneNote SATS_EARNED_MELODY[] = {
+    {523, 100}, {0, 20}, {587, 100}, {0, 20}, {659, 100}, {0, 20},
+    {784, 150}, {0, 20}, {880, 150}, {0, 20}, {1047, 300}
+  };
+  static const ToneNote FIX_REJECTED_MELODY[] = {
+    {880, 150}, {0, 30}, {784, 150}, {0, 30}, {659, 150}, {0, 30},
+    {587, 200}, {0, 30}, {523, 200}, {0, 30}, {392, 400}
+  };
+  static const ToneNote BUTTON_CHIRP[] = {{880, 60}, {1319, 60}};
+  static const ToneNote MENU_SELECT_TONE[] = {{988, 90}, {1319, 150}};
+  static const ToneNote SAD_MELODY[] = {{659, 180}, {587, 180}, {523, 280}};
+  static const ToneNote DEATH_MELODY[] = {{523, 230}, {440, 230}, {349, 230}, {262, 480}};
+  static const ToneNote LOW_BATTERY_MELODY[] = {{880, 140}, {659, 140}, {440, 190}};
+  static const ToneNote NEW_JOB_CHIRP[] = {{784, 130}, {988, 130}, {1175, 180}};
+  #define NOTE_COUNT(a) ((uint8_t)(sizeof(a) / sizeof((a)[0])))
+
   void playSatsEarnedSound() {
-    if (isQuietHours()) return;
     // Uplifting 8-bit style melody for earning sats
-    int melody[] = {523, 587, 659, 784, 880, 1047};
-    int durations[] = {100, 100, 100, 150, 150, 300};
-    
-    for (int i = 0; i < 6; i++) {
-      tone(BUZZER_PIN, melody[i], durations[i]);
-      delay(durations[i] + 20);
-      noTone(BUZZER_PIN);
-    }
+    soundPlay(SATS_EARNED_MELODY, NOTE_COUNT(SATS_EARNED_MELODY));
   }
 
   void playFixRejectedSound() {
-    if (isQuietHours()) return;  // Silent during quiet hours
     // Sad descending tone - opposite of the celebration melody
-    int melody[] = {880, 784, 659, 587, 523, 392};
-    int durations[] = {150, 150, 150, 200, 200, 400};
-    
-    for (int i = 0; i < 6; i++) {
-      tone(BUZZER_PIN, melody[i], durations[i]);
-      delay(durations[i] + 30);
-      noTone(BUZZER_PIN);
-    }
+    soundPlay(FIX_REJECTED_MELODY, NOTE_COUNT(FIX_REJECTED_MELODY));
   }
 
   void displayPairingCode() {
@@ -390,41 +417,33 @@
     
     // Get the fact from PROGMEM
     char factBuffer[128];
-    strcpy_P(factBuffer, (char*)pgm_read_ptr(&(bitcoin_facts[factIndex])));
-    
-    // Word wrap the fact text (max ~18 chars per line for 92px width)
-    String fact = String(factBuffer);
-    int textX = 36;
-    int lineHeight = 11;
-    int startY = 6; // Moved up to make room for 4 lines
-    
-    // Simple word wrapping - break at spaces near line limit
-    int currentLine = 0;
-    int currentPos = 0;
-    int maxCharsPerLine = 18;
-    
-    while (currentPos < fact.length() && currentLine < 4) {
-      String line = "";
-      int lineStart = currentPos;
-      
-      // Find good break point (word boundary)
-      while (currentPos < fact.length() && line.length() < maxCharsPerLine) {
-        line += fact.charAt(currentPos);
-        currentPos++;
-      }
-      
-      // Backtrack to last space if we're mid-word
-      if (currentPos < fact.length() && fact.charAt(currentPos) != ' ') {
-        int lastSpace = line.lastIndexOf(' ');
-        if (lastSpace > 0) {
-          currentPos = lineStart + lastSpace + 1;
-          line = line.substring(0, lastSpace);
+    strncpy_P(factBuffer, (char*)pgm_read_ptr(&(bitcoin_facts[factIndex])), sizeof(factBuffer) - 1);
+    factBuffer[sizeof(factBuffer) - 1] = '\0';
+
+    // Word wrap in place (max ~18 chars per line for 92px width, 4 lines).
+    const int textX = 36;
+    const int lineHeight = 11;
+    const int startY = 6;
+    const int maxCharsPerLine = 18;
+    const int len = strlen(factBuffer);
+    char line[maxCharsPerLine + 1];
+    int pos = 0;
+
+    for (int currentLine = 0; currentLine < 4 && pos < len; currentLine++) {
+      while (pos < len && factBuffer[pos] == ' ') pos++;  // Skip leading spaces
+      int end = min(pos + maxCharsPerLine, len);
+      // Break at the last space if the line would split a word
+      if (end < len && factBuffer[end] != ' ') {
+        for (int i = end - 1; i > pos; i--) {
+          if (factBuffer[i] == ' ') { end = i; break; }
         }
       }
-      
-      line.trim(); // Trim in place (returns void)
+      int lineLen = end - pos;
+      while (lineLen > 0 && factBuffer[pos + lineLen - 1] == ' ') lineLen--;
+      memcpy(line, factBuffer + pos, lineLen);
+      line[lineLen] = '\0';
       display.drawString(textX, startY + (currentLine * lineHeight), line);
-      currentLine++;
+      pos = end;
     }
     
     display.display();
@@ -472,6 +491,269 @@
     return min(delay, WIFI_MAX_BACKOFF_MS);
   }
 
+  // ===== Non-blocking WiFi =====
+  // Runs in the WiFi event task: only set flags here.
+  void onWifiEvent(arduino_event_id_t event) {
+    switch (event) {
+      case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+        wifiHasIp = true;
+        break;
+      case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+        wifiHasIp = false;
+        wifiDisconnectEvt = true;
+        break;
+      default:
+        break;
+    }
+  }
+
+  bool wifiReady() {
+    return wifiHasIp && WiFi.status() == WL_CONNECTED;
+  }
+
+  // Turn the radio fully off and drop the shared TLS connection.
+  void wifiRadioOff() {
+    ganamosHttpReset();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    wifiConnecting = false;
+    wifiHasIp = false;
+  }
+
+  // Issue one WiFi.begin(). Fast path pins the cached BSSID/channel (skips the
+  // full scan); the fallback uses the stored SSID/password without pinning so
+  // the driver config is unpinned again if the AP changed.
+  void wifiBeginAttempt(bool allowFast) {
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(false);
+    wifiFastAttempt = false;
+  #ifdef WOKWI_SIMULATOR
+    (void)allowFast;
+    WiFi.begin("Wokwi-GUEST", "", 6);
+  #else
+    // Credentials saved by WiFiManager live in the WiFi driver's NVS config.
+    char ssid[33] = {0};
+    char pass[65] = {0};
+    wifi_config_t conf;
+    memset(&conf, 0, sizeof(conf));
+    if (esp_wifi_get_config(WIFI_IF_STA, &conf) == ESP_OK) {
+      memcpy(ssid, conf.sta.ssid, sizeof(conf.sta.ssid));
+      memcpy(pass, conf.sta.password, sizeof(conf.sta.password));
+    }
+    uint8_t bssid[6];
+    int32_t channel = 0;
+    if (ssid[0] == '\0') {
+      WiFi.begin();
+    } else if (allowFast && loadWifiFastConnect(bssid, channel)) {
+      wifiFastAttempt = true;
+      WiFi.begin(ssid, pass[0] ? pass : nullptr, channel, bssid);
+    } else {
+      WiFi.begin(ssid, pass[0] ? pass : nullptr);
+    }
+  #endif
+    wifiDisconnectEvt = false;
+    wifiConnectStart = millis();
+    wifiConnecting = true;
+  }
+
+  // Start a background connect. No-op while connected or already connecting,
+  // so it never races a pending WiFi.begin().
+  void wifiStartConnect() {
+    if (wifiConnecting || wifiReady()) return;
+    Serial.println(F("📶 Starting WiFi connect (non-blocking)"));
+    wifiBeginAttempt(true);
+  }
+
+  // Start a connect for scheduled work, honoring exponential backoff.
+  bool wifiRequestConnect(unsigned long now) {
+    if (wifiConnecting) return true;
+    if (lastWifiReconnectAttempt != 0 && now - lastWifiReconnectAttempt < getWifiBackoffDelay()) {
+      return false;
+    }
+    wifiReconnectAttempts++;
+    lastWifiReconnectAttempt = now;
+    Serial.print(F("📶 WiFi reconnect attempt #"));
+    Serial.println(wifiReconnectAttempts);
+    if (wifiReconnectAttempts >= WIFI_MAX_QUICK_RETRIES && wifiReconnectAttempts % 5 == 0) {
+      Serial.println(F("💡 Tip: Hold the button to enter WiFi setup"));
+    }
+    wifiStartConnect();
+    return wifiConnecting;
+  }
+
+  // Advance the connect state machine; call every loop iteration.
+  void wifiService() {
+    if (!wifiConnecting) {
+      if (wifiDisconnectEvt) {
+        wifiDisconnectEvt = false;
+        ganamosHttpReset();  // Connection dropped: the TLS session is dead
+      }
+      return;
+    }
+    unsigned long now = millis();
+    if (wifiReady()) {
+      wifiConnecting = false;
+      wifiReconnectAttempts = 0;
+      Serial.print(F("✅ WiFi connected in "));
+      Serial.print(now - wifiConnectStart);
+      Serial.print(F("ms: "));
+      Serial.println(WiFi.localIP());
+  #ifndef WOKWI_SIMULATOR
+      saveWifiFastConnect(WiFi.BSSID(), WiFi.channel());
+  #endif
+      WiFi.setSleep(WIFI_PS_MAX_MODEM);
+      if (time(nullptr) < 1600000000) startTimeSync();  // Retry SNTP now that we have a route
+      return;
+    }
+    unsigned long elapsed = now - wifiConnectStart;
+    if (wifiFastAttempt &&
+        (elapsed > WIFI_FAST_CONNECT_TIMEOUT_MS || (wifiDisconnectEvt && elapsed > 300))) {
+      Serial.println(F("📶 Fast reconnect failed - falling back to full scan"));
+      WiFi.disconnect(false);
+      wifiBeginAttempt(false);
+      return;
+    }
+    if (elapsed > WIFI_CONNECT_TIMEOUT_MS) {
+      Serial.println(F("❌ WiFi connect timed out"));
+      wifiRadioOff();  // Save power until the next attempt
+    }
+  }
+
+  bool wifiEnsureConnected(unsigned long timeoutMs) {
+    if (wifiReady()) return true;
+    if (!wifiConnecting) {
+      lastWifiReconnectAttempt = millis();
+      wifiStartConnect();
+    }
+    unsigned long start = millis();
+    while (millis() - start < timeoutMs) {
+      wifiService();
+      if (wifiReady()) return true;
+      if (!wifiConnecting) return false;
+      esp_task_wdt_reset();
+      soundUpdate();
+      delay(50);
+    }
+    return wifiReady();
+  }
+
+  // ===== Redraw throttling =====
+  // The render chain only redraws when the screen identity/content key changes
+  // or its refresh period elapses (static screens: slow self-heal refresh;
+  // animated screens: ~8 fps).
+  const unsigned long STATIC_SCREEN_REFRESH_MS = 2000;
+  const unsigned long ANIMATED_FRAME_MS = 125;
+  enum RenderScreen {
+    SCREEN_LOW_BATTERY = 1, SCREEN_PET_WARNING, SCREEN_NEW_JOB, SCREEN_REJECTION,
+    SCREEN_FACT, SCREEN_SCREENSAVER, SCREEN_CELEBRATION, SCREEN_ONBOARDING, SCREEN_PET
+  };
+
+  uint32_t renderKey(uint32_t screen, uint32_t content) {
+    return (screen << 24) | (content & 0xFFFFFFUL);
+  }
+
+  void invalidateRender() {
+    lastRenderKey = 0;
+  }
+
+  bool renderDue(uint32_t key, unsigned long now, unsigned long refreshMs) {
+    if (key != lastRenderKey || now - lastRenderAt >= refreshMs) {
+      lastRenderKey = key;
+      lastRenderAt = now;
+      return true;
+    }
+    return false;
+  }
+
+  // Debounced, active-low button levels.
+  void readButtons(bool &prgDown, bool &externalDown) {
+    unsigned long now = millis();
+    debounceUpdate(dbPrg, now);
+    debounceUpdate(dbExt, now);
+    prgDown = debounceIsDown(dbPrg);
+    externalDown = debounceIsDown(dbExt);
+  }
+
+  bool anyButtonDown() {
+    bool prgDown, externalDown;
+    readButtons(prgDown, externalDown);
+    return prgDown || externalDown;
+  }
+
+  // Poll interval: server value is seconds, clamped; idle polls at least every 5 minutes.
+  unsigned long currentPollIntervalMs() {
+    long seconds = ganamosConfig.pollInterval > 0 ? ganamosConfig.pollInterval : DEFAULT_POLL_INTERVAL_S;
+    seconds = constrain(seconds, MIN_POLL_INTERVAL_S, MAX_POLL_INTERVAL_S);
+    unsigned long intervalMs = (unsigned long)seconds * 1000UL;
+    if (isScreensaverActive && intervalMs < IDLE_POLL_INTERVAL_MS) {
+      intervalMs = IDLE_POLL_INTERVAL_MS;
+    }
+    return intervalMs;
+  }
+
+  unsigned long msUntil(unsigned long last, unsigned long interval, unsigned long now) {
+    unsigned long elapsed = now - last;
+    return elapsed >= interval ? 0 : interval - elapsed;
+  }
+
+  // Time until the next scheduled job (poll, decay tick, battery sample).
+  unsigned long msUntilNextScheduledJob(unsigned long now) {
+    unsigned long next = msUntil(lastDecayCheck, DECAY_CHECK_INTERVAL_MS, now);
+    next = min(next, msUntil(lastBatteryCheck, BATTERY_CHECK_INTERVAL, now));
+    if (isPaired) {
+      next = min(next, msUntil(lastUpdate, currentPollIntervalMs(), now) + 1);
+    }
+    return constrain(next, 20UL, DECAY_CHECK_INTERVAL_MS);
+  }
+
+  // A titled tap/hold list (tap = next, hold = pick). Returns the picked
+  // index, or -1 after 30 s without input or when the last item is "Back".
+  int runListMenu(const char* title, const char* const* options, int count) {
+    int selected = 0;
+    unsigned long lastInput = millis();
+    auto render = [&]() {
+      display.clear();
+      display.setFont(ArialMT_Plain_10);
+      display.setTextAlignment(TEXT_ALIGN_LEFT);
+      display.drawString(0, 0, title);
+      display.drawLine(0, 12, 127, 12);
+      for (int i = 0; i < count; i++) {
+        display.drawString(4, 15 + i * 12, String(i == selected ? "> " : "  ") + options[i]);
+      }
+      display.display();
+    };
+    render();
+    while (millis() - lastInput < 30000) {
+      PressEvent ev = holdPressUpdate(anyButtonDown());
+      if (holdPressActive()) lastInput = lastButtonPress = millis();
+      if (ev == PRESS_TAP) {
+        lastInput = lastButtonPress = millis();
+        selected = (selected + 1) % count;
+        playButtonChirp();
+        render();
+      } else if (ev == PRESS_HOLD) {
+        lastButtonPress = millis();
+        bool back = strcmp(options[selected], "Back") == 0;
+        if (back) playMenuSelectTone();
+        return back ? -1 : selected;
+      }
+      holdPressDrawBar(display);
+      esp_task_wdt_reset();
+      soundUpdate();
+      delay(20);
+    }
+    return -1;
+  }
+
+  void applyGameHappinessBonus(int bonus) {
+    if (bonus <= 0) return;
+    int oldHappiness = petStats.happiness;
+    petStats.happiness = min(100, petStats.happiness + bonus);
+    savePetStats();
+    Serial.println("Game bonus: Happiness " + String(oldHappiness) + " → " + String(petStats.happiness));
+  }
+
   // Enter WiFi config portal to connect to a new network
   void enterWifiConfigPortal() {
     Serial.println(F("📶 Entering WiFi config portal..."));
@@ -497,7 +779,9 @@
     display.display();
     
     // Disconnect from any existing connection
+    ganamosHttpReset();
     WiFi.disconnect(true);
+    wifiConnecting = false;
     delay(100);
     
     WiFiManager wm;
@@ -510,6 +794,9 @@
     if (connected) {
       Serial.println(F("✅ WiFi connected via config portal!"));
       wifiReconnectAttempts = 0;
+      clearWifiFastConnect();  // New network: re-learn BSSID/channel
+      saveWifiFastConnect(WiFi.BSSID(), WiFi.channel());
+      WiFi.setSleep(WIFI_PS_MAX_MODEM);
       lastWifiReconnectAttempt = 0;
       
       display.clear();
@@ -519,7 +806,7 @@
       delay(1500);
     } else {
       Serial.println(F("❌ Config portal timed out"));
-      WiFi.mode(WIFI_OFF);  // Turn off to save power
+      wifiRadioOff();  // Turn off to save power
     }
     
     wifiConfigPortalRequested = false;
@@ -530,8 +817,13 @@
   }
 
   void setup() {
+    // 80 MHz is ample for the UI, WiFi and TLS and cuts active current.
+    setCpuFrequencyMhz(80);
     Serial.begin(115200);
     Serial.println(F("Satoshi Pet boot"));
+
+    // Track WiFi link state from driver events (non-blocking connect logic).
+    WiFi.onEvent(onWifiEvent);
     
     // ESP32 Arduino framework already initializes watchdog timer (5s default)
     // DISABLED: Watchdog registration causing boot loop
@@ -592,7 +884,7 @@
     ganamosConfig.balance = 12345;
     ganamosConfig.coins = 1000;
     ganamosConfig.btcPrice = 100000.0;
-    ganamosConfig.pollInterval = DEFAULT_UPDATE_INTERVAL;
+    ganamosConfig.pollInterval = DEFAULT_POLL_INTERVAL_S;
 #endif
     logCurrentPairingState();
     
@@ -641,6 +933,9 @@
       if (wifiConfigured && WiFi.status() == WL_CONNECTED) {
         Serial.print(F("WiFi configured and connected: "));
         Serial.println(WiFi.localIP());
+#ifndef WOKWI_SIMULATOR
+        saveWifiFastConnect(WiFi.BSSID(), WiFi.channel());
+#endif
       } else {
         // WiFi setup failed or timed out - show error and restart
         Serial.println(F("WiFi setup failed - restarting..."));
@@ -655,38 +950,30 @@
       }
     } else {
       // ===== PAIRED DEVICE: Try quick reconnect, offline is OK =====
+      // Fast path pins the cached BSSID/channel; wifiService() falls back to
+      // a full scan and gives up after the connect timeout (radio off).
       Serial.println(F("Device paired - trying quick WiFi reconnect..."));
-      WiFi.mode(WIFI_STA);
-      WiFi.setAutoReconnect(false);
-#ifdef WOKWI_SIMULATOR
-      WiFi.begin("Wokwi-GUEST", "", 6);
-#else
-      WiFi.begin();
-#endif
-      
-      // Wait up to 10 seconds for connection
-      unsigned long wifiStart = millis();
-      while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart) < 10000) {
-        delay(250);
-        yield();
+      wifiStartConnect();
+      while (wifiConnecting) {
+        wifiService();
+        delay(50);
       }
       
-      if (WiFi.status() == WL_CONNECTED) {
+      if (wifiReady()) {
         Serial.print(F("WiFi connected: "));
         Serial.println(WiFi.localIP());
-        // ESP32 modem sleep preserves connectivity while substantially reducing
-        // idle radio power. Interactive UI does not require it to be disabled.
-        WiFi.setSleep(true);
       } else {
         Serial.println(F("WiFi unavailable - continuing offline"));
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
+        wifiRadioOff();
       }
     }
+    if (wifiReady()) {
+      // Max modem sleep keeps the association while the radio idles.
+      WiFi.setSleep(WIFI_PS_MAX_MODEM);
+    }
 
-    // Initialize NTP for real time (for sleep cycle)
-    configTime(-8 * 3600, 0, "pool.ntp.org", "time.nist.gov"); // PST timezone, adjust as needed
-    Serial.println("NTP time sync initiated...");
+    // Initialize NTP with a POSIX TZ (DST-aware); server config may override it.
+    startTimeSync();
 
     initPet("default");
     
@@ -703,12 +990,8 @@
     setLocalCoins(1000);
 #endif
     
-    // Check for corrupted economy data and clear if needed
-    int pendingCount = getPendingSpendCount();
-    if (pendingCount > 10) {
-      Serial.println("⚠️ Suspicious pending spend count (" + String(pendingCount) + ") - clearing economy data");
-      clearEconomyData();
-    }
+    // (Removed the boot-time wipe when >10 spends were pending: queue entries
+    //  are checksum-verified on load, and 11+ is a normal offline backlog.)
     
     loadPetStats();
     
@@ -738,6 +1021,8 @@
     }
     // Initialize buttons using button_handler module
     initButtons();
+    debounceInit(dbPrg, BUTTON_PIN_PRG);
+    debounceInit(dbExt, BUTTON_PIN_EXTERNAL);
 #ifndef WOKWI_SIMULATOR
     gpio_wakeup_enable((gpio_num_t)BUTTON_PIN_PRG, GPIO_INTR_LOW_LEVEL);
     gpio_wakeup_enable((gpio_num_t)BUTTON_PIN_EXTERNAL, GPIO_INTR_LOW_LEVEL);
@@ -784,17 +1069,181 @@
     Serial.println("  coins: " + String(ganamosConfig.coins));
   }
 
+  int cachedBatteryPct = -1; // Cached battery percentage (-1 = not initialized)
+
+  // One config sync + economy reconciliation. Requires an IP (wifiReady()).
+  // The render chain in loop() redraws afterwards.
+  void runConfigSync() {
+    unsigned long fetchStart = millis();
+    // Always restore idle radio state, including early returns and HTTP errors.
+    struct IdleRadioCleanup {
+      bool wasSleeping;
+      ~IdleRadioCleanup() {
+        if (wasSleeping) {
+          wifiRadioOff();
+        }
+      }
+    } radioCleanup{isDisplayOff};
+
+    // Lighter power save while exchanging data keeps request latency low.
+    WiFi.setSleep(WIFI_PS_MIN_MODEM);
+    bool fetchSuccess = fetchGanamosConfig();
+    syncAttempted = true;
+    lastSyncSucceeded = fetchSuccess;
+    esp_task_wdt_reset();
+
+    unsigned long fetchTime = millis() - fetchStart;
+    if (fetchTime > 100) {
+      Serial.print(F("SLOW FETCH: "));
+      Serial.print(fetchTime);
+      Serial.println(F("ms"));
+    }
+
+    if (!fetchSuccess) {
+      // Only consecutive 404s count toward a reset; any success clears the counter.
+      if (getLastHttpCode() == 404) {
+        consecutiveConfig404s++;
+        Serial.println("⚠️ Device config 404 (" + String(consecutiveConfig404s) + "/" + String(CONFIG_404_THRESHOLD) + ")");
+        if (consecutiveConfig404s >= CONFIG_404_THRESHOLD) {
+          Serial.println("⚠️ Device not found after repeated attempts - clearing saved config");
+          clearDeviceConfig();
+          isPaired = false;
+          hadSavedConfigOnBoot = false;
+          ganamosConfig.deviceId = "";  // Pair with the new code only
+          generatePairingCode();
+          // Turn display back on (full brightness) to show the pairing code,
+          // and keep the radio on so pairing can complete.
+          if (isDisplayOff) {
+            VextON();
+            delay(100);
+            display.init();
+          }
+          isDisplayOff = isScreensaverActive = isBitcoinFactsActive = false;
+          radioCleanup.wasSleeping = false;
+          setOLEDContrast(NORMAL_BRIGHTNESS);
+          lastButtonPress = millis();
+          displayPairingCode();
+          Serial.println("New pairing code generated: " + maskForLog(pairingCode));
+          consecutiveConfig404s = 0;
+          return;
+        }
+        Serial.println("⚠️ Waiting for additional 404s before resetting.");
+      }
+      if (wifiReady()) WiFi.setSleep(WIFI_PS_MAX_MODEM);
+      return;  // Pet keeps showing cached data
+    }
+
+    consecutiveConfig404s = 0;
+    static int lastBalance = ganamosConfig.balance;
+
+    // Sync economy: update local balance from server and sync pending spends
+    int serverCoins = ganamosConfig.coins;
+    int localCoins = getLocalCoins();
+
+    // Sync pending spends FIRST before reconciling balance
+    int synced = syncPendingSpends();
+    clearSyncedSpends();  // Persists the synced marks (single NVS write)
+    if (synced > 0) {
+      Serial.println("✅ Synced " + String(synced) + " pending spends");
+    }
+    esp_task_wdt_reset();
+    soundUpdate();
+
+    // Upload game scores that were queued while offline
+    syncPendingGameScores();
+    clearSyncedGameScores();
+    esp_task_wdt_reset();
+    soundUpdate();
+
+    // Check how many pending spends are still unsynced
+    int remainingPending = getPendingSpendCount();
+
+    // After sync attempt, reconcile local balance with server
+    // BUT only trust server if we have NO pending spends - otherwise our offline
+    // spending hasn't been acknowledged by the server yet!
+    // serverCoins was read before this round's spends were synced, so it is
+    // stale whenever we just synced something; reconcile on the next poll.
+    if (synced > 0) {
+      Serial.println("⏳ Spends synced this round - reconciling balance next poll");
+    } else if (serverCoins != localCoins) {
+      int diff = localCoins - serverCoins;
+
+      if (remainingPending > 0) {
+        // DON'T trust server - we have unsynced spends that server doesn't know about
+        Serial.println("⏳ Balance mismatch but " + String(remainingPending) + " pending spends not synced yet");
+        Serial.println("   Local: " + String(localCoins) + ", Server: " + String(serverCoins));
+        Serial.println("   Keeping local balance until spends sync successfully");
+      } else if (diff > 0) {
+        // No pending spends, but local is higher - this shouldn't happen normally
+        // Could be corrupted data, so trust server
+        Serial.println("⚠️ Local balance higher than server by " + String(diff) + " coins (no pending spends)");
+        Serial.println("   This may indicate corrupted data - trusting server balance");
+        setLocalCoins(serverCoins);
+      } else {
+        // Server is higher - user earned coins while offline, safe to update
+        Serial.println("💰 Server balance higher by " + String(-diff) + " coins (earned while offline)");
+        setLocalCoins(serverCoins);
+      }
+    }
+
+    // Apply time-based decay to pet stats
+    applyTimeBasedDecay();
+    lastDecayCheck = millis();
+
+    cachedBatteryPct = getBatteryPercentage(); // Update cached battery value
+
+    // Preserve the idle state before the celebration renderer wakes us.
+    if (ganamosConfig.balance > lastBalance && isScreensaverActive) {
+      wakeForNotification();
+    }
+    lastBalance = ganamosConfig.balance;
+
+    // Check for fix rejection notification. The server keeps sending the
+    // last rejection, so remember which one was shown in flash: otherwise
+    // every reboot or re-flash would show an old rejection again.
+    static String lastSeenRejectionId;
+    static bool rejectionSeenLoaded = false;
+    if (!rejectionSeenLoaded) {
+      Preferences uiPrefs;
+      if (uiPrefs.begin("sp-ui", true)) {
+        lastSeenRejectionId = uiPrefs.getString("seenReject", "");
+        uiPrefs.end();
+      }
+      rejectionSeenLoaded = true;
+      // First run with this firmware: whatever rejection the server reports
+      // now is from before; record it without showing it.
+      if (lastSeenRejectionId.length() == 0 && ganamosConfig.lastRejectionId.length() > 0) {
+        lastSeenRejectionId = ganamosConfig.lastRejectionId;
+        Preferences w;
+        if (w.begin("sp-ui", false)) { w.putString("seenReject", lastSeenRejectionId); w.end(); }
+      }
+    }
+    if (ganamosConfig.lastRejectionId.length() > 0 &&
+        ganamosConfig.lastRejectionId != lastSeenRejectionId) {
+      // New rejection detected!
+      lastSeenRejectionId = ganamosConfig.lastRejectionId;
+      Preferences w;
+      if (w.begin("sp-ui", false)) { w.putString("seenReject", lastSeenRejectionId); w.end(); }
+      triggerRejection(ganamosConfig.rejectionMessage);
+    }
+
+    if (isDisplayOff) {
+      Serial.println("💤💤 Display OFF: Balance=" + String(ganamosConfig.balance) + " Battery=" + String(cachedBatteryPct) + "%");
+    }
+    if (wifiReady()) WiFi.setSleep(WIFI_PS_MAX_MODEM);
+    invalidateRender();  // Show fresh data on the next render pass
+  }
+
   void loop() {
-    // DISABLED: Watchdog feed causing boot loop
-    // esp_task_wdt_reset();
-      esp_task_wdt_reset();  // Feed watchdog at start of every loop iteration
+    esp_task_wdt_reset();  // Feed watchdog at start of every loop iteration
+    soundUpdate();
+    wifiService();
     // Ensure WiFi stays off if we're in offline mode (prevents background blocking)
     static bool wifiDisabled = false;
-    if (!wifiDisabled && WiFi.status() != WL_CONNECTED) {
+    if (!wifiDisabled && !wifiConnecting && WiFi.status() != WL_CONNECTED) {
       if (WiFi.getMode() != WIFI_OFF) {
         Serial.println(F("Forcing WiFi OFF to prevent blocking"));
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
+        wifiRadioOff();
       }
       wifiDisabled = true;
     }
@@ -814,8 +1263,7 @@
         isDisplayOff = isScreensaverActive = true;
         isBitcoinFactsActive = false;
         VextOFF();
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
+        wifiRadioOff();
       }
       notificationReturnToSleep = false;
     }
@@ -840,16 +1288,13 @@
       lastLoopDebug = now;
     }
   #endif
-    static int cachedBatteryPct = -1; // Cache battery percentage (-1 = not initialized)
-    static unsigned long lastBatteryCheck = 0;
-    
     // Initialize battery on first loop, then sample at the target-specific cadence.
-    if (cachedBatteryPct < 0 || (now - lastBatteryCheck > BATTERY_CHECK_INTERVAL)) {
+    if (cachedBatteryPct < 0 || (now - lastBatteryCheck >= BATTERY_CHECK_INTERVAL)) {
       cachedBatteryPct = getBatteryPercentage();
       lastBatteryCheck = now;
       
       // Trigger low battery warning at 10% (only once per charge cycle)
-      if (cachedBatteryPct <= 10 && !lowBatteryAlertPlayed && !isLowBatteryWarningActive) {
+      if (cachedBatteryPct <= 10 && batteryPresent() && !lowBatteryAlertPlayed && !isLowBatteryWarningActive) {
         Serial.println("🔋 LOW BATTERY WARNING - waking display to show warning");
         
         wakeForNotification();
@@ -873,7 +1318,9 @@
     // Enter ultra-low-power mode only at 5% (critical battery)
     // BUT only if user hasn't interacted recently - let normal screensaver flow handle sleep
     // This ensures button press always wakes device for full timeout period
-    if (cachedBatteryPct <= 5 && !isDisplayOff && !isLowBatteryWarningActive) {
+    // Not when no battery reads at all: that's USB power with no battery, and
+    // shutting the radio off there only breaks syncing and multiplayer.
+    if (cachedBatteryPct <= 5 && batteryPresent() && !isDisplayOff && !isLowBatteryWarningActive) {
       // Only force low-power if we've already gone through the screensaver timeout
       // (i.e., user hasn't pressed a button recently)
       if (!notificationActive && !inMenuMode && now - lastButtonPress > SCREENSAVER_DISPLAY_OFF_TIMEOUT) {
@@ -881,9 +1328,9 @@
         isScreensaverActive = true;
         isDisplayOff = true;
         VextOFF();
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
-        // Will only wake for button press or poll every 5 minutes
+        syncPending = false;
+        wifiRadioOff();
+        // Will only wake for button press or the idle poll
       }
     }
     
@@ -892,15 +1339,17 @@
       lowBatteryAlertPlayed = false;
     }
     
-    // Multi-stage sleep transition: screensaver → facts → display OFF
-      if (!notificationActive && !inMenuMode && !buttonPressed && !isScreensaverActive && (now - lastButtonPress > SCREENSAVER_TIMEOUT)) {
+    // Multi-stage sleep transition: screensaver → facts → display OFF.
+    // An unpaired device only dims, so its pairing code stays visible and
+    // pairing polls keep running.
+    if (!notificationActive && !inMenuMode && !buttonPressed && !isScreensaverActive && (now - lastButtonPress > SCREENSAVER_TIMEOUT)) {
       isScreensaverActive = true;
       isBitcoinFactsActive = false;
       isDisplayOff = false;
       setOLEDContrast(DIM_BRIGHTNESS);
-      // Enable WiFi power saving when idle (saves 20-40mA)
-      if (WiFi.status() == WL_CONNECTED) {
-        WiFi.setSleep(true);
+      // Strongest modem sleep while idle (radio stays associated)
+      if (wifiReady()) {
+        WiFi.setSleep(WIFI_PS_MAX_MODEM);
       }
   #ifdef DEBUG_LOGGING
       Serial.println(F("Entering screensaver"));
@@ -908,7 +1357,7 @@
     }
     
     // Briefly show facts before display-off.
-    if (isScreensaverActive && !isBitcoinFactsActive && !isDisplayOff && (now - lastButtonPress > BITCOIN_FACTS_TIMEOUT)) {
+    if (isPaired && isScreensaverActive && !isBitcoinFactsActive && !isDisplayOff && (now - lastButtonPress > BITCOIN_FACTS_TIMEOUT)) {
       isBitcoinFactsActive = true;
       bitcoinFactsStartTime = now;
       
@@ -922,13 +1371,15 @@
     }
     
     // End the idle display period.
-    if (isBitcoinFactsActive && !isDisplayOff && (now - lastButtonPress > SCREENSAVER_DISPLAY_OFF_TIMEOUT)) {
+    if (isPaired && isBitcoinFactsActive && !isDisplayOff && (now - lastButtonPress > SCREENSAVER_DISPLAY_OFF_TIMEOUT)) {
       isDisplayOff = true;
       VextOFF();  // Turn display OFF completely to save power
       
-      // Disconnect WiFi to save significant power
-      WiFi.disconnect(true);
-      WiFi.mode(WIFI_OFF);
+      // Disconnect WiFi to save significant power. A sync that is still
+      // connecting turns the radio off itself when it finishes or times out.
+      if (!syncPending) {
+        wifiRadioOff();
+      }
   #ifdef DEBUG_LOGGING
       Serial.println(F("Display OFF, WiFi OFF (power saving)"));
   #endif
@@ -947,10 +1398,10 @@
       if (now - lastUpdate > 5000) {
         lastUpdate = now;
         
-        extern int getLastHttpCode();
-        bool fetchSuccess = fetchGanamosConfig();
-        
-        if (fetchSuccess) {
+        if (!wifiReady()) {
+          // Connect in the background; the next 5 s tick fetches once we have an IP.
+          wifiRequestConnect(now);
+        } else if (fetchGanamosConfig()) {
           isPaired = true;
           saveDeviceConfig(); // SAVE TO FLASH!
           Serial.println("Successfully paired and saved to flash memory!");
@@ -966,7 +1417,10 @@
           
           // Start onboarding flow
           onboardingStep = 1;
+          lastButtonPress = millis();
+          invalidateRender();
           renderOnboardingStep(display, onboardingStep, ganamosConfig.petName);
+          return;
         } else {
           // Check if we got a 404 - only regenerate if we had saved config that's now invalid
           // If we're starting fresh (no saved config), 404 is expected - don't regenerate code
@@ -976,8 +1430,6 @@
           if (got404) {
             consecutiveConfig404s++;
             Serial.println("⚠️ Pairing fetch returned 404 (" + String(consecutiveConfig404s) + "/" + String(CONFIG_404_THRESHOLD) + ")");
-          } else {
-            consecutiveConfig404s = 0;
           }
           
           if (got404 && hadSavedConfigOnBoot && !hasHandledSavedConfig404 && consecutiveConfig404s >= CONFIG_404_THRESHOLD) {
@@ -988,19 +1440,15 @@
             generatePairingCode(); // Generate new pairing code
             Serial.println("New pairing code generated: " + maskForLog(pairingCode));
             hasHandledSavedConfig404 = true;
-            displayPairingCode();
             consecutiveConfig404s = 0;
+          } else if (!got404) {
+            Serial.println("Connection failed (not 404) - keeping pairing code");
           } else {
-            // Either no 404, or no saved config (expected), or already handled
-            // Just show the current pairing code (keep it static)
-            if (!got404) {
-              Serial.println("Connection failed (not 404) - keeping pairing code");
-            } else {
-              Serial.println("Not paired yet - waiting for user to pair (pairing code static)");
-            }
-            displayPairingCode();
+            Serial.println("Not paired yet - waiting for user to pair (pairing code static)");
           }
         }
+        // Keep the (static) pairing code on screen
+        displayPairingCode();
       }
     } else {
       // Debug timing checkpoint
@@ -1013,7 +1461,7 @@
       
       // Debug: Print state flags
       static unsigned long lastStateLog = 0;
-      if (millis() - lastStateLog > 10000) {
+      if (!isDisplayOff && millis() - lastStateLog > 10000) {
         Serial.print(F("State: menu="));
         Serial.print(inMenuMode);
         Serial.print(F(" scrsvr="));
@@ -1025,230 +1473,40 @@
         lastStateLog = millis();
       }
       
-      // Normal operation - fetch data less frequently during screensaver to save power
-      unsigned long configuredInterval = ganamosConfig.pollInterval > 0
-        ? (unsigned long)ganamosConfig.pollInterval
-        : DEFAULT_UPDATE_INTERVAL;
-      configuredInterval = max(configuredInterval, MIN_UPDATE_INTERVAL);
-      unsigned long updateInterval = isScreensaverActive ? 300000UL : configuredInterval;
+      // Normal operation - poll less often while idle to save power
+      unsigned long updateInterval = currentPollIntervalMs();
 #ifdef WOKWI_SIMULATOR
       // Keep simulator tests deterministic and completely separate from the live API.
       updateInterval = 0xFFFFFFFFUL;
 #endif
       
-      if (now - lastUpdate > updateInterval) {
+      if (!syncPending && now - lastUpdate > updateInterval) {
         lastUpdate = now;
-        unsigned long fetchStart = millis();
-        // Always restore idle radio state, including early returns and HTTP errors.
-        struct IdleRadioCleanup {
-          bool wasSleeping;
-          ~IdleRadioCleanup() {
-            if (wasSleeping) {
-              WiFi.disconnect(true);
-              WiFi.mode(WIFI_OFF);
-            }
-          }
-        } radioCleanup{isDisplayOff};
-        
-        // Reconnect and fetch in this same cycle; never leave the radio waiting
-        // for the next five-minute poll after a successful connection.
-        if (WiFi.status() != WL_CONNECTED) {
-          unsigned long backoffDelay = getWifiBackoffDelay();
-          
-          // Check if enough time has passed since last attempt
-          if (now - lastWifiReconnectAttempt < backoffDelay) {
-            // Not time yet - just skip this fetch cycle
-            return;
-          }
-          
-          wifiReconnectAttempts++;
-          lastWifiReconnectAttempt = now;
-          
-          Serial.print(F("📶 WiFi reconnect attempt #"));
-          Serial.print(wifiReconnectAttempts);
-          Serial.print(F(" (next in "));
-          Serial.print(getWifiBackoffDelay() / 1000);
-          Serial.println(F("s)"));
-          
-          // After many failures, suggest config portal
-          if (wifiReconnectAttempts >= WIFI_MAX_QUICK_RETRIES && wifiReconnectAttempts % 5 == 0) {
-            Serial.println(F("💡 Tip: Hold PRG button 5 seconds to enter WiFi setup"));
-          }
-          
-          WiFi.mode(WIFI_STA);
-          WiFi.begin();  // Try with saved credentials
-          
-          // Wait briefly to see if connection starts
-          unsigned long wifiWaitStart = millis();
-          while (WiFi.status() != WL_CONNECTED && millis() - wifiWaitStart < 3000) {
-            delay(100);
-            yield();
-          }
-          
-          if (WiFi.status() == WL_CONNECTED) {
-            Serial.println(F("✅ WiFi reconnected!"));
-            wifiReconnectAttempts = 0;
-            WiFi.setSleep(true);
-          } else {
-            Serial.println(F("❌ WiFi reconnect failed"));
-            WiFi.disconnect(true);
-            WiFi.mode(WIFI_OFF);  // Turn off to save power between attempts
-            lastSyncSucceeded = false;
-            return;
-          }
-        } else {
-          // Connected - reset retry counter
-          if (wifiReconnectAttempts > 0) {
-            wifiReconnectAttempts = 0;
-            Serial.println(F("✅ WiFi connection restored"));
-          }
+        if (isScreensaverActive && isQuietHours()) {
+          // Nobody is looking and sounds are muted: skip idle polls overnight.
+          Serial.println(F("💤 Quiet hours - skipping idle poll"));
+        } else if (wifiReady() || wifiRequestConnect(now)) {
+          // Runs below as soon as we have an IP; never blocks waiting for WiFi.
+          syncPending = true;
         }
-        
-        extern int getLastHttpCode();
-        bool fetchSuccess = fetchGanamosConfig();
-        lastSyncSucceeded = fetchSuccess;
-        
-        // Log fetch timing
-        unsigned long fetchTime = millis() - fetchStart;
-        if (fetchTime > 100) {
-          Serial.print(F("SLOW FETCH: "));
-          Serial.print(fetchTime);
-          Serial.println(F("ms"));
-        }
-        
-        // If we got a 404, the saved pairing code is invalid - clear config and reset
-        if (!fetchSuccess) {
-          if (getLastHttpCode() == 404) {
-            consecutiveConfig404s++;
-            Serial.println("⚠️ Device config 404 (" + String(consecutiveConfig404s) + "/" + String(CONFIG_404_THRESHOLD) + ")");
-            if (consecutiveConfig404s >= CONFIG_404_THRESHOLD) {
-              Serial.println("⚠️ Device not found after repeated attempts - clearing saved config");
-              clearDeviceConfig();
-              isPaired = false;
-              generatePairingCode();
-              // Turn display back on to show pairing code
-              VextON();
-              delay(100);
-              display.init();
-              displayPairingCode();
-              Serial.println("New pairing code generated: " + maskForLog(pairingCode));
-              consecutiveConfig404s = 0;
-              return; // Skip to next loop iteration
-            } else {
-              Serial.println("⚠️ Waiting for additional 404s before resetting.");
-            }
-          } else {
-            consecutiveConfig404s = 0;
-          }
-          // Don't return here - continue to button handling below
-        }
-        
-        consecutiveConfig404s = 0;
+      }
 
-        if (fetchSuccess) {
-          static int lastBalance = ganamosConfig.balance;
-          
-          // Sync economy: update local balance from server and sync pending spends
-          extern int getLocalCoins();
-          extern void setLocalCoins(int coins);
-          extern int syncPendingSpends();
-          extern void clearSyncedSpends();
-          extern int getPendingSpendCount();
-          
-          int serverCoins = ganamosConfig.coins;
-          int localCoins = getLocalCoins();
-          
-          // Sync pending spends FIRST before reconciling balance
-          int synced = syncPendingSpends();
-          if (synced > 0) {
-            Serial.println("✅ Synced " + String(synced) + " pending spends");
-            clearSyncedSpends();
-          }
-          
-          // Check how many pending spends are still unsynced
-          int remainingPending = getPendingSpendCount();
-          
-          // After sync attempt, reconcile local balance with server
-          // BUT only trust server if we have NO pending spends - otherwise our offline
-          // spending hasn't been acknowledged by the server yet!
-          if (serverCoins != localCoins) {
-            int diff = localCoins - serverCoins;
-            
-            if (remainingPending > 0) {
-              // DON'T trust server - we have unsynced spends that server doesn't know about
-              Serial.println("⏳ Balance mismatch but " + String(remainingPending) + " pending spends not synced yet");
-              Serial.println("   Local: " + String(localCoins) + ", Server: " + String(serverCoins));
-              Serial.println("   Keeping local balance until spends sync successfully");
-              // Don't call setLocalCoins - keep local balance as-is
-            } else if (diff > 0) {
-              // No pending spends, but local is higher - this shouldn't happen normally
-              // Could be corrupted data, so trust server
-              Serial.println("⚠️ Local balance higher than server by " + String(diff) + " coins (no pending spends)");
-              Serial.println("   This may indicate corrupted data - trusting server balance");
-              setLocalCoins(serverCoins);
-            } else {
-              // Server is higher - user earned coins while offline, safe to update
-              Serial.println("💰 Server balance higher by " + String(-diff) + " coins (earned while offline)");
-              setLocalCoins(serverCoins);
-            }
-          }
-          
-          // Apply time-based decay to pet stats
-          extern void applyTimeBasedDecay();
-          applyTimeBasedDecay();
-          
-          updatePetMood(ganamosConfig.btcPrice, ganamosConfig.balance);
-          cachedBatteryPct = getBatteryPercentage(); // Update cached battery value
-          
-          // Preserve the idle state before the celebration renderer wakes us.
-          if (ganamosConfig.balance > lastBalance && isScreensaverActive) {
-            wakeForNotification();
-          }
-          lastBalance = ganamosConfig.balance;
-
-          // Check for fix rejection notification
-          static String lastSeenRejectionId = "";
-          if (ganamosConfig.lastRejectionId.length() > 0 && 
-              ganamosConfig.lastRejectionId != lastSeenRejectionId) {
-              // New rejection detected!
-              lastSeenRejectionId = ganamosConfig.lastRejectionId;
-              triggerRejection(ganamosConfig.rejectionMessage);
-              }
-          
-          // Render based on power saving mode
-          if (isDisplayOff) {
-            // Display is completely OFF - just log (maximum power saving)
-            // DO NOT RENDER - display is powered off
-            Serial.println("💤💤 Display OFF: Balance=" + String(ganamosConfig.balance) + " Battery=" + String(cachedBatteryPct) + "%");
-          } else if (isLowBatteryWarningActive) {
-            // Low battery warning shares the brief notification timeout
-            renderLowBatteryWarning(display, cachedBatteryPct);
-          } else if (isBitcoinFactsActive && !isDisplayOff) {
-            // Bitcoin facts mode - rotate through 3 facts (20 seconds each)
-            unsigned long timeInFacts = now - bitcoinFactsStartTime;
-            int factSlot = (timeInFacts / 20000) % 3; // 0, 1, or 2
-            renderBitcoinFact(display, bitcoinFactsForSession[factSlot]);
-          } else if (isScreensaverActive && !isDisplayOff) {
-            // Animated screensaver - render it (only if display is ON and not turned off)
-            renderScreensaver(display, ganamosConfig.balance);
-            Serial.println("💤 Screensaver: Balance=" + String(ganamosConfig.balance) + " Battery=" + String(cachedBatteryPct) + "%");
-          } else if (onboardingStep > 0) {
-            // Onboarding active - render current step (don't overwrite with pet)
-            renderOnboardingStep(display, onboardingStep, ganamosConfig.petName);
-          } else {
-            // Normal mode - render pet
-            renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, cachedBatteryPct);
-            // Log battery voltage for debugging
-            Serial.println("Battery: " + String(getBatteryVoltage(), 2) + "V (" + String(cachedBatteryPct) + "%)");
-          }
+      if (syncPending) {
+        if (wifiReady()) {
+          syncPending = false;
+          runConfigSync();
+          if (!isPaired) return;  // Device was reset to pairing mode
+        } else if (!wifiConnecting) {
+          // Connect attempt gave up (radio already turned off by wifiService)
+          syncPending = false;
+          syncAttempted = true;
+          lastSyncSucceeded = false;
+          Serial.println(F("❌ WiFi reconnect failed - sync skipped"));
         }
-        // If fetch failed, just continue - pet will show with cached data
       }
       
       // Apply decay even when offline (every minute)
-      static unsigned long lastDecayCheck = 0;
-      if (now - lastDecayCheck > 60000) { // Check every minute
-        extern void applyTimeBasedDecay();
+      if (now - lastDecayCheck >= DECAY_CHECK_INTERVAL_MS) {
         applyTimeBasedDecay();
         lastDecayCheck = now;
       }
@@ -1266,64 +1524,65 @@
         }
       }
 
-      // Keep updating the display based on current mode
-      extern bool showCelebration;
-      extern bool showNewJobNotification;
-      extern unsigned long newJobNotificationStart;
-      extern const unsigned long NEW_JOB_NOTIFICATION_DURATION;
-      extern void renderNewJobNotification(SSD1306Wire &display);
-      extern bool showRejection;
-      extern unsigned long rejectionStart;
-      extern void renderRejection(SSD1306Wire &display);
-      
       // Check if new job notification should end
       if (showNewJobNotification && (millis() - newJobNotificationStart >= NEW_JOB_NOTIFICATION_DURATION)) {
         showNewJobNotification = false;
         digitalWrite(RGB_LED, LOW);
       }
 
-      // NEW: Check if rejection notification should end (5 seconds)
+      // Check if rejection notification should end (5 seconds)
       if (showRejection && (millis() - rejectionStart >= 5000)) {
         showRejection = false;
         digitalWrite(RGB_LED, LOW);
       }
       
-      // Menu mode is handled separately in button handling section
+      // Menu mode is handled separately in button handling section.
+      // Each screen redraws only when its content key changes, on a slow
+      // self-heal refresh (static screens) or at ~8 fps (animated screens).
       if (!inMenuMode) {
         unsigned long renderStart = millis();
         if (isDisplayOff) {
           // Display is completely OFF - no rendering needed (maximum power saving)
-          // Just skip rendering entirely
         } else if (isLowBatteryWarningActive) {
-          renderLowBatteryWarning(display, cachedBatteryPct);
+          if (renderDue(renderKey(SCREEN_LOW_BATTERY, cachedBatteryPct), now, STATIC_SCREEN_REFRESH_MS)) {
+            renderLowBatteryWarning(display, cachedBatteryPct);
+          }
         } else if (petWarning) {
-          if (petWarning == 3) renderDeathWarning(display, ganamosConfig.petName);
-          else if (petWarning == 1) renderHungerWarning(display, ganamosConfig.petName, petStats.fullness);
-          else renderSadnessWarning(display, ganamosConfig.petName, petStats.happiness);
+          int value = petWarning == 1 ? petStats.fullness : petStats.happiness;
+          if (renderDue(renderKey(SCREEN_PET_WARNING, ((uint32_t)petWarning << 8) | (value & 0xFF)), now, STATIC_SCREEN_REFRESH_MS)) {
+            if (petWarning == 3) renderDeathWarning(display, ganamosConfig.petName);
+            else if (petWarning == 1) renderHungerWarning(display, ganamosConfig.petName, petStats.fullness);
+            else renderSadnessWarning(display, ganamosConfig.petName, petStats.happiness);
+          }
         } else if (showNewJobNotification) {
-          // New job notification takes priority
-          renderNewJobNotification(display);
+          // New job notification takes priority (animated)
+          if (renderDue(renderKey(SCREEN_NEW_JOB, 0), now, ANIMATED_FRAME_MS)) {
+            renderNewJobNotification(display);
+          }
         } else if (showRejection) {
-          // NEW: Rejection notification
-          renderRejection(display);
+          if (renderDue(renderKey(SCREEN_REJECTION, 0), now, ANIMATED_FRAME_MS)) {
+            renderRejection(display);
+          }
         } else if (isBitcoinFactsActive) {
           unsigned long timeInFacts = now - bitcoinFactsStartTime;
           int factSlot = (timeInFacts / 20000) % 3;
-          renderBitcoinFact(display, bitcoinFactsForSession[factSlot]);
+          int fact = bitcoinFactsForSession[factSlot];
+          if (renderDue(renderKey(SCREEN_FACT, ((uint32_t)factSlot << 16) | (fact & 0xFFFF)), now, STATIC_SCREEN_REFRESH_MS)) {
+            renderBitcoinFact(display, fact);
+          }
         } else if (isScreensaverActive) {
-          if (!isDisplayOff) {
-            static unsigned long lastScreensaverUpdate = 0;
-            if (now - lastScreensaverUpdate > 500) {
-              renderScreensaver(display, ganamosConfig.balance);
-              lastScreensaverUpdate = now;
-            }
+          if (renderDue(renderKey(SCREEN_SCREENSAVER, 0), now, 500)) {
+            renderScreensaver(display, ganamosConfig.balance);
           }
         } else if (showCelebration) {
-          renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, cachedBatteryPct);
+          if (renderDue(renderKey(SCREEN_CELEBRATION, 0), now, ANIMATED_FRAME_MS)) {
+            renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, cachedBatteryPct);
+          }
         } else if (onboardingStep > 0) {
-          // Onboarding active - don't overwrite, let button handler manage it
-          // Optionally re-render to keep it on screen:
-          renderOnboardingStep(display, onboardingStep, ganamosConfig.petName);
+          // Onboarding active - button handler advances it; just keep it on screen
+          if (renderDue(renderKey(SCREEN_ONBOARDING, onboardingStep), now, STATIC_SCREEN_REFRESH_MS)) {
+            renderOnboardingStep(display, onboardingStep, ganamosConfig.petName);
+          }
         } else {
           // Normal mode
           static unsigned long lastDisplayUpdate = 0;
@@ -1332,19 +1591,26 @@
           static int lastDisplayedHappiness = -1;
           static int lastDisplayedBattery = -1;
           
-          extern int getLocalCoins();
           int currentCoins = getLocalCoins();
           bool dataChanged = (currentCoins != lastDisplayedCoins ||
                             petStats.fullness != lastDisplayedFullness ||
                             petStats.happiness != lastDisplayedHappiness ||
                             cachedBatteryPct != lastDisplayedBattery);
+          const uint32_t petKey = renderKey(SCREEN_PET, 0);
+          bool screenChanged = lastRenderKey != petKey;
           
           // One frame per second keeps the pet feeling alive while halving idle
           // OLED transfers compared with the previous 500 ms refresh cadence.
-          bool animationUpdate = (now - lastDisplayUpdate > 1000);
+          // While syncing, refresh faster so the "..." indicator animates.
+          // While the pet plays a gesture or eats, redraw every 200 ms so no
+          // frame is skipped; otherwise once a second (the breath bob).
+          unsigned long frameMs = petAnimating() ? 200UL : ((syncPending || wifiConnecting) ? 400UL : 1000UL);
+          bool animationUpdate = (now - lastDisplayUpdate >= frameMs);
           
-          if (dataChanged || animationUpdate) {
+          if (dataChanged || animationUpdate || screenChanged) {
             renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, cachedBatteryPct);
+            lastRenderKey = petKey;
+            lastRenderAt = now;
             lastDisplayUpdate = now;
             lastDisplayedCoins = currentCoins;
             lastDisplayedFullness = petStats.fullness;
@@ -1368,9 +1634,9 @@
       Serial.println(F("ms"));
     }
     
-    // Handle button presses
-    bool prgButtonState = digitalRead(BUTTON_PIN_PRG) == LOW;
-    bool externalButtonState = digitalRead(BUTTON_PIN_EXTERNAL) == LOW;
+    // Handle button presses (debounced levels; long-press timing unchanged)
+    bool prgButtonState, externalButtonState;
+    readButtons(prgButtonState, externalButtonState);
     bool currentButtonState = prgButtonState || externalButtonState;
 
     if (consumeButtonUntilRelease) {
@@ -1384,6 +1650,7 @@
       lastButtonPress = millis();
       notificationActive = notificationReturnToSleep = false;
       petWarning = 0;
+      invalidateRender();
       if (prgButtonState && externalButtonState) {
         lastButtonSource = BUTTON_SOURCE_BOTH;
         Serial.println(F("Both buttons pressed"));
@@ -1439,19 +1706,31 @@
           display.setFont(ArialMT_Plain_10);
           display.setTextAlignment(TEXT_ALIGN_LEFT);
           
-          // Start WiFi reconnection in background (non-blocking)
-          if (WiFi.status() != WL_CONNECTED) {
+          // Start WiFi reconnection in background (non-blocking). A due poll
+          // waits for this connect instead of issuing its own WiFi.begin().
+          if (!wifiReady() && !wifiConnecting) {
             Serial.println(F("Starting WiFi reconnection..."));
-            WiFi.mode(WIFI_STA);
-            WiFi.begin();  // Uses saved credentials, connects in background
+            lastWifiReconnectAttempt = millis();
+            wifiStartConnect();
           }
         }
+        // Refresh right away on wake (the screen shows "..." meanwhile) so
+        // new sats and jobs appear without waiting for the next poll.
+        if (isPaired && !syncPending && (wifiReady() || wifiConnecting)) {
+          lastUpdate = millis();
+          syncPending = true;
+          syncAttempted = false;
+        }
         // Button handling is local, so modem sleep can remain enabled after wake.
-        if (WiFi.status() == WL_CONNECTED) WiFi.setSleep(true);
+        if (wifiReady()) WiFi.setSleep(WIFI_PS_MAX_MODEM);
         isDisplayOff = false;
         setOLEDContrast(NORMAL_BRIGHTNESS);
-        int batteryPct = getBatteryPercentage();
-        renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);
+        if (isPaired) {
+          int batteryPct = getBatteryPercentage();
+          renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);
+        } else {
+          displayPairingCode();
+        }
         Serial.println(F("Wake complete"));
         
         buttonPressed = false;
@@ -1461,9 +1740,21 @@
       }
     }
     
-    if (!currentButtonState && buttonPressed) {
-      unsigned long pressDuration = millis() - buttonPressTime;
+    // In the menu a hold counts as soon as the line fills, without waiting
+    // for release; the rest of that press is ignored. Elsewhere (home screen)
+    // presses are still measured on release, so the 10 s factory-reset hold
+    // and the WiFi-setup hold stay reachable.
+    bool menuHoldReached = buttonPressed && currentButtonState && inMenuMode &&
+                           onboardingStep == 0 &&
+                           millis() - buttonPressTime >= HOLD_PRESS_MIN;
+    if ((!currentButtonState && buttonPressed) || menuHoldReached) {
+      unsigned long pressDuration = menuHoldReached ? HOLD_PRESS_MIN : millis() - buttonPressTime;
       buttonPressed = false;
+      if (menuHoldReached) {
+        consumeButtonUntilRelease = true;
+        holdPressSwallow();     // nested screens ignore this press too
+        holdHintsNoteHold();
+      }
       ButtonSource triggeredSource = lastButtonSource;
       lastButtonSource = BUTTON_SOURCE_NONE;
 
@@ -1508,7 +1799,8 @@
       if (inMenuMode) {
         if (isHoldPress) {
           int selectedOption = currentMenuOption;
-          playMenuSelectTone();
+          if (selectedOption == 3) playMenuSelectToneBlocking();  // Jobs screen blocks
+          else playMenuSelectTone();
           inMenuMode = false;
           currentMenuOption = 0;
 
@@ -1517,65 +1809,33 @@
             int batteryPct = getBatteryPercentage();
             renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);
           } else if (selectedOption == 1) {
-            bool inGameMenu = true;
-            int selectedGame = 0;
-            unsigned long lastGameInput = millis();
-
-            auto renderGameMenu = [&]() {
-              const char* gameOptions[] = {"Flappy Pet", "Pickle Practice", "Multiplayer", "Back"};
-              display.clear();
-              display.setFont(ArialMT_Plain_10);
-              display.setTextAlignment(TEXT_ALIGN_LEFT);
-              display.drawString(0, 0, "Choose game");
-              display.drawLine(0, 12, 127, 12);
-              for (int i = 0; i < 4; i++) {
-                display.drawString(4, 15 + i * 12,
-                  String(i == selectedGame ? "> " : "  ") + gameOptions[i]);
-              }
-              display.display();
-            };
-            renderGameMenu();
-
-            while (inGameMenu && millis() - lastGameInput < 30000) {
-              bool gameButtonDown = digitalRead(BUTTON_PIN_PRG) == LOW ||
-                                    digitalRead(BUTTON_PIN_EXTERNAL) == LOW;
-              if (gameButtonDown && !buttonPressed) {
-                buttonPressed = true;
-                buttonPressTime = millis();
-              }
-              if (!gameButtonDown && buttonPressed) {
-                unsigned long duration = millis() - buttonPressTime;
-                buttonPressed = false;
-                lastGameInput = millis();
-                lastButtonPress = lastGameInput;
-                if (duration <= SHORT_PRESS_MAX) {
-                  selectedGame = (selectedGame + 1) % 4;
-                  playButtonChirp();
-                  renderGameMenu();
-                } else if (duration >= HOLD_PRESS_MIN && duration < VERY_LONG_PRESS) {
-                  playMenuSelectTone();
-                  inGameMenu = false;
-                  if (selectedGame == 0) {
-                    handleLightningGame(display);
-                  } else if (selectedGame == 1) {
-                    handlePickleballPractice(display);
-                  } else if (selectedGame == 2) {
+            static const char* const GAME_OPTIONS[] = {"Flappy Pet", "Pickleball", "Sat Catcher", "Back"};
+            static const char* const PICKLEBALL_OPTIONS[] = {"Solo", "2 Players", "Back"};
+            int game = runListMenu("Choose game", GAME_OPTIONS, 4);
+            if (game == 1) {  // Pickleball: pick solo or 2 players next
+              int mode = runListMenu("Pickleball", PICKLEBALL_OPTIONS, 3);
+              game = mode == 0 ? 10 : mode == 1 ? 11 : -1;
+            }
+            if (game == 0 || game == 2 || game == 10 || game == 11) {
+              playMenuSelectToneBlocking();  // Games run their own blocking loops
+            }
+            if (game == 0) {
+              handleLightningGame(display);        // Applies its own happiness and leaderboard
+            } else if (game == 2) {
+              handleSatCatcherGame(display);       // Applies its own happiness and leaderboard
+            } else if (game == 10) {
+              handlePickleballPractice(display);   // Solo rally: own happiness and leaderboard
+            } else if (game == 11) {
 #ifdef WOKWI_SIMULATOR
-                    display.clear();
-                    display.setTextAlignment(TEXT_ALIGN_CENTER);
-                    display.drawString(64, 22, "Multiplayer needs");
-                    display.drawString(64, 38, "physical devices");
-                    display.display();
-                    delay(1800);
+              display.clear();
+              display.setTextAlignment(TEXT_ALIGN_CENTER);
+              display.drawString(64, 22, "Multiplayer needs");
+              display.drawString(64, 38, "physical devices");
+              display.display();
+              delay(1800);
 #else
-                    handlePickleballGame(display);
+              applyGameHappinessBonus(handlePickleballGame(display));
 #endif
-                  }
-                }
-              }
-              renderHoldProgress();
-              esp_task_wdt_reset();
-              delay(20);
             }
             int batteryPct = getBatteryPercentage();
             renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);
@@ -1596,22 +1856,13 @@
                 break;
               }
 
-              bool prgStateFood = digitalRead(BUTTON_PIN_PRG) == LOW;
-              bool externalStateFood = digitalRead(BUTTON_PIN_EXTERNAL) == LOW;
-              bool currentStateFood = prgStateFood || externalStateFood;
+              soundUpdate();
+              PressEvent foodEv = holdPressUpdate(anyButtonDown());
+              if (holdPressActive()) lastButtonPress = lastFoodCycle = millis();
 
-              if (currentStateFood && !buttonPressed) {
-                buttonPressed = true;
-                buttonPressTime = millis();
-                lastButtonPress = lastFoodCycle = buttonPressTime;
-              }
-
-              if (!currentStateFood && buttonPressed) {
-                unsigned long foodPressDuration = millis() - buttonPressTime;
-                buttonPressed = false;
-
-                bool foodShort = foodPressDuration <= SHORT_PRESS_MAX;
-                bool foodHold = (foodPressDuration >= HOLD_PRESS_MIN) && (foodPressDuration < VERY_LONG_PRESS);
+              if (foodEv != PRESS_NONE) {
+                bool foodShort = foodEv == PRESS_TAP;
+                bool foodHold = foodEv == PRESS_HOLD;
 
                 if (foodShort) {
                   selectedFood = (selectedFood + 1) % totalFoodItems;
@@ -1627,7 +1878,7 @@
                   } else {
                     int foodCost = getFoodCostByIndex(selectedFood);
                     inFoodMenu = false;
-                    playMenuSelectTone();
+                    playMenuSelectToneBlocking();  // Result screen below blocks
                     
                     // Check local coin balance (not stale server balance)
                     extern int getLocalCoins();
@@ -1643,15 +1894,24 @@
                 }
               }
 
-              renderHoldProgress();
+              holdPressDrawBar(display);
               delay(45);
             }
 
             int batteryPct = getBatteryPercentage();
             renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);
           } else if (selectedOption == 3) {
-            // Jobs - browse open jobs from user's groups
-            extern void handleJobsMenu(SSD1306Wire &display);
+            // Jobs - browse open jobs from user's groups. If the radio is
+            // still (re)connecting after wake, wait for it here (user-initiated)
+            // instead of failing the fetch.
+            if (!wifiReady()) {
+              display.clear();
+              display.setFont(ArialMT_Plain_10);
+              display.setTextAlignment(TEXT_ALIGN_CENTER);
+              display.drawString(64, 25, "Connecting WiFi...");
+              display.display();
+              wifiEnsureConnected(WIFI_CONNECT_TIMEOUT_MS + WIFI_FAST_CONNECT_TIMEOUT_MS);
+            }
             handleJobsMenu(display);
             int batteryPct = getBatteryPercentage();
             renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);
@@ -1688,7 +1948,7 @@
             // Hold press → WiFi setup (only if disconnected)
             if (WiFi.status() != WL_CONNECTED) {
               Serial.println(F("📶 Hold press + no WiFi - entering config portal"));
-              playMenuSelectTone();
+              playMenuSelectToneBlocking();
               enterWifiConfigPortal();
               int batteryPct = getBatteryPercentage();
               renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);
@@ -1715,20 +1975,30 @@
     // If in menu mode, keep rendering menu
     if (inMenuMode) {
       static unsigned long lastMenuRender = 0;
-      if (millis() - lastMenuRender > 500) { // Update menu display every 500ms
+      // Not while the button is down: a redraw would wipe the hold line
+      if (!buttonPressed && millis() - lastMenuRender > 500) {
         renderMenu(display, currentMenuOption);
         lastMenuRender = millis();
       }
-      renderHoldProgress();
+      if (buttonPressed && !consumeButtonUntilRelease) {
+        drawHoldBar(display, millis() - buttonPressTime);
+      }
     }
     
-    // When both OLED and radio are off, light-sleep the CPU between button
-    // scans. Buttons wake via GPIO; the one-second timer services the watchdog
-    // and scheduled work. RAM is retained. Wokwi cannot validate current draw.
+    // When both OLED and radio are off, light-sleep the CPU until the next
+    // scheduled job (poll / decay tick / battery sample). Buttons wake via
+    // GPIO. RAM is retained. Wokwi cannot validate current draw.
 #ifndef WOKWI_SIMULATOR
-    if (isDisplayOff && WiFi.getMode() == WIFI_OFF) {
-      esp_sleep_enable_timer_wakeup(1000000);
+    if (isDisplayOff && WiFi.getMode() == WIFI_OFF && !soundBusy()) {
+      unsigned long sleepMs = msUntilNextScheduledJob(millis());
+      esp_sleep_enable_timer_wakeup((uint64_t)sleepMs * 1000ULL);
+      // An intentional sleep can exceed the 15 s task-watchdog timeout:
+      // unsubscribe for its duration and re-subscribe on wake.
+      esp_task_wdt_reset();
+      esp_task_wdt_delete(NULL);
       esp_light_sleep_start();
+      esp_task_wdt_add(NULL);
+      esp_task_wdt_reset();
     } else {
       delay(10);
     }
@@ -1737,80 +2007,46 @@
 #endif
   }
 
+  // User-initiated feedback tones play regardless of quiet hours (as before).
   void playButtonChirp() {
-    tone(BUZZER_PIN, 880, 80);
-    delay(60);
-    tone(BUZZER_PIN, 1319, 80);
-    delay(60);
-    noTone(BUZZER_PIN);
+    soundPlay(BUTTON_CHIRP, NOTE_COUNT(BUTTON_CHIRP), false);
   }
 
   void playMenuSelectTone() {
-    tone(BUZZER_PIN, 988, 100);
-    delay(90);
-    tone(BUZZER_PIN, 1319, 160);
-    delay(150);
-    noTone(BUZZER_PIN);
+    soundPlay(MENU_SELECT_TONE, NOTE_COUNT(MENU_SELECT_TONE), false);
   }
 
-  // Check if current time is during quiet hours (8pm-8am)
-  // Returns true if sounds should be suppressed
+  // Blocking variant for selections that hand control to a blocking screen
+  // (games, jobs, portal) which does not service soundUpdate().
+  void playMenuSelectToneBlocking() {
+    soundPlayBlocking(MENU_SELECT_TONE, NOTE_COUNT(MENU_SELECT_TONE), false);
+  }
+
+  // Check if current time is during quiet hours (8pm-8am local time).
+  // Cheap and non-blocking: no SNTP wait. Returns false until time is valid.
   bool isQuietHours() {
+    time_t nowEpoch = time(nullptr);
+    if (nowEpoch < 1600000000) return false;  // Clock not yet synced
     struct tm timeinfo;
-    if (getLocalTime(&timeinfo, 10)) {  // 10ms timeout
-      int hour = timeinfo.tm_hour;
-      // Quiet hours: 8pm (20:00) to 8am (08:00)
-      return (hour >= 20 || hour < 8);
-    }
-    // If time not available, don't suppress sounds
-    return false;
+    localtime_r(&nowEpoch, &timeinfo);
+    return (timeinfo.tm_hour >= 20 || timeinfo.tm_hour < 8);
   }
 
   void playSadSound() {
-    if (isQuietHours()) return;  // Silent during quiet hours
-    tone(BUZZER_PIN, 659, 200);
-    delay(180);
-    tone(BUZZER_PIN, 587, 200);
-    delay(180);
-    tone(BUZZER_PIN, 523, 300);
-    delay(280);
-    noTone(BUZZER_PIN);
+    soundPlay(SAD_MELODY, NOTE_COUNT(SAD_MELODY));
   }
 
   void playDeathSound() {
-    if (isQuietHours()) return;  // Silent during quiet hours
-    tone(BUZZER_PIN, 523, 250);
-    delay(230);
-    tone(BUZZER_PIN, 440, 250);
-    delay(230);
-    tone(BUZZER_PIN, 349, 250);
-    delay(230);
-    tone(BUZZER_PIN, 262, 500);
-    delay(480);
-    noTone(BUZZER_PIN);
+    soundPlay(DEATH_MELODY, NOTE_COUNT(DEATH_MELODY));
   }
 
   void playLowBatterySound() {
-    if (isQuietHours()) return;  // Silent during quiet hours
-    tone(BUZZER_PIN, 880, 150);
-    delay(140);
-    tone(BUZZER_PIN, 659, 150);
-    delay(140);
-    tone(BUZZER_PIN, 440, 200);
-    delay(190);
-    noTone(BUZZER_PIN);
+    soundPlay(LOW_BATTERY_MELODY, NOTE_COUNT(LOW_BATTERY_MELODY));
   }
 
   void playNewJobChirp() {
-    if (isQuietHours()) return;  // Silent during quiet hours
-    // Distinct attention-getting chirp - two rising tones
-    tone(BUZZER_PIN, 784, 150);  // G5
-    delay(130);
-    tone(BUZZER_PIN, 988, 150);  // B5
-    delay(130);
-    tone(BUZZER_PIN, 1175, 200); // D6
-    delay(180);
-    noTone(BUZZER_PIN);
+    // Distinct attention-getting chirp - rising G5, B5, D6
+    soundPlay(NEW_JOB_CHIRP, NOTE_COUNT(NEW_JOB_CHIRP));
   }
 
   void renderLowBatteryWarning(SSD1306Wire &display, int batteryPercent) {
@@ -1970,8 +2206,10 @@
     renderFactoryResetPrompt(selectedOption);
 
     while (millis() - lastInteraction < timeoutMs) {
-      bool externalState = digitalRead(BUTTON_PIN_EXTERNAL) == LOW;
-      bool prgState = digitalRead(BUTTON_PIN_PRG) == LOW;
+      esp_task_wdt_reset();
+      soundUpdate();
+      bool prgState, externalState;
+      readButtons(prgState, externalState);
 
       if (prgState) {
         return false;
@@ -1996,7 +2234,7 @@
           renderFactoryResetPrompt(selectedOption);
         } else if (holdPress) {
           if (selectedOption == 1) {
-            playMenuSelectTone();
+            playMenuSelectToneBlocking();  // Device reboots right after
             return true;
           } else {
             playButtonChirp();
@@ -2009,20 +2247,6 @@
     }
 
     return false;
-  }
-
-  void handleForceSync() {
-    display.clear();
-    display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 25, "Syncing...");
-    display.display();
-    
-    fetchGanamosConfig();
-    
-    display.clear();
-    display.drawString(64, 25, "Synced!");
-    display.display();
-    delay(1000);
   }
 
   void handleFactoryReset() {

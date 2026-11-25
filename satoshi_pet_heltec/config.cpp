@@ -1,14 +1,12 @@
 #include "config.h"
+#include "ca_roots.h"
+#include "economy.h"
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h> 
-#include <WiFiClient.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-
-
-// Removed unused legacy DeviceConfig and loadConfig()
+#include <WiFiClientSecure.h>
+#include <esp_task_wdt.h>
+#include <time.h>
 
 GanamosConfig ganamosConfig = {
   "",          // deviceId
@@ -18,8 +16,7 @@ GanamosConfig ganamosConfig = {
   0,           // balance
   0,           // coins
   0.0,         // btcPrice
-  20000,       // pollInterval
-  "",          // serverUrl
+  60,          // pollInterval (seconds)
   "",          // lastMessage
   "",          // lastMessageType
   "",          // lastPostTitle
@@ -30,8 +27,20 @@ GanamosConfig ganamosConfig = {
   "",          // rejectionMessage
   ""           // rejectionPostTitle
 };
-int consecutiveFailures = 0;
 int lastHttpCode = 0; // Track last HTTP response code
+
+static const char GANAMOS_BASE_URL[] = "https://www.ganamos.earth";
+static const uint16_t GANAMOS_HTTP_TIMEOUT_MS = 5000;
+static WiFiClientSecure* ganamosClient = nullptr;
+// One long-lived HTTPClient for this file's requests. HTTPClient's destructor
+// stops its client, so a function-local HTTPClient would close the shared
+// keep-alive connection every time it goes out of scope.
+static HTTPClient ganamosHttp;
+// Requests within one sync burst reuse the connection; after a longer idle
+// gap the server has likely closed it, so start fresh instead of failing on
+// a stale socket.
+static const unsigned long GANAMOS_KEEPALIVE_IDLE_MS = 10000;
+static unsigned long ganamosLastBegin = 0;
 
 // Attach device identity headers to a request
 void attachIdentityHeaders(HTTPClient& http) {
@@ -44,11 +53,61 @@ void attachIdentityHeaders(HTTPClient& http) {
   }
 }
 
+bool ganamosHttpBegin(HTTPClient& http, const String& path) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  if (!ganamosClient) {
+    // Created once and kept for the life of the firmware: avoids heap churn
+    // and lets HTTPClient reuse an open TLS session (keep-alive).
+    ganamosClient = new WiFiClientSecure();
+    if (!ganamosClient) {
+      return false;
+    }
+    ganamosClient->setCACert(GANAMOS_ROOT_CAS);
+    ganamosClient->setHandshakeTimeout(GANAMOS_HTTP_TIMEOUT_MS / 1000);
+  }
+
+  unsigned long now = millis();
+  if (ganamosLastBegin != 0 && now - ganamosLastBegin > GANAMOS_KEEPALIVE_IDLE_MS) {
+    ganamosClient->stop();
+  }
+  ganamosLastBegin = now;
+
+  if (!http.begin(*ganamosClient, String(GANAMOS_BASE_URL) + path)) {
+    return false;
+  }
+
+  http.setReuse(true);
+  http.setConnectTimeout(GANAMOS_HTTP_TIMEOUT_MS);
+  http.setTimeout(GANAMOS_HTTP_TIMEOUT_MS);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  attachIdentityHeaders(http);
+  http.addHeader("Content-Type", "application/json");
+  return true;
+}
+
+HTTPClient& ganamosSharedHttp() { return ganamosHttp; }
+
+void ganamosHttpReset() {
+  if (ganamosClient) {
+    ganamosClient->stop();
+  }
+}
+
 // Redact secrets for logs: show first 4 characters only
 String maskForLog(const String& value) {
   if (value.length() == 0) return "";
   int visible = value.length() < 4 ? value.length() : 4;
   return value.substring(0, visible) + "****";
+}
+
+// Assign only when the value changed, to avoid needless heap reallocations.
+static void assignIfChanged(String& dst, JsonVariantConst value) {
+  const char* s = value.as<const char*>();
+  if (!s) s = "";
+  if (dst != s) dst = s;
 }
 
 // Safe offline defaults match the live server configuration.
@@ -60,7 +119,6 @@ EconomyConfig economyConfig = {
 // Jobs data - cached from server
 Job cachedJobs[MAX_JOBS];
 int cachedJobCount = 0;
-String lastSeenJobId = "";
 
 // Format sats with k/M suffix for compact display
 String formatSatsShort(int sats) {
@@ -76,301 +134,281 @@ String formatSatsShort(int sats) {
   return String(sats);
 }
 
-bool fetchJobs() {
-  // Check WiFi status first
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("fetchJobs: WiFi not connected");
-    return false;
+// Parse a JSON response body. Streams straight from the socket when the
+// length is known; falls back to a String for chunked/unknown-length bodies
+// (ArduinoJson cannot de-chunk) so keep-alive stays possible.
+static DeserializationError parseJsonResponse(HTTPClient& http, JsonDocument& doc,
+                                              JsonDocument& filter, int maxBytes) {
+  int size = http.getSize();
+  if (size > maxBytes) {
+    return DeserializationError::InvalidInput;
   }
-  
+  if (size > 0) {
+    return deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  }
+  String body = http.getString();
+  if ((int)body.length() > maxBytes) {
+    return DeserializationError::InvalidInput;
+  }
+  return deserializeJson(doc, body, DeserializationOption::Filter(filter));
+}
+
+bool fetchJobs() {
   if (ganamosConfig.deviceId.length() == 0) {
     Serial.println("fetchJobs: No deviceId");
     return false;
   }
-  
-  WiFiClientSecure *client = new WiFiClientSecure;
-  if (!client) {
+
+  HTTPClient& http = ganamosHttp;
+  if (!ganamosHttpBegin(http, "/api/device/jobs?deviceId=" + ganamosConfig.deviceId)) {
+    Serial.println("fetchJobs: WiFi not connected");
     return false;
   }
-  
-  HTTPClient http;
-  
-  client->setInsecure();
-  client->setTimeout(5000);
-  client->setHandshakeTimeout(5);
-  
-  String url = "https://www.ganamos.earth/api/device/jobs?deviceId=" + ganamosConfig.deviceId;
-  
-  delay(100);
-  if (!http.begin(*client, url)) {
-    delete client;
-    return false;
-  }
-  
-  http.setTimeout(5000);
-  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  http.setReuse(false);
-  // Attach identity via headers (keep query param for temporary compatibility)
-  attachIdentityHeaders(http);
-  http.addHeader("Connection", "close");
-  
+
   int httpCode = http.GET();
-  
   if (httpCode != 200) {
     Serial.println("fetchJobs: HTTP error " + String(httpCode));
     http.end();
-    client->stop();
-    delete client;
+    if (httpCode < 0) ganamosHttpReset();
     return false;
   }
-  
-  String payload = http.getString();
-  
-  // Use DynamicJsonDocument for larger response
-  DynamicJsonDocument doc(4096);
-  DeserializationError error = deserializeJson(doc, payload);
-  
+
+  JsonDocument filter;
+  filter["success"] = true;
+  JsonObject jobFilter = filter["jobs"].add<JsonObject>();
+  jobFilter["id"] = true;
+  jobFilter["title"] = true;
+  jobFilter["reward"] = true;
+  jobFilter["location"] = true;
+  jobFilter["createdAt"] = true;
+  jobFilter["groupName"] = true;
+
+  JsonDocument doc;
+  DeserializationError error = parseJsonResponse(http, doc, filter, 16384);
+  http.end();
+
   if (error) {
     Serial.println("fetchJobs: JSON parse error");
-    http.end();
-    client->stop();
-    delete client;
     return false;
   }
-  
-  if (!doc["success"]) {
+
+  if (!(doc["success"] | false)) {
     Serial.println("fetchJobs: API returned success=false");
-    http.end();
-    client->stop();
-    delete client;
     return false;
   }
-  
-  // Parse jobs array
-  JsonArray jobs = doc["jobs"].as<JsonArray>();
+
   cachedJobCount = 0;
-  
-  for (JsonVariant jobVar : jobs) {
+  for (JsonVariantConst jobVar : doc["jobs"].as<JsonArrayConst>()) {
     if (cachedJobCount >= MAX_JOBS) break;
-    
-    JsonObject job = jobVar.as<JsonObject>();
-    cachedJobs[cachedJobCount].id = job["id"].as<String>();
-    cachedJobs[cachedJobCount].title = job["title"].as<String>();
-    cachedJobs[cachedJobCount].reward = job["reward"] | 0;
-    cachedJobs[cachedJobCount].location = job["location"].as<String>();
-    cachedJobs[cachedJobCount].createdAt = job["createdAt"].as<String>();
-    cachedJobs[cachedJobCount].groupName = job["groupName"].as<String>();
+    JsonObjectConst job = jobVar.as<JsonObjectConst>();
+    Job& slot = cachedJobs[cachedJobCount];
+    assignIfChanged(slot.id, job["id"]);
+    assignIfChanged(slot.title, job["title"]);
+    slot.reward = job["reward"] | 0;
+    assignIfChanged(slot.location, job["location"]);
+    assignIfChanged(slot.createdAt, job["createdAt"]);
+    assignIfChanged(slot.groupName, job["groupName"]);
     cachedJobCount++;
   }
-  
+
   Serial.println("fetchJobs: Loaded " + String(cachedJobCount) + " jobs");
-  
-  // Track newest job for notifications
-  if (cachedJobCount > 0) {
-    lastSeenJobId = cachedJobs[0].id;
+  return true;
+}
+
+// ===== Time zone =====
+static const char DEFAULT_TZ[] = "PST8PDT,M3.2.0,M11.1.0";
+static String currentTz;
+
+// A POSIX TZ string ("PST8PDT,M3.2.0,M11.1.0", "CET-1CEST,...", "<+0530>-5:30")
+// always has an offset digit and never contains '/' (IANA names do).
+static bool isPosixTz(const char* tz) {
+  if (!tz) return false;
+  size_t len = strlen(tz);
+  if (len < 4 || len > 60) return false;
+  if (strchr(tz, '/') != nullptr) return false;
+  for (size_t i = 0; i < len; i++) {
+    if (isdigit((unsigned char)tz[i])) return true;
   }
-  
+  return false;
+}
+
+void startTimeSync() {
+  if (currentTz.length() == 0) {
+    Preferences tzPrefs;
+    String saved;
+    if (tzPrefs.begin("satoshi-pet", true)) {
+      if (tzPrefs.isKey("tz")) saved = tzPrefs.getString("tz", "");
+      tzPrefs.end();
+    }
+    currentTz = isPosixTz(saved.c_str()) ? saved : String(DEFAULT_TZ);
+  }
+  configTzTime(currentTz.c_str(), "pool.ntp.org", "time.nist.gov");
+  Serial.println("NTP time sync initiated (TZ " + currentTz + ")");
+}
+
+static void applyServerTimezone(const char* tz) {
+  if (!isPosixTz(tz) || currentTz == tz) return;
+  currentTz = tz;
+  Preferences tzPrefs;
+  if (tzPrefs.begin("satoshi-pet", false)) {
+    tzPrefs.putString("tz", currentTz);
+    tzPrefs.end();
+  }
+  setenv("TZ", currentTz.c_str(), 1);
+  tzset();
+  Serial.println("Timezone updated from server: " + currentTz);
+}
+
+// ===== Device config =====
+static bool requestConfigOnce(HTTPClient& http, const String& path) {
+  lastHttpCode = 0;
+  if (!ganamosHttpBegin(http, path)) {
+    return false;
+  }
+  unsigned long started = millis();
+  lastHttpCode = http.GET();
+  if (lastHttpCode == 200) {
+    return true;
+  }
+  Serial.printf("Config request failed after %lums: %d %s\n", millis() - started,
+                lastHttpCode,
+                lastHttpCode < 0 ? HTTPClient::errorToString(lastHttpCode).c_str() : "");
+  if (lastHttpCode > 0) {
+    http.getString(); // Drain the error body so the connection stays reusable
+  }
   http.end();
-  client->stop();
-  delete client;
+  if (lastHttpCode < 0) {
+    ganamosHttpReset(); // Transport error: don't reuse this socket
+  }
+  return false;
+}
+
+// A transport error (no HTTP response at all) is retried once on a fresh
+// connection: the first request after the radio wakes can fail while the
+// network path settles, and one retry is cheaper than showing a warning and
+// waiting for the next poll.
+static bool requestConfig(HTTPClient& http, const String& path) {
+  if (requestConfigOnce(http, path)) return true;
+  if (lastHttpCode >= 0 || WiFi.status() != WL_CONNECTED) return false;
+  esp_task_wdt_reset();
+  Serial.println(F("Retrying config request on a new connection"));
+  return requestConfigOnce(http, path);
+}
+
+static bool parseConfigResponse(HTTPClient& http) {
+  JsonDocument filter;
+  filter["success"] = true;
+  JsonObject f = filter["config"].to<JsonObject>();
+  const char* const fields[] = {
+    "deviceId", "petName", "petType", "userName", "balance", "coins", "btcPrice",
+    "pollInterval", "lastMessage", "lastMessageType", "lastPostTitle",
+    "lastSenderName", "gameCost", "gameReward", "lastRejectionId",
+    "rejectionMessage", "rejectionPostTitle", "hungerDecayPer24h",
+    "happinessDecayPer24h", "coinsEarnedSinceLastSync", "hasNewJob",
+    "newJobTitle", "newJobReward", "timezone", "tz"
+  };
+  for (const char* field : fields) {
+    f[field] = true;
+  }
+
+  JsonDocument doc;
+  DeserializationError error = parseJsonResponse(http, doc, filter, 8192);
+  if (error) {
+    Serial.println("fetchGanamosConfig: JSON parse error: " + String(error.c_str()));
+    return false;
+  }
+  if (!(doc["success"] | false)) {
+    return false;
+  }
+
+  JsonObjectConst config = doc["config"].as<JsonObjectConst>();
+  const char* deviceId = config["deviceId"].as<const char*>();
+  if (deviceId && deviceId[0] && ganamosConfig.deviceId != deviceId) {
+    ganamosConfig.deviceId = deviceId;
+  }
+  if (config["petName"].is<const char*>()) assignIfChanged(ganamosConfig.petName, config["petName"]);
+  if (config["petType"].is<const char*>()) assignIfChanged(ganamosConfig.petType, config["petType"]);
+  assignIfChanged(ganamosConfig.userName, config["userName"]);
+  ganamosConfig.balance = config["balance"] | ganamosConfig.balance;
+  ganamosConfig.coins = config["coins"] | 0; // Default to 0 if not present (deprecated)
+  ganamosConfig.btcPrice = config["btcPrice"] | ganamosConfig.btcPrice;
+  ganamosConfig.pollInterval = config["pollInterval"] | 60; // seconds
+  assignIfChanged(ganamosConfig.lastMessage, config["lastMessage"]);
+  assignIfChanged(ganamosConfig.lastMessageType, config["lastMessageType"]);
+  assignIfChanged(ganamosConfig.lastPostTitle, config["lastPostTitle"]);
+  assignIfChanged(ganamosConfig.lastSenderName, config["lastSenderName"]);
+  // Pet care costs (with defaults)
+  ganamosConfig.gameCost = config["gameCost"] | 100;
+  ganamosConfig.gameReward = config["gameReward"] | 15;
+
+  // Parse fix rejection data
+  assignIfChanged(ganamosConfig.lastRejectionId, config["lastRejectionId"]);
+  assignIfChanged(ganamosConfig.rejectionMessage, config["rejectionMessage"]);
+  assignIfChanged(ganamosConfig.rejectionPostTitle, config["rejectionPostTitle"]);
+
+  // Economy parameters (with defaults)
+  if (config["hungerDecayPer24h"].is<float>()) {
+    economyConfig.hungerDecayPer24h = config["hungerDecayPer24h"].as<float>();
+  }
+  if (config["happinessDecayPer24h"].is<float>()) {
+    economyConfig.happinessDecayPer24h = config["happinessDecayPer24h"].as<float>();
+  }
+
+  // Optional POSIX time zone for quiet hours / pet clock
+  const char* tz = config["timezone"].is<const char*>() ? config["timezone"].as<const char*>()
+                                                        : config["tz"].as<const char*>();
+  if (tz) applyServerTimezone(tz);
+
+  // Apply coins earned from server
+  int coinsEarned = config["coinsEarnedSinceLastSync"] | 0;
+  if (coinsEarned > 0) {
+    extern int getLocalCoins();
+    extern void setLocalCoins(int coins);
+    setLocalCoins(getLocalCoins() + coinsEarned);
+  }
+
+  // Check for new job notification (triggerNewJobNotification plays the chirp)
+  if (config["hasNewJob"] | false) {
+    const char* jobTitle = config["newJobTitle"] | "";
+    int jobReward = config["newJobReward"] | 0;
+    if (jobTitle[0] && jobReward > 0) {
+      extern void triggerNewJobNotification(String title, int reward);
+      triggerNewJobNotification(String(jobTitle), jobReward);
+    }
+  }
   return true;
 }
 
 bool fetchGanamosConfig() {
-  // Check WiFi status first
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println(F("fetchGanamosConfig: WiFi not connected, skipping"));
-    return false;
-  }
-  
-  // Try DNS first, fall back to cached IP if DNS fails
-  // (Common pattern for IoT devices on unreliable networks)
-  IPAddress serverIP;
-  
-  if (!WiFi.hostByName("www.ganamos.earth", serverIP) || serverIP[0] == 0) {
-    // DNS failed - use fallback IP
-    serverIP = IPAddress(66, 33, 60, 35);
-  }
-  
-  WiFiClientSecure *client = new WiFiClientSecure;
-  if (!client) {
-    return false;
-  }
-  
-  HTTPClient http;
-  
-  // Configure SSL client with shorter timeout to prevent watchdog resets
-  client->setInsecure();  // Skip certificate validation
-  client->setTimeout(5000); // 5 second timeout (reduced from 10s to prevent watchdog)
-  client->setHandshakeTimeout(5); // 5 second SSL handshake timeout
-  
-  // Build URL using hostname (DNS is now resolved)
-  // Strategy: Try deviceId first (most reliable, never changes), then fallback to pairingCode
-  // This ensures we can reconnect even if pairing code changed but deviceId is still valid
-  
-  bool triedDeviceId = false;
-  bool triedPairingCode = false;
-  
-  // Try deviceId first if available
-  if (ganamosConfig.deviceId.length() > 0) {
-    triedDeviceId = true;
-    String url = "https://www.ganamos.earth/api/device/config?deviceId=" + ganamosConfig.deviceId;
-    
-    delay(100);
-    if (http.begin(*client, url)) {
-      http.setTimeout(5000);
-      http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-      http.setReuse(false);
-      // Identity headers preferred path
-      attachIdentityHeaders(http);
-      http.addHeader("Connection", "close");
-      
-      lastHttpCode = 0;
-      int httpCode = http.GET();
-      lastHttpCode = httpCode;
-      
-      if (httpCode == 200) {
-        goto process_success;
-      } else if (httpCode == 404) {
-        http.end();
-        // Continue to try pairing code
-      } else {
-        http.end();
-        client->stop();
-        delete client;
-        return false;
-      }
-    }
-  }
-  
-  // Fallback: Try pairingCode if deviceId failed or wasn't available
-  if (pairingCode.length() > 0 && (!triedDeviceId || lastHttpCode == 404)) {
-    triedPairingCode = true;
-    String url = "https://www.ganamos.earth/api/device/config?pairingCode=" + pairingCode;
-    
-    http.end();
-    client->stop();
-    delete client;
-    
-    client = new WiFiClientSecure;
-    if (!client) {
-      return false;
-    }
-    client->setInsecure();
-    client->setTimeout(5000);
-    client->setHandshakeTimeout(5);
-    
-    delay(100);
-    if (!http.begin(*client, url)) {
-      delete client;
-      return false;
-    }
-    
-    http.setTimeout(5000);
-    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-    http.setReuse(false);
-    // Include headers for pairing-code based fetch as well
-    attachIdentityHeaders(http);
-    http.addHeader("Connection", "close");
-    
     lastHttpCode = 0;
-    int httpCode = http.GET();
-    lastHttpCode = httpCode;
-    
-    if (httpCode == 200) {
-      goto process_success;
-    } else {
-      http.end();
-      client->stop();
-      delete client;
-      return false;
-    }
+    return false;
   }
-  
+
+  extern bool isPaired;
+  HTTPClient& http = ganamosHttp;
+  bool haveDeviceId = ganamosConfig.deviceId.length() > 0;
+  bool ok = false;
+
+  // Strategy: try deviceId first (stable). The pairing code is only a
+  // fallback while pairing is still in progress (no deviceId yet, or the
+  // deviceId was rejected and the device is not paired).
+  if (haveDeviceId) {
+    ok = requestConfig(http, "/api/device/config?deviceId=" + ganamosConfig.deviceId);
+  }
+  if (!ok && pairingCode.length() > 0 &&
+      (!haveDeviceId || (lastHttpCode == 404 && !isPaired))) {
+    esp_task_wdt_reset();
+    ok = requestConfig(http, "/api/device/config?pairingCode=" + pairingCode);
+  }
+  if (!ok) {
+    return false;
+  }
+
+  bool parsed = parseConfigResponse(http);
   http.end();
-  client->stop();
-  delete client;
-  return false;
-
-process_success:
-  // Process successful response (200 OK)
-  int httpCode = lastHttpCode;
-    String payload = http.getString();
-    
-    StaticJsonDocument<1024> doc;
-    DeserializationError error = deserializeJson(doc, payload);
-    
-    if (error) {
-      http.end();
-      delete client;
-      return false;
-    }
-    
-    if (!doc["success"]) {
-      http.end();
-      delete client;
-      return false;
-    }
-    
-    JsonObject config = doc["config"];
-    ganamosConfig.deviceId = config["deviceId"].as<String>();
-    ganamosConfig.petName = config["petName"].as<String>();
-    ganamosConfig.petType = config["petType"].as<String>();
-    ganamosConfig.userName = config["userName"].as<String>();
-    ganamosConfig.balance = config["balance"];
-    ganamosConfig.coins = config["coins"] | 0; // Default to 0 if not present (deprecated)
-    ganamosConfig.btcPrice = config["btcPrice"];
-    ganamosConfig.pollInterval = config["pollInterval"];
-    ganamosConfig.serverUrl = config["serverUrl"].as<String>();
-    ganamosConfig.lastMessage = config["lastMessage"].as<String>();
-    ganamosConfig.lastMessageType = config["lastMessageType"].as<String>();
-    ganamosConfig.lastPostTitle = config["lastPostTitle"].as<String>();
-    ganamosConfig.lastSenderName = config["lastSenderName"].as<String>();
-    // Pet care costs (with defaults)
-    ganamosConfig.gameCost = config["gameCost"] | 100;
-    ganamosConfig.gameReward = config["gameReward"] | 15;
-    
-    // Parse fix rejection data
-    ganamosConfig.lastRejectionId = config["lastRejectionId"].as<String>();
-    ganamosConfig.rejectionMessage = config["rejectionMessage"].as<String>();
-    ganamosConfig.rejectionPostTitle = config["rejectionPostTitle"].as<String>();
-
-    // Economy parameters (with defaults)
-    if (config.containsKey("hungerDecayPer24h")) {
-      economyConfig.hungerDecayPer24h = config["hungerDecayPer24h"];
-      economyConfig.happinessDecayPer24h = config["happinessDecayPer24h"];
-    }
-    
-    // Apply coins earned from server
-    int coinsEarned = config["coinsEarnedSinceLastSync"] | 0;
-    if (coinsEarned > 0) {
-      extern int getLocalCoins();
-      extern void setLocalCoins(int coins);
-      
-      int currentCoins = getLocalCoins();
-      setLocalCoins(currentCoins + coinsEarned);
-    }
-    
-    // Check for new job notification
-    bool hasNewJob = config["hasNewJob"] | false;
-    if (hasNewJob) {
-      String jobTitle = config["newJobTitle"].as<String>();
-      int jobReward = config["newJobReward"] | 0;
-      
-      if (jobTitle.length() > 0 && jobReward > 0) {
-      extern void triggerNewJobNotification(String title, int reward);
-      extern void playNewJobChirp();  // Add this
-      triggerNewJobNotification(jobTitle, jobReward);
-      playNewJobChirp();
-      }
-    }
-    
-    consecutiveFailures = 0;
-    
-    http.end();
-    client->stop();
-    delete client;
-    return true;
+  return parsed;
 }
 
 String pairingCode = "";
@@ -379,16 +417,14 @@ String generatePairingCode() {
   // Generate a 6-character alphanumeric code
   String code = "";
   const char chars[] = "ABCDEFGHIJKLMNPQRSTUVWXYZ123456789"; // Removed confusing chars like 0, O, I, 1
-  
+
   for (int i = 0; i < 6; i++) {
     code += chars[random(0, sizeof(chars) - 1)];
   }
-  
+
   pairingCode = code;
   return code;
 }
-
-// Removed unused displayPairingMode() function
 
 Preferences preferences;
 
@@ -468,77 +504,45 @@ void saveLastKnownCoins(int coins) {
   preferences.end();
 }
 
-bool spendCoins(int amount, String action) {
-  if (WiFi.status() != WL_CONNECTED) {
-    return false;
+// ===== WiFi fast-reconnect cache =====
+// Stored in its own namespace and only rewritten when the AP changes, so a
+// normal reconnect costs no flash writes.
+bool loadWifiFastConnect(uint8_t bssid[6], int32_t& channel) {
+  Preferences wifiPrefs;
+  if (!wifiPrefs.begin("sp-wifi", true)) return false;
+  bool ok = false;
+  if (wifiPrefs.isKey("bssid") && wifiPrefs.isKey("chan")) {
+    ok = wifiPrefs.getBytes("bssid", bssid, 6) == 6;
+    channel = wifiPrefs.getInt("chan", 0);
+    ok = ok && channel >= 1 && channel <= 14;
   }
-  
-  IPAddress serverIP;
-  if (!WiFi.hostByName("www.ganamos.earth", serverIP) || serverIP[0] == 0) {
-    serverIP = IPAddress(66, 33, 60, 35);
-  }
-  
-  WiFiClientSecure *client = new WiFiClientSecure;
-  if (!client) {
-    return false;
-  }
-  
-  HTTPClient http;
-  
-  // Configure SSL client
-  client->setInsecure();  // Skip certificate validation
-  client->setTimeout(5000); // 5 second timeout (reduced from 10s)
-  client->setHandshakeTimeout(5);  // 5 second handshake timeout
-  
-  String url = "https://www.ganamos.earth/api/device/spend-coins?deviceId=" + ganamosConfig.deviceId;
-  
-  lastHttpCode = 0;
-  delay(100);
-  
-  if (!http.begin(*client, url)) {
-    delete client;
-    return false;
-  }
-  
-  http.setTimeout(5000); // 5 second timeout (reduced from 10s to prevent watchdog)
-  
-  // Create JSON payload
-  StaticJsonDocument<200> doc;
-  doc["amount"] = amount;
-  doc["action"] = action;
-  
-  String payload;
-  serializeJson(doc, payload);
-  
-  // Prefer headers for identity
-  attachIdentityHeaders(http);
-  http.addHeader("Content-Type", "application/json");
-  int httpCode = http.POST(payload);
-  
-  if (httpCode == 200) {
-    String payload = http.getString();
-    
-    StaticJsonDocument<200> responseDoc;
-    DeserializationError error = deserializeJson(responseDoc, payload);
-    
-    if (!error && responseDoc["success"]) {
-      ganamosConfig.coins = responseDoc["newCoinBalance"];
-      http.end();
-      client->stop();
-      delete client;
-      return true;
-    }
-  }
-  
-  http.end();
-  client->stop();
-  delete client;
-  return false;
+  wifiPrefs.end();
+  return ok;
 }
 
-// Removed spendCoinsAsync() - replaced by offline economy system (spendCoinsLocal)
+void saveWifiFastConnect(const uint8_t* bssid, int32_t channel) {
+  if (!bssid || channel < 1 || channel > 14) return;
+  uint8_t oldBssid[6];
+  int32_t oldChannel = 0;
+  if (loadWifiFastConnect(oldBssid, oldChannel) && oldChannel == channel &&
+      memcmp(oldBssid, bssid, 6) == 0) {
+    return;
+  }
+  Preferences wifiPrefs;
+  if (!wifiPrefs.begin("sp-wifi", false)) return;
+  wifiPrefs.putBytes("bssid", bssid, 6);
+  wifiPrefs.putInt("chan", channel);
+  wifiPrefs.end();
+}
 
-bool submitGameScore(int score, GameScoreResponse &response) {
+void clearWifiFastConnect() {
+  Preferences wifiPrefs;
+  if (!wifiPrefs.begin("sp-wifi", false)) return;
+  wifiPrefs.clear();
+  wifiPrefs.end();
+}
+
+bool submitGameScore(int score, GameScoreResponse &response, uint8_t game) {
   response.success = false;
   response.isNewHighScore = false;
   response.isPersonalBest = false;
@@ -559,66 +563,39 @@ bool submitGameScore(int score, GameScoreResponse &response) {
 
   // If WiFi not connected, queue score for later sync
   if (WiFi.status() != WL_CONNECTED) {
-    extern bool queueGameScoreLocal(int score);
-    queueGameScoreLocal(score);
+    queueGameScoreLocal(score, game);
     return false;
   }
 
-  IPAddress serverIP;
-  if (!WiFi.hostByName("www.ganamos.earth", serverIP) || serverIP[0] == 0) {
-    serverIP = IPAddress(66, 33, 60, 35);
-  }
-
-  WiFiClientSecure *client = new WiFiClientSecure;
-  if (!client) {
-    return false;
-  }
-  client->setInsecure();
-  client->setTimeout(5000);
-  client->setHandshakeTimeout(5);
-
-  HTTPClient http;
-  String url = "https://www.ganamos.earth/api/device/game-score?deviceId=" + ganamosConfig.deviceId;
-
-  if (!http.begin(*client, url)) {
-    delete client;
+  HTTPClient& http = ganamosHttp;
+  if (!ganamosHttpBegin(http, "/api/device/game-score?deviceId=" + ganamosConfig.deviceId)) {
     return false;
   }
 
-  // Prefer headers for identity
-  attachIdentityHeaders(http);
-  http.addHeader("Content-Type", "application/json");
-
-  StaticJsonDocument<128> payloadDoc;
+  JsonDocument payloadDoc;
   payloadDoc["score"] = score;
+  payloadDoc["game"] = petGameApiName(game);
   String payload;
   serializeJson(payloadDoc, payload);
 
   int httpCode = http.POST(payload);
-
   if (httpCode != 200) {
     http.end();
-    client->stop();
-    delete client;
+    if (httpCode < 0) ganamosHttpReset();
     return false;
   }
 
   String body = http.getString();
+  http.end();
 
   // Safety checks
   if (body.length() > 3000 || !body.startsWith("{")) {
-    http.end();
-    client->stop();
-    delete client;
     return false;
   }
 
-  DynamicJsonDocument doc(2048);
+  JsonDocument doc;
   DeserializationError error = deserializeJson(doc, body);
   if (error) {
-    http.end();
-    client->stop();
-    delete client;
     return false;
   }
 
@@ -629,19 +606,19 @@ bool submitGameScore(int score, GameScoreResponse &response) {
   response.yourRank = doc["yourRank"] | 0;
   response.currentScoreRank = doc["currentScoreRank"] | 0;
 
-  JsonArray leaderboard = doc["leaderboard"].as<JsonArray>();
+  JsonArrayConst leaderboard = doc["leaderboard"].as<JsonArrayConst>();
   if (!leaderboard.isNull()) {
     int idx = 0;
-    for (JsonVariant entry : leaderboard) {
+    for (JsonVariantConst entry : leaderboard) {
       if (idx >= 4) break;
-      
-      if (!entry.is<JsonObject>()) {
+
+      if (!entry.is<JsonObjectConst>()) {
         continue;
       }
-      
+
       LeaderboardEntry &slot = response.leaderboard[idx];
       slot.rank = entry["rank"] | (idx + 1);
-      
+
       // Safety: Limit pet name length to prevent buffer issues
       const char* name = entry["petName"].as<const char*>();
       if (name && strlen(name) > 0) {
@@ -649,7 +626,7 @@ bool submitGameScore(int score, GameScoreResponse &response) {
       } else {
         slot.petName = "Pet";
       }
-      
+
       slot.score = entry["score"] | 0;
       slot.isYou = entry["isYou"] | false;
       response.leaderboardCount = idx + 1;
@@ -657,20 +634,16 @@ bool submitGameScore(int score, GameScoreResponse &response) {
     }
   }
 
-  if (doc.containsKey("yourEntry")) {
-    JsonObject personal = doc["yourEntry"].as<JsonObject>();
-    if (!personal.isNull()) {
-      response.hasPersonalEntry = true;
-      response.personalEntry.rank = personal["rank"] | response.yourRank;
-      response.personalEntry.petName = personal["petName"].as<const char*>() ? personal["petName"].as<const char*>() : ganamosConfig.petName;
-      response.personalEntry.score = personal["score"] | response.personalBest;
-      response.personalEntry.isYou = true;
-    }
+  if (doc["yourEntry"].is<JsonObjectConst>()) {
+    JsonObjectConst personal = doc["yourEntry"].as<JsonObjectConst>();
+    response.hasPersonalEntry = true;
+    response.personalEntry.rank = personal["rank"] | response.yourRank;
+    const char* personalName = personal["petName"].as<const char*>();
+    response.personalEntry.petName = personalName ? String(personalName) : ganamosConfig.petName;
+    response.personalEntry.score = personal["score"] | response.personalBest;
+    response.personalEntry.isYou = true;
   }
 
-  http.end();
-  client->stop();
-  delete client;
   return response.success;
 }
 
@@ -680,67 +653,39 @@ int getLastHttpCode() {
 
 // Mark a job as complete - sends request to server which emails the poster
 bool markJobComplete(String jobId) {
-  // Check WiFi status first
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("markJobComplete: WiFi not connected");
-    return false;
-  }
-  
   if (ganamosConfig.deviceId.length() == 0) {
     Serial.println("markJobComplete: No deviceId");
     return false;
   }
-  
+
   if (jobId.length() == 0) {
     Serial.println("markJobComplete: No jobId");
     return false;
   }
-  
-  WiFiClientSecure *client = new WiFiClientSecure;
-  if (!client) {
+
+  HTTPClient& http = ganamosHttp;
+  if (!ganamosHttpBegin(http, "/api/device/job-complete?deviceId=" + ganamosConfig.deviceId)) {
+    Serial.println("markJobComplete: WiFi not connected");
     return false;
   }
-  
-  HTTPClient http;
-  
-  client->setInsecure();
-  client->setTimeout(5000);
-  client->setHandshakeTimeout(5);
-  
-  String url = "https://www.ganamos.earth/api/device/job-complete?deviceId=" + ganamosConfig.deviceId;
-  
-  delay(100);
-  if (!http.begin(*client, url)) {
-    delete client;
-    return false;
-  }
-  
-  http.setTimeout(5000);
-  // Prefer headers for identity
-  attachIdentityHeaders(http);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Connection", "close");
-  
-  // Build JSON payload
-  StaticJsonDocument<128> doc;
+
+  JsonDocument doc;
   doc["jobId"] = jobId;
-  
   String payload;
   serializeJson(doc, payload);
-  
+
   Serial.println("📋 Marking job complete: " + jobId);
-  
+
   int httpCode = http.POST(payload);
-  
   bool success = false;
-  
+
   if (httpCode == 200) {
-    String response = http.getString();
-    
-    StaticJsonDocument<256> responseDoc;
-    DeserializationError error = deserializeJson(responseDoc, response);
-    
-    if (!error && responseDoc["success"]) {
+    JsonDocument filter;
+    filter["success"] = true;
+    JsonDocument responseDoc;
+    DeserializationError error = parseJsonResponse(http, responseDoc, filter, 2048);
+
+    if (!error && (responseDoc["success"] | false)) {
       success = true;
       Serial.println("✅ Job marked complete - notification sent to poster");
     } else {
@@ -749,10 +694,8 @@ bool markJobComplete(String jobId) {
   } else {
     Serial.println("❌ Job complete request failed (HTTP " + String(httpCode) + ")");
   }
-  
+
   http.end();
-  client->stop();
-  delete client;
-  
+  if (httpCode < 0) ganamosHttpReset();
   return success;
 }

@@ -1,4 +1,4 @@
-name: Pickleball single-player practice
+name: Pickleball solo (rally streak)
 version: 1
 author: Satoshi Pet
 steps:
@@ -14,7 +14,7 @@ steps:
   - set-control: { part-id: externalButton, control: pressed, value: 0 }
   - delay: 250ms
 
-  # Hold Play, select Pickle Practice, then hold to launch it.
+  # Hold Play, select Pickleball, hold it, then hold Solo (first item).
   - set-control: { part-id: externalButton, control: pressed, value: 1 }
   - delay: 1s
   - set-control: { part-id: externalButton, control: pressed, value: 0 }
@@ -26,6 +26,11 @@ steps:
   - set-control: { part-id: externalButton, control: pressed, value: 1 }
   - delay: 1s
   - set-control: { part-id: externalButton, control: pressed, value: 0 }
+  - delay: 300ms
+  - set-control: { part-id: externalButton, control: pressed, value: 1 }
+  - delay: 1s
+  - set-control: { part-id: externalButton, control: pressed, value: 0 }
 
-  - wait-serial: "Starting Pickleball Practice!"
-  - wait-serial: "Pickleball practice complete!"
+  # No presses: the first ball is missed and the rally ends at 0.
+  - wait-serial: "Starting Pickleball solo (rally streak)"
+  - wait-serial: "Pickleball rally over: 0 returns"

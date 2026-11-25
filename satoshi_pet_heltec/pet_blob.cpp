@@ -16,7 +16,9 @@ extern bool lastSyncSucceeded;
 #include "pet_sprites_simple.h"
 #include "display_assets.h"
 #include "food_bitmaps.h"
-// Removed unused animation variables 
+#include "sound.h"
+#include "hold_press.h"
+#include "button_handler.h"
 
 // Forward declarations
 void renderJobsList(SSD1306Wire &display, int selectedJob, int scrollOffset);
@@ -24,6 +26,35 @@ void renderJobDetail(SSD1306Wire &display, int jobIndex);
 void handleJobsMenu(SSD1306Wire &display);
 
 extern GanamosConfig ganamosConfig;
+
+PetKind petKindFromString(const String& petType) {
+  if (petType.equalsIgnoreCase("dog")) return PET_DOG;
+  if (petType.equalsIgnoreCase("squirrel")) return PET_SQUIRREL;
+  if (petType.equalsIgnoreCase("turtle")) return PET_TURTLE;
+  if (petType.equalsIgnoreCase("rabbit") || petType.equalsIgnoreCase("bunny")) return PET_BUNNY;
+  if (petType.equalsIgnoreCase("owl")) return PET_OWL;
+  return PET_CAT;  // "cat" and unknown types
+}
+
+// The pet type string only changes on a config fetch, so the enum is cached and
+// recomputed when the string differs (one String compare per call).
+static PetKind currentPetKind() {
+  static String cachedType;
+  static PetKind cachedKind = PET_CAT;
+  static bool cachedValid = false;
+  if (!cachedValid || cachedType != ganamosConfig.petType) {
+    cachedType = ganamosConfig.petType;
+    cachedKind = petKindFromString(cachedType);
+    cachedValid = true;
+  }
+  return cachedKind;
+}
+
+// Horizontal position of the pet sprite on the home screen. Sprite width and
+// height come from the per-pet animation table (getPetSpriteAnim).
+static int petSpriteHomeX(PetKind kind) {
+  return (kind == PET_BUNNY || kind == PET_OWL) ? 64 : 54;
+}
 
 bool showCelebration = false;
 unsigned long celebrationStart = 0;
@@ -49,10 +80,133 @@ String rejectionMessage = "";
 PetAnimationState currentAnimState = ANIM_DEFAULT;
 int eatAnimLoopsCompleted = 0;
 const int EAT_ANIM_TOTAL_LOOPS = 5;  // Number of eat animation cycles
+static int eatFoodIndex = -1;         // food being eaten (drawn at the mouth)
 
-   const uint8_t* getCurrentPetSprite(String animation) {
-     return getPetSprite(ganamosConfig.petType, ANIM_DEFAULT, 0); // Use default animation frame 0 for static contexts
-   }
+// ---- Pet animation timing ----
+// Real pets mostly sit still: idle holds the first (rest) frame for a random
+// 3-6 s, then plays the full idle sequence once (wink, sparkle...). Sad and
+// die play through once, hold their last frame, and replay their last frames
+// now and then. A 1 px "breath" bob runs while idle or sad.
+static const unsigned long ANIM_FRAME_MS = 400;
+enum AnimPhase : uint8_t { PHASE_REST, PHASE_GESTURE, PHASE_INTRO };
+static AnimPhase animPhase = PHASE_REST;
+static unsigned long animPhaseStart = 0;
+static unsigned long nextGestureAt = 0;
+static int currentAnimFrame = 0;
+static const int TAIL_GESTURE_FRAMES = 4;  // sad/die: frames replayed as a gesture
+
+static void scheduleGesture(unsigned long now, unsigned long minMs, unsigned long maxMs) {
+  nextGestureAt = now + (unsigned long)random((long)minMs, (long)maxMs + 1);
+}
+
+static void enterAnimState(PetAnimationState state, unsigned long now) {
+  currentAnimState = state;
+  currentAnimFrame = 0;
+  animPhaseStart = now;
+  eatAnimLoopsCompleted = 0;
+  if (state == ANIM_DEFAULT) {
+    animPhase = PHASE_REST;
+    scheduleGesture(now, 3000, 6000);
+  } else {
+    animPhase = PHASE_INTRO;  // sad/die play through; eat loops on its own
+  }
+}
+
+// Advances the animation and returns the frame to draw for `now`.
+static void advancePetAnimation(PetKind kind, unsigned long now) {
+  int count = getPetAnimFrameCount(kind, currentAnimState);
+  unsigned long elapsed = now - animPhaseStart;
+  int step = (int)(elapsed / ANIM_FRAME_MS);
+
+  if (currentAnimState == ANIM_EAT) {
+    if (step >= count) {
+      eatAnimLoopsCompleted++;
+      animPhaseStart += (unsigned long)count * ANIM_FRAME_MS;
+      step -= count;
+      if (eatAnimLoopsCompleted >= EAT_ANIM_TOTAL_LOOPS) {
+        eatFoodIndex = -1;
+        enterAnimState((petStats.fullness < 20 || petStats.happiness < 20) ? ANIM_SAD : ANIM_DEFAULT, now);
+        currentAnimFrame = 0;
+        return;
+      }
+    }
+    currentAnimFrame = step % count;
+    return;
+  }
+
+  if (currentAnimState == ANIM_DEFAULT) {
+    if (animPhase == PHASE_REST) {
+      currentAnimFrame = 0;
+      if ((long)(now - nextGestureAt) >= 0 && count > 1) {
+        animPhase = PHASE_GESTURE;
+        animPhaseStart = now;
+        currentAnimFrame = 1;
+      }
+    } else {  // gesture: frames 1..count-1 once
+      int frame = 1 + step;
+      if (frame >= count) {
+        animPhase = PHASE_REST;
+        currentAnimFrame = 0;
+        scheduleGesture(now, 3000, 6000);
+      } else {
+        currentAnimFrame = frame;
+      }
+    }
+    return;
+  }
+
+  // ANIM_SAD / ANIM_DIE
+  int tailStart = max(0, count - TAIL_GESTURE_FRAMES);
+  if (animPhase == PHASE_INTRO) {
+    if (step >= count - 1) {
+      animPhase = PHASE_REST;
+      currentAnimFrame = count - 1;
+      scheduleGesture(now, 4000, 8000);
+    } else {
+      currentAnimFrame = step;
+    }
+  } else if (animPhase == PHASE_REST) {
+    currentAnimFrame = count - 1;
+    if ((long)(now - nextGestureAt) >= 0) {
+      animPhase = PHASE_GESTURE;
+      animPhaseStart = now;
+      currentAnimFrame = tailStart;
+    }
+  } else {
+    int frame = tailStart + step;
+    if (frame >= count) {
+      animPhase = PHASE_REST;
+      currentAnimFrame = count - 1;
+      scheduleGesture(now, 4000, 8000);
+    } else {
+      currentAnimFrame = frame;
+    }
+  }
+}
+
+// True while frames change faster than the 1 s idle redraw (a gesture, an
+// intro or eating): the main loop then redraws every ANIM_FRAME_MS/2.
+bool petAnimating() {
+  return currentAnimState == ANIM_EAT || animPhase != PHASE_REST;
+}
+
+// 1 px breathing bob: up for the first half of each 2 s breath (idle and sad
+// only). Half a breath matches the 1 s idle redraw, so each redraw alternates.
+static int petBreathOffset(unsigned long now) {
+  if (currentAnimState != ANIM_DEFAULT && currentAnimState != ANIM_SAD) return 0;
+  return (now % 2000) < 1000 ? -1 : 0;
+}
+
+// Food at the pet's mouth while eating: the 48x48 icon pooled down to 16x16
+// (a pixel is set if any source pixel in its 3x3 block is), losing a bite
+// from the right every couple of chew loops.
+static void drawEatenFood(SSD1306Wire &display, int x, int y);
+
+// Last animation step drawn by each timed overlay; identical frames are not
+// re-sent to the OLED. Reset by the matching trigger function.
+static long lastCelebrationStepDrawn = -1;
+static long lastNewJobStepDrawn = -1;
+static long lastRejectionStepDrawn = -1;
 
 struct FoodOption {
   const char* name;
@@ -104,29 +258,49 @@ static int clampFoodIndex(int index) {
   return index;
 }
 
-// Get the appropriate food options array based on pet type
+// Get the appropriate food options array based on pet type.
+// "bunny" and "rabbit" both get rabbit food (they share the bunny sprites).
+// There is no owl-specific food art, so the owl uses the cat menu
+// (mouse/milk/tuna); unknown pet types also fall back to cat food.
 static const FoodOption* getPetFoodOptions() {
-  extern GanamosConfig ganamosConfig;
-  
-  if (ganamosConfig.petType == "cat") {
-    return CAT_FOOD_OPTIONS;
-  } else if (ganamosConfig.petType == "dog") {
-    return DOG_FOOD_OPTIONS;
-  } else if (ganamosConfig.petType == "rabbit") {
-    return RABBIT_FOOD_OPTIONS;
-  } else if (ganamosConfig.petType == "squirrel") {
-    return SQUIRREL_FOOD_OPTIONS;
-  } else if (ganamosConfig.petType == "turtle") {
-    return TURTLE_FOOD_OPTIONS;
-  } else {
-    // Default to cat food if pet type is unknown
-    return CAT_FOOD_OPTIONS;
+  switch (currentPetKind()) {
+    case PET_DOG: return DOG_FOOD_OPTIONS;
+    case PET_BUNNY: return RABBIT_FOOD_OPTIONS;
+    case PET_SQUIRREL: return SQUIRREL_FOOD_OPTIONS;
+    case PET_TURTLE: return TURTLE_FOOD_OPTIONS;
+    case PET_OWL:
+    case PET_CAT:
+    default: return CAT_FOOD_OPTIONS;
   }
 }
 
 static const FoodOption& getFoodOption(int index) {
   const FoodOption* options = getPetFoodOptions();
   return options[clampFoodIndex(index)];
+}
+
+static void drawEatenFood(SSD1306Wire &display, int x, int y) {
+  const unsigned char* bmp = getFoodOption(eatFoodIndex).bitmap;
+  // 16 columns shown, losing 5 per bite: whole, 2 bites, 3 bites, crumbs
+  static const int8_t COLS_LEFT[EAT_ANIM_TOTAL_LOOPS] = {16, 16, 11, 6, 3};
+  int cols = COLS_LEFT[constrain(eatAnimLoopsCompleted, 0, EAT_ANIM_TOTAL_LOOPS - 1)];
+  // Black backing so the food reads over the pet's chin
+  display.setColor(BLACK);
+  display.fillRect(x - 1, y - 1, cols + 2, 18);
+  display.setColor(WHITE);
+  for (int ty = 0; ty < 16; ty++) {
+    for (int tx = 0; tx < cols; tx++) {
+      bool on = false;
+      for (int dy = 0; dy < 3 && !on; dy++) {
+        const unsigned char* row = bmp + (ty * 3 + dy) * 6;  // 48 px = 6 bytes a row
+        for (int dx = 0; dx < 3 && !on; dx++) {
+          int sx = tx * 3 + dx;
+          on = (pgm_read_byte(row + (sx >> 3)) >> (sx & 7)) & 1;
+        }
+      }
+      if (on) display.setPixel(x + tx, y + ty);
+    }
+  }
 }
 
 int getFoodCostByIndex(int foodIndex) {
@@ -149,6 +323,7 @@ void triggerCelebration(int earnedSats, String message = "") {
   showCelebration = true;
   celebrationStart = millis();
   celebrationFrame = 0;
+  lastCelebrationStepDrawn = -1;
   satsEarned = earnedSats;
   celebrationMessage = message;
   Serial.println("🎉 CELEBRATION! Earned " + String(earnedSats) + " sats!");
@@ -165,6 +340,7 @@ void triggerCelebration(int earnedSats, String message = "") {
 void triggerNewJobNotification(String title, int reward) {
   showNewJobNotification = true;
   newJobNotificationStart = millis();
+  lastNewJobStepDrawn = -1;
   newJobTitle = title;
   newJobReward = reward;
   
@@ -186,6 +362,11 @@ void renderNewJobNotification(SSD1306Wire &display) {
   } else {
     digitalWrite(RGB_LED, LOW);
   }
+
+  // Only the coin animation changes (every 150 ms); skip identical frames.
+  long step = (long)((now - newJobNotificationStart) / 150);
+  if (step == lastNewJobStepDrawn) return;
+  lastNewJobStepDrawn = step;
   
   display.clear();
   display.setFont(ArialMT_Plain_16);
@@ -217,6 +398,7 @@ void renderNewJobNotification(SSD1306Wire &display) {
 void triggerRejection(String message) {
   showRejection = true;
   rejectionStart = millis();
+  lastRejectionStepDrawn = -1;
   rejectionMessage = message;
   Serial.println("❌ FIX REJECTED! " + message);
   
@@ -233,6 +415,11 @@ void renderRejection(SSD1306Wire &display) {
     showRejection = false;
     return;
   }
+
+  // The X marks blink every 150 ms; skip identical frames.
+  long step = (long)(elapsed / 150);
+  if (step == lastRejectionStepDrawn) return;
+  lastRejectionStepDrawn = step;
   
   display.clear();
   display.setFont(ArialMT_Plain_16);
@@ -291,19 +478,21 @@ void renderScreensaver(SSD1306Wire &display, int satoshis) {
   
   // Note: During animated screensaver, display stays at normal brightness
   // Display OFF happens later (after 1 more minute) for power saving
+
+  // The frame only advances every 500 ms; don't resend an identical frame.
+  // (Re-entering the screensaver after a pause always advances the frame.)
+  static int lastDrawnScreensaverFrame = -1;
+  if (screensaverFrame == lastDrawnScreensaverFrame) return;
+  lastDrawnScreensaverFrame = screensaverFrame;
   
   display.clear();
   display.setTextAlignment(TEXT_ALIGN_CENTER);
   
-  // Draw pet sprite centered and moved up
+  // Draw pet sprite centered and moved up, using the pet's real dimensions
+  PetKind kind = currentPetKind();
+  const PetSpriteAnim& anim = getPetSpriteAnim(kind, ANIM_DEFAULT);
   int spriteFrame = (screensaverFrame / 2) % 3;
-  const uint8_t* sprite = getPetSprite(ganamosConfig.petType, ANIM_DEFAULT, spriteFrame);
-  
-  // Handle bunny's different dimensions (default is 50x50)
-  int spriteWidth = (ganamosConfig.petType == "bunny" || ganamosConfig.petType == "rabbit") ? BUNNY_DEFAULT_WIDTH : SPRITE_WIDTH;
-  int spriteHeight = (ganamosConfig.petType == "bunny" || ganamosConfig.petType == "rabbit") ? BUNNY_DEFAULT_HEIGHT : SPRITE_HEIGHT;
-  
-  display.drawXbm(34, 6, spriteWidth, spriteHeight, sprite);
+  display.drawXbm(34, 6, anim.width, anim.height, getPetSprite(kind, ANIM_DEFAULT, spriteFrame));
   
   // Draw floating bitcoin coins at different positions
   int coinFrame = screensaverFrame % 4;
@@ -338,10 +527,11 @@ void renderCelebration(SSD1306Wire &display) {
     digitalWrite(RGB_LED, LOW);
   }
   
-  // Update animation frame every 150ms for smoother spinning bitcoins
-  if (now - celebrationStart > (celebrationFrame * 150)) {
-    celebrationFrame++;
-  }
+  // Animation frame advances every 150ms; the coins change every 2 frames.
+  celebrationFrame = (int)((now - celebrationStart) / 150);
+  long step = celebrationFrame / 2;
+  if (step == lastCelebrationStepDrawn) return;  // identical frame already shown
+  lastCelebrationStepDrawn = step;
   
   display.clear();
   display.setTextAlignment(TEXT_ALIGN_CENTER);
@@ -407,23 +597,19 @@ void initPet(String petType) {
   // Initialize pet stats based on type
   petStats.happiness = 50;  // Start at neutral happiness
   petStats.fullness = 50;   // Start at neutral fullness
-  petStats.age = 0;
-  petStats.sleeping = false;
-  petStats.lastFeed = millis();
-  petStats.lastActivity = millis();
   petStats.lastUpdate = millis();  // Initialize entropy tracking
   
   Serial.println("Initialized " + petType + " pet with default stats");
 }
 
+// Intentionally empty: mood is driven by updatePetStats(). Kept only because
+// the .ino still calls it; safe to delete together with that call.
 void updatePetMood(int price, int sats) {
-  // This function is now handled by updatePetStats()
-  // Price changes don't affect pet mood anymore (removed happiness)
-  static int lastPrice = price;
-  lastPrice = price;
+  (void)price;
+  (void)sats;
 }
 
-PetStats petStats = {50, 50, 0, false, 0, 0, 0}; // happiness, fullness, age, sleeping, lastFeed, lastActivity, lastUpdate (7 values total)
+PetStats petStats = {50, 50, 0, 0}; // happiness, fullness, lastUpdate, lastActivity
 
 static float hungerDecayRemainder = 0.0f;
 static float happinessDecayRemainder = 0.0f;
@@ -442,7 +628,65 @@ static void applyDecayForMilliseconds(unsigned long elapsedMs) {
   petStats.happiness = max(0, petStats.happiness - happinessPoints);
 }
 
+// --- Offline decay across reboots -----------------------------------------
+// The device saves the epoch with its stats. At boot NTP is usually not synced
+// yet, so the offline gap is applied the first time a valid wall-clock time is
+// available (checked in the 60 s block of updatePetStats).
+static const time_t MIN_VALID_EPOCH = 1600000000;  // Sep 2020
+static uint32_t petBaseEpoch = 0;          // epoch the loaded stats were saved at (0 = unknown)
+static unsigned long petBaseMillis = 0;    // millis() when the stats were loaded
+static bool offlineDecayPending = false;   // offline gap not applied yet
+
+static bool currentEpoch(time_t& out) {
+  time_t t = time(nullptr);
+  if (t > MIN_VALID_EPOCH) {
+    out = t;
+    return true;
+  }
+  return false;
+}
+
+// Epoch up to which decay has already been applied to petStats. Before the
+// offline gap is applied (or while the clock is unknown) this is the loaded
+// epoch plus uptime, so a reboot before NTP sync never loses the saved epoch.
+static uint32_t accountedEpoch() {
+  time_t now;
+  if (!offlineDecayPending && currentEpoch(now)) return (uint32_t)now;
+  if (petBaseEpoch == 0) return 0;
+  return petBaseEpoch + (uint32_t)((millis() - petBaseMillis) / 1000UL);
+}
+
+// Applies the offline gap once a valid time exists. Returns true if the stats
+// should be saved (decay applied or the stored epoch needs correcting).
+static bool tryApplyOfflineDecay() {
+  if (!offlineDecayPending) return false;
+  time_t now;
+  if (!currentEpoch(now)) return false;
+
+  const uint32_t accounted = accountedEpoch();
+  offlineDecayPending = false;
+  const long elapsedSeconds = (long)((int64_t)now - (int64_t)accounted);
+
+  if (elapsedSeconds < 0) {
+    Serial.println("Pet stats: saved time is in the future; skipping offline decay");
+    return true;  // re-save with the real epoch
+  }
+  if (elapsedSeconds == 0) return false;
+
+  const int oldFullness = petStats.fullness;
+  const int oldHappiness = petStats.happiness;
+  // More than 30 days already takes both meters to zero at current rates;
+  // cap the conversion so seconds-to-milliseconds cannot overflow uint32_t.
+  const unsigned long cappedSeconds = min((unsigned long)elapsedSeconds, 30UL * 86400UL);
+  applyDecayForMilliseconds(cappedSeconds * 1000UL);
+  Serial.printf("Pet stats: offline %ld min; fullness %d -> %d, happiness %d -> %d\n",
+                elapsedSeconds / 60, oldFullness, petStats.fullness, oldHappiness, petStats.happiness);
+  return true;
+}
+
 void updatePetStats(int newBalance, int oldBalance) {
+  (void)newBalance;
+  (void)oldBalance;
   unsigned long now = millis();
   
   // Note: Earning sats no longer automatically feeds pet
@@ -456,105 +700,86 @@ void updatePetStats(int newBalance, int oldBalance) {
     
     int oldFullness = petStats.fullness;
     int oldHappiness = petStats.happiness;
-    
+
+    bool dirty = tryApplyOfflineDecay();
     applyDecayForMilliseconds(elapsedMs);
     
     petStats.lastUpdate = now;
     
     // Save pet stats to flash if they changed due to entropy
-    if (oldFullness != petStats.fullness || oldHappiness != petStats.happiness) {
+    if (dirty || oldFullness != petStats.fullness || oldHappiness != petStats.happiness) {
       savePetStats();
     }
   }
-  
-  // Sleep cycle (pet sleeps at night using real time)
-  // Use 10ms timeout to prevent blocking when WiFi/NTP unavailable
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo, 10)) {  // 10ms timeout instead of default 5000ms!
-    int hour = timeinfo.tm_hour;
-    petStats.sleeping = (hour >= 22 || hour <= 6);
-  } else {
-    // If time not available, don't change sleep state
-    petStats.sleeping = false;
-  }
 }
 
-String getPetAnimation() {
-  if (petStats.sleeping) return "sleeping";
-  if (petStats.fullness < 20) return "hungry"; // Low fullness (starving)
-  if (petStats.happiness > 70 && petStats.fullness > 70) return "happy"; // Very happy and well-fed
-  if (petStats.happiness < 30 || petStats.fullness < 30) return "sick";  // Unhappy or very empty
-  return "idle";
+// Writes the last known sats balance and coin count with one NVS session,
+// skipping keys whose value did not change.
+static int persistedLastBalance = -1;
+static int persistedLastCoins = -1;
+static void persistLastKnownBalances(int sats, int coins) {
+  if (sats == persistedLastBalance && coins == persistedLastCoins) return;
+  extern Preferences preferences;
+  if (!preferences.begin("satoshi-pet", false)) return;
+  if (sats != persistedLastBalance) preferences.putInt("lastBalance", sats);
+  if (coins != persistedLastCoins) preferences.putInt("lastCoins", coins);
+  preferences.end();
+  persistedLastBalance = sats;
+  persistedLastCoins = coins;
 }
 
-void renderPet(SSD1306Wire &display, int btcPrice, int satoshis, int batteryPercent) {
-  unsigned long funcStart = millis();
+// Balance bookkeeping driven by renderPet(): detects earned sats (celebration),
+// persists the last known balance, and advances pet decay.
+static void trackBalanceChange(int satoshis) {
   static int oldBalance = -1; // Initialize to -1 to detect first balance
   static bool firstRun = true;
   static bool firstSyncAfterBoot = true; // Skip celebration on first sync after boot
-  static unsigned long lastFrameUpdate = 0;
-  static int currentAnimFrame = 0;
-  
+
   // On first run, load the last known balance from flash to prevent false celebrations
   if (firstRun) {
-    extern int loadLastKnownBalance();
     oldBalance = loadLastKnownBalance();
+    persistedLastBalance = oldBalance;
     Serial.println("Loaded last known balance from flash: " + String(oldBalance) + " sats");
     firstRun = false;
   }
-  
+
   // On first sync after boot: silently update oldBalance to current balance without celebration
   // This handles the case where the device was off and balance changed - we don't want to celebrate that
   if (firstSyncAfterBoot) {
     // Only update if we actually got a new balance from API (satoshis > 0)
     // If satoshis is still 0, it means API hasn't fetched yet - don't update oldBalance
     if (satoshis > 0) {
-      Serial.println("📊 First sync after boot - Balance: " + String(satoshis) + " sats (no celebration)");
-      Serial.println("📊 Previous balance was: " + String(oldBalance) + " sats");
-      int previousBalance = oldBalance; // Save previous balance before updating
-      
-      // Only save to flash if we have a valid balance from API
-      extern void saveLastKnownBalance(int balance);
-      extern void saveLastKnownCoins(int coins);
-      saveLastKnownBalance(satoshis);
-      extern int getLocalCoins();
-      saveLastKnownCoins(getLocalCoins());
-      Serial.println("💾 Saved balance and coins to flash: " + String(satoshis) + " sats, " + String(getLocalCoins()) + " coins");
-      
-      // Update pet stats with the actual previous balance (but don't celebrate)
-      // We pass the previous balance so stats update correctly, but no celebration happens
+      Serial.println("First sync after boot - balance " + String(satoshis) + " sats (was " + String(oldBalance) + ", no celebration)");
+      int previousBalance = oldBalance;
+      persistLastKnownBalances(satoshis, getLocalCoins());
       updatePetStats(satoshis, previousBalance);
-      
-      // Set oldBalance to current balance and mark first sync as complete
       oldBalance = satoshis;
       firstSyncAfterBoot = false;
     }
-    // If satoshis is 0, keep firstSyncAfterBoot = true and use oldBalance from flash
-    // Skip celebration check for first sync - just render the display
-    // Continue to render below
-  } else {
-    // After first sync is complete, check for actual sats earned
-    if (satoshis > oldBalance && oldBalance >= 0) {
-      int earned = satoshis - oldBalance;
-      // Normal operation - celebrate the earnings!
-      Serial.println("🎉 BALANCE INCREASED! Old: " + String(oldBalance) + " New: " + String(satoshis) + " Earned: " + String(earned));
-      triggerCelebration(earned, ganamosConfig.lastMessage);
-    }
-    
-    // ALWAYS save the current balance and coins to flash (not just on increases)
-    // This ensures we have the latest values even if device powers off
-    if (satoshis != oldBalance) {
-      extern void saveLastKnownBalance(int balance);
-      extern void saveLastKnownCoins(int coins);
-      extern int getLocalCoins();
-      saveLastKnownBalance(satoshis);
-      saveLastKnownCoins(getLocalCoins());
-      Serial.println("💾 Saved balance and coins to flash: " + String(satoshis) + " sats, " + String(getLocalCoins()) + " coins");
-    }
-    
-    updatePetStats(satoshis, oldBalance);
-    oldBalance = satoshis;
+    return;
   }
+
+  // After first sync is complete, check for actual sats earned
+  if (satoshis > oldBalance && oldBalance >= 0) {
+    int earned = satoshis - oldBalance;
+    Serial.println("BALANCE INCREASED! Old: " + String(oldBalance) + " New: " + String(satoshis) + " Earned: " + String(earned));
+    triggerCelebration(earned, ganamosConfig.lastMessage);
+  }
+
+  // Persist the latest balance (and coins) whenever the balance changes so
+  // the value survives a power-off.
+  if (satoshis != oldBalance) {
+    persistLastKnownBalances(satoshis, getLocalCoins());
+  }
+
+  updatePetStats(satoshis, oldBalance);
+  oldBalance = satoshis;
+}
+
+void renderPet(SSD1306Wire &display, int btcPrice, int satoshis, int batteryPercent) {
+  unsigned long funcStart = millis();
+
+  trackBalanceChange(satoshis);
   
   // Check if we should show celebration
   if (showCelebration) {
@@ -580,46 +805,12 @@ void renderPet(SSD1306Wire &display, int btcPrice, int satoshis, int batteryPerc
     targetAnimState = ANIM_DEFAULT;
   }
   
-  // If animation state changed (and not from eat), reset frame counter
-  if (targetAnimState != currentAnimState && currentAnimState != ANIM_EAT) {
-    currentAnimFrame = 0;
-    currentAnimState = targetAnimState;
-    eatAnimLoopsCompleted = 0;
-  }
-  
-  // Update animation frame every 400ms for smoother animations
+  // State changes restart the animation; eating finishes before it changes.
   unsigned long now = millis();
-  if (now - lastFrameUpdate > 400) {
-    currentAnimFrame++;
-    
-    // Handle eat animation looping (3 complete loops then back to default/sad)
-    if (currentAnimState == ANIM_EAT) {
-      // Get frame count for current pet's eat animation
-      int maxFrames = (ganamosConfig.petType == "cat") ? CAT_EAT_FRAMES :
-                      (ganamosConfig.petType == "dog") ? DOG_EAT_FRAMES :
-                      (ganamosConfig.petType == "squirrel") ? SQUIRREL_EAT_FRAMES :
-                      (ganamosConfig.petType == "turtle") ? TURTLE_EAT_FRAMES :
-                      (ganamosConfig.petType == "rabbit" || ganamosConfig.petType == "bunny") ? BUNNY_EAT_FRAMES : 8;
-      
-      if (currentAnimFrame >= maxFrames) {
-        eatAnimLoopsCompleted++;
-        currentAnimFrame = 0;
-        
-        if (eatAnimLoopsCompleted >= EAT_ANIM_TOTAL_LOOPS) {
-          // Eat animation complete, transition back to appropriate state
-          eatAnimLoopsCompleted = 0;
-          if (petStats.fullness < 20 || petStats.happiness < 20) {
-            currentAnimState = ANIM_SAD;
-          } else {
-            currentAnimState = ANIM_DEFAULT;
-          }
-          currentAnimFrame = 0;
-        }
-      }
-    }
-    
-    lastFrameUpdate = now;
+  if (targetAnimState != currentAnimState && currentAnimState != ANIM_EAT) {
+    enterAnimState(targetAnimState, now);
   }
+  advancePetAnimation(currentPetKind(), now);
   
   unsigned long preDrawTime = millis() - funcStart;
   if (preDrawTime > 50) {
@@ -640,29 +831,31 @@ void renderPet(SSD1306Wire &display, int btcPrice, int satoshis, int batteryPerc
   String shortName = ganamosConfig.petName;
   while (shortName.length() && display.getStringWidth(shortName) > 62) shortName.remove(shortName.length() - 1);
   display.drawString(0, 0, shortName);
-  const char* syncStatus = WiFi.status() != WL_CONNECTED ? "Offline"
-    : getPendingSpendCount() || getPendingGameScoreCount() ? "Queued"
-    : !lastSyncSucceeded ? "Stale" : "";
-  display.setTextAlignment(TEXT_ALIGN_RIGHT);
-  display.drawString(106, 0, syncStatus);
-  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  // Sync status just left of the battery: nothing when synced, animated dots
+  // while connecting/syncing, an icon only once something actually failed.
+  static const uint8_t ICON_WIFI_OFF[] = {  // WiFi with a slash: no WiFi
+    0x7A, 0x00, 0x86, 0x00, 0x29, 0x01, 0x54, 0x00, 0x30, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x01 };
+  static const uint8_t ICON_WARNING[] = {   // warning triangle: last sync failed
+    0x10, 0x00, 0x28, 0x00, 0x28, 0x00, 0x54, 0x00, 0x54, 0x00, 0x82, 0x00, 0x92, 0x00, 0xFF, 0x01 };
+  static const uint8_t ICON_UPLOAD[] = {    // up arrow: feedings/scores waiting to upload
+    0x10, 0x00, 0x38, 0x00, 0x54, 0x00, 0x92, 0x00, 0x10, 0x00, 0x10, 0x00, 0x00, 0x00, 0xFE, 0x00 };
+  extern bool wifiConnecting;
+  extern bool syncPending;
+  extern bool syncAttempted;
+  const uint8_t* statusIcon = nullptr;
+  if (syncPending || wifiConnecting) {
+    // Syncing (e.g. just woke up): animated ". .. ..." rather than a warning
+    int dots = (millis() / 400) % 3 + 1;
+    for (int i = 0; i < dots; i++) display.fillRect(128 - 18 - 11 + i * 3, 5, 2, 2);
+  } else if (WiFi.status() != WL_CONNECTED) {
+    statusIcon = ICON_WIFI_OFF;                 // couldn't connect
+  } else if (getPendingSpendCount() || getPendingGameScoreCount()) {
+    statusIcon = ICON_UPLOAD;
+  } else if (syncAttempted && !lastSyncSucceeded) {
+    statusIcon = ICON_WARNING;                  // a sync was tried and failed
+  }
+  if (statusIcon) display.drawXbm(128 - 18 - 12, 0, 9, 8, statusIcon);
   
-  // // Top right: Lightning bolt icon + Battery percentage (above pet sprite which starts at y=12)
-  // // Calculate position: text is right-aligned, icon is to the left of text
-  // String batteryText = String(batteryPercent) + "%";
-  // int textWidth = batteryText.length() * 6;  // Approximate width (6px per char in ArialMT_Plain_10)
-  // int iconWidth = 8;
-  // int gap = 2;  // 2px gap between icon and text
-  // int totalWidth = iconWidth + gap + textWidth;
-  // int startX = 128 - totalWidth;
-
-  //   // Draw lightning bolt icon (8x10 pixels)
-  // display.drawXbm(startX, 0, 8, 10, epd_bitmap_bolt);
-  
-  // // Draw battery percentage after icon
-  // display.setTextAlignment(TEXT_ALIGN_LEFT);
-  // display.drawString(startX + iconWidth + gap, 0, batteryText);
-
     // Top right: Battery icon (16x8 pixels, right-aligned)
   extern int getBatteryLevel();
   extern bool isBatteryCharging();
@@ -734,37 +927,22 @@ void renderPet(SSD1306Wire &display, int btcPrice, int satoshis, int batteryPerc
 
   display.drawString(0, 54, satsText);
 
-  // Right side: Draw pet sprite - position varies by pet type (60x51px, bunny varies)
-  display.setTextAlignment(TEXT_ALIGN_CENTER);
-  
-  // Get the appropriate sprite for the pet type with animation frame
-  const uint8_t* sprite = getPetSprite(ganamosConfig.petType, currentAnimState, currentAnimFrame);
-  
-    // Determine sprite dimensions based on pet type and animation state
-  int spriteWidth, spriteHeight, spriteX;
-  if (ganamosConfig.petType == "bunny" || ganamosConfig.petType == "rabbit") {
-    // Bunny: default is 50x50, eat/sad/die are 55x55
-    if (currentAnimState == ANIM_DEFAULT) {
-      spriteWidth = BUNNY_DEFAULT_WIDTH;   // 50
-      spriteHeight = BUNNY_DEFAULT_HEIGHT; // 50
-    } else {
-      spriteWidth = BUNNY_SPRITE_WIDTH;   // 55
-      spriteHeight = BUNNY_SPRITE_HEIGHT; // 55
-    }
-    spriteX = 64; // Bunny position (moved 8px left from 72)
-  } else if (ganamosConfig.petType == "owl") {
-    // Owl: all animations are 50x50
-    spriteWidth = 50;
-    spriteHeight = 50;
-    spriteX = 64; // Same position as bunny (fits similar size)
-  } else {
-    // Cat, dog, squirrel, turtle are all 60x51
-    spriteWidth = SPRITE_WIDTH;   // 60
-    spriteHeight = SPRITE_HEIGHT; // 51
-    spriteX = 54; // Other pets position (moved 8px left from 62)
+  // Right side: Draw pet sprite - position and size vary by pet type/animation
+  PetKind kind = currentPetKind();
+  const PetSpriteAnim& anim = getPetSpriteAnim(kind, currentAnimState);
+  const uint8_t* sprite = getPetSprite(kind, currentAnimState, currentAnimFrame);
+  // Sprites differ in size between states (bunny: 50 px idle, 55 px eating),
+  // so centre each one on the same point and stand it on the bottom row
+  // instead of pinning its top-left corner; the pet no longer jumps.
+  const PetSpriteAnim& home = getPetSpriteAnim(kind, ANIM_DEFAULT);
+  int centreX = petSpriteHomeX(kind) + home.width / 2;
+  int spriteX = centreX - anim.width / 2;
+  int spriteY = 64 - anim.height + petBreathOffset(millis());
+  display.drawXbm(spriteX, spriteY, anim.width, anim.height, sprite);
+  if (currentAnimState == ANIM_EAT && eatFoodIndex >= 0) {
+    // At the chin; the owl's beak sits higher on its taller body
+    drawEatenFood(display, centreX - 8, kind == PET_OWL ? 64 - 28 : 64 - 18);
   }
-  
-  display.drawXbm(spriteX, 12, spriteWidth, spriteHeight, sprite);
 
   unsigned long drawTime = millis() - drawStart;
   if (drawTime > 50) {
@@ -810,7 +988,7 @@ void renderMenu(SSD1306Wire &display, int menuOption) {
   
   display.setFont(ArialMT_Plain_10);
   display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.drawString(64, 50, "Tap: next  Hold: pick");
+  if (holdHintsVisible()) display.drawString(64, 50, "Tap: next  Hold: pick");
   display.display();
 }
 
@@ -824,24 +1002,7 @@ static unsigned long lastMarqueeUpdate = 0;
 static int lastSelectedJob = -1;
 const int MARQUEE_SPEED_MS = 150;  // Scroll speed (lower = faster)
 const int MARQUEE_PAUSE_MS = 1500; // Pause at start before scrolling
-const int MAX_TITLE_CHARS = 20;    // Characters that fit without scrolling
-
-// Format date string from ISO to "Dec 7" format
-String formatJobDate(String isoDate) {
-  if (isoDate.length() < 10) return isoDate;
-  
-  // Parse month and day from "2025-12-07T..."
-  int month = isoDate.substring(5, 7).toInt();
-  int day = isoDate.substring(8, 10).toInt();
-  
-  const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-  
-  if (month >= 1 && month <= 12) {
-    return String(months[month - 1]) + " " + String(day);
-  }
-  return isoDate.substring(5, 10);
-}
+const int JOB_TITLE_VISIBLE_CHARS = 15; // Title chars shown in the list before truncating/scrolling
 
 void renderJobsList(SSD1306Wire &display, int selectedJob, int scrollOffset) {
   extern Job cachedJobs[];
@@ -863,7 +1024,6 @@ void renderJobsList(SSD1306Wire &display, int selectedJob, int scrollOffset) {
   // selectedJob == cachedJobCount means "Back" is selected
   const int rowHeight = 15;      // Height per row (10pt font + padding)
   const int visibleItems = 4;
-  const int maxTitleChars = 15;  // Chars before truncation
   const int totalItems = cachedJobCount + 1;  // +1 for Back option
   
   int startIdx = scrollOffset;
@@ -887,7 +1047,7 @@ void renderJobsList(SSD1306Wire &display, int selectedJob, int scrollOffset) {
     String title = job.title;
     
     // Marquee scrolling for selected job if title is too long
-    if (isSelected && title.length() > maxTitleChars) {
+    if (isSelected && title.length() > JOB_TITLE_VISIBLE_CHARS) {
       unsigned long now = millis();
       
       // Reset marquee when selection changes
@@ -898,7 +1058,7 @@ void renderJobsList(SSD1306Wire &display, int selectedJob, int scrollOffset) {
       }
       
       // Calculate visible portion with scrolling
-      int maxScroll = title.length() - maxTitleChars + 3; // +3 for "..." effect
+      int maxScroll = title.length() - JOB_TITLE_VISIBLE_CHARS + 3; // +3 for "..." effect
       
       // Pause at start, then scroll
       if (now - lastMarqueeUpdate > MARQUEE_PAUSE_MS || jobsMarqueeOffset > 0) {
@@ -913,10 +1073,10 @@ void renderJobsList(SSD1306Wire &display, int selectedJob, int scrollOffset) {
       
       // Extract visible portion
       int startChar = jobsMarqueeOffset;
-      title = title.substring(startChar, startChar + maxTitleChars);
-    } else if (title.length() > maxTitleChars) {
+      title = title.substring(startChar, startChar + JOB_TITLE_VISIBLE_CHARS);
+    } else if (title.length() > JOB_TITLE_VISIBLE_CHARS) {
       // Non-selected long title: truncate with ellipsis
-      title = title.substring(0, maxTitleChars - 2) + "..";
+      title = title.substring(0, JOB_TITLE_VISIBLE_CHARS - 2) + "..";
     }
     
     // Draw title (left aligned)
@@ -981,15 +1141,9 @@ void renderJobDetail(SSD1306Wire &display, int jobIndex) {
   display.setFont(ArialMT_Plain_16);
   display.drawString(0, rewardY, String(job.reward) + " sats");
   
-  // Location and date on bottom line
+  // Bottom line: instructions
   display.setFont(ArialMT_Plain_10);
-  String location = job.location;
-  if (location.length() > 14) {
-    location = location.substring(0, 12) + "..";
-  }
-  String dateStr = formatJobDate(job.createdAt);
-  // Show location/date OR instruction (alternate or just show instruction)
-  display.drawString(0, 54, "Press:Back  Hold:Done");  
+  if (holdHintsVisible()) display.drawString(0, 54, "Tap: back  Hold: done");
   display.display();
 }
 
@@ -1023,8 +1177,6 @@ void handleJobsMenu(SSD1306Wire &display) {
   int scrollOffset = 0;  // Which job is at the top of the visible list
   bool inJobsMenu = true;
   unsigned long lastJobCycle = millis();
-  bool buttonPressed = false;
-  unsigned long buttonPressTime = 0;
   
   // Reset marquee state
   jobsMarqueeOffset = 0;
@@ -1033,12 +1185,11 @@ void handleJobsMenu(SSD1306Wire &display) {
   
   renderJobsList(display, selectedJob, scrollOffset);
   
-  // Button handling constants (from main sketch)
-  const unsigned long SHORT_PRESS_MAX = 600;
-  const unsigned long HOLD_PRESS_MIN = 700;
-  
+  extern bool anyButtonDown();
+
   while (inJobsMenu) {
-    esp_task_wdt_reset();  
+    esp_task_wdt_reset();
+    soundUpdate();
     unsigned long now = millis();
     
     // Timeout after 30 seconds
@@ -1047,23 +1198,16 @@ void handleJobsMenu(SSD1306Wire &display) {
       break;
     }
     
-    // Read buttons
-    bool prgState = digitalRead(0) == LOW;      // BUTTON_PIN_PRG
-    bool externalState = digitalRead(2) == LOW;  // BUTTON_PIN_EXTERNAL
-    bool currentState = prgState || externalState;
-    
-    if (currentState && !buttonPressed) {
-      buttonPressed = true;
-      buttonPressTime = millis();
-    }
-    
-    if (!currentState && buttonPressed) {
-      unsigned long pressDuration = millis() - buttonPressTime;
-      buttonPressed = false;
+    // Tap = next, hold = open (counts as soon as the line fills)
+    PressEvent ev = holdPressUpdate(anyButtonDown());
+    if (holdPressActive()) lastJobCycle = millis();
+    holdPressDrawBar(display);
+
+    if (ev != PRESS_NONE) {
       lastJobCycle = millis();
-      
-      bool isShort = pressDuration <= SHORT_PRESS_MAX;
-      bool isHold = pressDuration >= HOLD_PRESS_MIN;
+
+      bool isShort = ev == PRESS_TAP;
+      bool isHold = ev == PRESS_HOLD;
       
             if (isShort) {
         // Cycle to next item (jobs + back option)
@@ -1102,31 +1246,21 @@ void handleJobsMenu(SSD1306Wire &display) {
         
         renderJobDetail(display, selectedJob);
         
-        // Wait for button press in detail view
-        // Short press = back to list
-        // Long press = mark as complete
-        delay(300);  // Debounce
-        bool detailButtonPressed = false;
-        unsigned long detailButtonPressTime = 0;
+        // Detail view: tap = back to list, hold = mark as complete.
+        // The hold that opened this screen is still down; holdPressUpdate
+        // ignores it until release.
         unsigned long detailStart = millis();
         bool inDetailView = true;
         
         while (inDetailView && (millis() - detailStart < 30000)) {  // 30s timeout
           esp_task_wdt_reset();
-          bool detailPrgState = digitalRead(0) == LOW;
-          bool detailExtState = digitalRead(2) == LOW;
-          bool detailState = detailPrgState || detailExtState;
+          soundUpdate();
+          PressEvent detailEv = holdPressUpdate(anyButtonDown());
+          if (holdPressActive()) detailStart = millis();
+          holdPressDrawBar(display);
           
-          if (detailState && !detailButtonPressed) {
-            detailButtonPressed = true;
-            detailButtonPressTime = millis();
-          }
-          
-          if (!detailState && detailButtonPressed) {
-            unsigned long detailPressDuration = millis() - detailButtonPressTime;
-            detailButtonPressed = false;
-            
-            if (detailPressDuration >= HOLD_PRESS_MIN) {
+          if (detailEv != PRESS_NONE) {
+            if (detailEv == PRESS_HOLD) {
               // Long press - show confirmation for marking complete
               playMenuSelectTone();
               
@@ -1137,34 +1271,30 @@ void handleJobsMenu(SSD1306Wire &display) {
               display.drawString(64, 5, "Mark Done?");
               
               display.setFont(ArialMT_Plain_10);
-              display.drawString(64, 28, "Press: Yes");
+              display.drawString(64, 28, "Tap: Yes");
               display.drawString(64, 42, "Hold: Cancel");
               display.display();
               
-              // Wait for confirmation
-              delay(300);
-              bool confirmPressed = false;
-              unsigned long confirmPressTime = 0;
+              // Wait for confirmation (the hold that got here is ignored
+              // until it is released)
               unsigned long confirmStart = millis();
               
               while (millis() - confirmStart < 10000) {  // 10s timeout for confirm
-                esp_task_wdt_reset(); 
-                bool confirmPrgState = digitalRead(0) == LOW;
-                bool confirmExtState = digitalRead(2) == LOW;
-                bool confirmState = confirmPrgState || confirmExtState;
+                esp_task_wdt_reset();
+                soundUpdate();
+                PressEvent confirmEv = holdPressUpdate(anyButtonDown());
+                if (holdPressActive()) confirmStart = millis();
+                holdPressDrawBar(display);
                 
-                if (confirmState && !confirmPressed) {
-                  confirmPressed = true;
-                  confirmPressTime = millis();
-                }
-                
-                if (!confirmState && confirmPressed) {
-                  unsigned long confirmDuration = millis() - confirmPressTime;
-                  confirmPressed = false;
-                  
-                  if (confirmDuration < SHORT_PRESS_MAX) {
-                    // Short press = Confirm!
-                    playMenuSelectTone();
+                if (confirmEv != PRESS_NONE) {
+                  if (confirmEv == PRESS_TAP) {
+                    // Short press = Confirm! Finish the tone before the
+                    // network call: nothing services the sound sequencer
+                    // while the request blocks, so a non-blocking tone would
+                    // hold its first note until the server answers.
+                    extern void playMenuSelectToneBlocking();
+                    playMenuSelectToneBlocking();
+                    soundStop();
                     
                     // Show "Sending..." screen
                     display.clear();
@@ -1174,6 +1304,7 @@ void handleJobsMenu(SSD1306Wire &display) {
                     display.display();
                     
                     esp_task_wdt_reset();
+                    soundUpdate();
 
                     // Call the API
                     extern bool markJobComplete(String jobId);
@@ -1193,7 +1324,25 @@ void handleJobsMenu(SSD1306Wire &display) {
                     }
                     display.display();
                     delay(2500);
-                    
+
+                    if (success) {
+                      // The job now waits for the poster's review, and the
+                      // server stops listing it: drop it from the cached list
+                      // too instead of showing it until the next fetch.
+                      for (int i = selectedJob; i < cachedJobCount - 1; i++) {
+                        cachedJobs[i] = cachedJobs[i + 1];
+                      }
+                      cachedJobCount--;
+                      if (cachedJobCount == 0) {
+                        inDetailView = false;
+                        inJobsMenu = false;
+                        break;
+                      }
+                      if (selectedJob >= cachedJobCount) selectedJob = cachedJobCount - 1;
+                      if (scrollOffset > selectedJob) scrollOffset = selectedJob;
+                      lastSelectedJob = -1;  // reset the title marquee
+                    }
+
                     inDetailView = false;
                   } else {
                     // Long press = Cancel
@@ -1225,7 +1374,10 @@ void handleJobsMenu(SSD1306Wire &display) {
     }
     
     // Update marquee animation even when no button pressed
-    if (cachedJobCount > 0 && cachedJobs[selectedJob].title.length() > MAX_TITLE_CHARS) {
+    // selectedJob == cachedJobCount is the "Back" row (no job behind it)
+    // (not while the button is down: the redraw would wipe the hold line)
+    if (!holdPressActive() && selectedJob >= 0 && selectedJob < cachedJobCount &&
+        cachedJobs[selectedJob].title.length() > JOB_TITLE_VISIBLE_CHARS) {
       static unsigned long lastMarqueeRender = 0;
       if (now - lastMarqueeRender > MARQUEE_SPEED_MS) {
         renderJobsList(display, selectedJob, scrollOffset);
@@ -1261,7 +1413,6 @@ void renderFeedResult(SSD1306Wire &display, bool success, int foodIndex, bool ha
     display.setFont(ArialMT_Plain_10);
     if (!hadEnoughCoins) {
       int localCoins = getLocalCoins();
-      int deficit = option.coinCost - localCoins;
       display.drawString(64, 28, "Not enough coins!");
       display.drawString(64, 40, "Need: " + String(option.coinCost) + " coins");
       display.drawString(64, 52, "Have: " + String(localCoins) + " coins");
@@ -1336,26 +1487,24 @@ static void flashRgbLed(int times, int onMs, int offMs) {
   digitalWrite(RGB_LED, LOW);
 }
 
-static void playHighScoreCelebrationTone() {
-  int melody[] = { 988, 1175, 1319, 1568 };
-  int durations[] = { 120, 120, 150, 220 };
+// Same notes and gaps as the old tone()+delay() loops (freq 0 = rest).
+static const ToneNote HIGH_SCORE_MELODY[] = {
+  {988, 120}, {0, 40}, {1175, 120}, {0, 40}, {1319, 150}, {0, 40}, {1568, 220}, {0, 40}
+};
+static const ToneNote GAME_OVER_WOMP[] = {
+  {392, 200}, {0, 60}, {330, 220}, {0, 60}, {262, 300}, {0, 60}
+};
 
-  for (int i = 0; i < 4; i++) {
-    tone(BUZZER_PIN, melody[i], durations[i]);
-    delay(durations[i] + 40);
-    noTone(BUZZER_PIN);
-  }
+// The game-over sequence is a blocking UI flow (delay()-based LED flashes and
+// result screens), so the loop-driven sequencer would not advance during it;
+// play these to completion like before. Game sounds play during quiet hours:
+// someone is playing, so they aren't an unprompted alert.
+static void playHighScoreCelebrationTone() {
+  soundPlayBlocking(HIGH_SCORE_MELODY, (uint8_t)(sizeof(HIGH_SCORE_MELODY) / sizeof(HIGH_SCORE_MELODY[0])), false);
 }
 
-void playGameOverWomp() {
-  int melody[] = { 392, 330, 262 };
-  int durations[] = { 200, 220, 300 };
-
-  for (int i = 0; i < 3; i++) {
-    tone(BUZZER_PIN, melody[i], durations[i]);
-    delay(durations[i] + 60);
-    noTone(BUZZER_PIN);
-  }
+static void playGameOverWomp() {
+  soundPlayBlocking(GAME_OVER_WOMP, (uint8_t)(sizeof(GAME_OVER_WOMP) / sizeof(GAME_OVER_WOMP[0])), false);
 }
 
 static void renderLeaderboard(SSD1306Wire &display, const GameScoreResponse &response) {
@@ -1409,7 +1558,6 @@ static void renderLeaderboard(SSD1306Wire &display, const GameScoreResponse &res
 }
 
 bool handleFeedPet(int foodIndex) {
-  extern GanamosConfig ganamosConfig;
   const FoodOption& option = getFoodOption(foodIndex);
   int foodCost = option.coinCost;
   
@@ -1430,15 +1578,14 @@ bool handleFeedPet(int foodIndex) {
     int fullnessIncrease = option.fullnessPercent;
     petStats.fullness = min(100, petStats.fullness + fullnessIncrease);
     int actualIncrease = petStats.fullness - oldFullness;
-    petStats.lastFeed = millis();
     petStats.lastUpdate = millis(); // Reset entropy timer after feeding
     
     Serial.println("Pet fed with " + String(option.name) + " (" + String(foodCost) + " coins)");
     Serial.println("Fullness increased by " + String(actualIncrease) + " (target +" + String(option.fullnessPercent) + "%), now " + String(petStats.fullness));
     
-    // Trigger eat animation (will loop 3 times)
-    currentAnimState = ANIM_EAT;
-    eatAnimLoopsCompleted = 0;
+    // Eat animation (EAT_ANIM_TOTAL_LOOPS chew loops) with the food at the mouth
+    eatFoodIndex = foodIndex;
+    enterAnimState(ANIM_EAT, millis());
     Serial.println("🍽️ Starting eat animation");
     
     // Save pet stats to flash after feeding
@@ -1451,32 +1598,7 @@ bool handleFeedPet(int foodIndex) {
   }
 }
 
-void renderGameScreen(SSD1306Wire &display, int round, int score, unsigned long gameStartTime) {
-  display.clear();
-  display.setFont(ArialMT_Plain_10);
-  display.setTextAlignment(TEXT_ALIGN_CENTER);
-  
-  // Game title
-  display.setFont(ArialMT_Plain_16);
-  display.drawString(64, 0, "Lightning!");
-  
-  display.setFont(ArialMT_Plain_10);
-  
-  // Show round info
-  display.drawString(64, 20, "Round " + String(round) + "/3");
-  display.drawString(64, 30, "Score: " + String(score));
-  
-  // Show lightning bolt (random position based on seed) - only if boltVisible
-  // Note: boltVisible state is handled in game loop, this function just renders
-  // The bolt position will be calculated consistently based on round
-  
-  // Instructions
-  display.drawString(64, 58, "Press when bolt!");
-  
-  display.display();
-}
-
-struct DebouncedButton {
+struct FlapDebouncedButton {
   int pin;
   bool lastStable = true;       // HIGH = not pressed (because of pull-up)
   bool lastEdgeState = true;
@@ -1537,6 +1659,118 @@ void renderInsufficientCoinsForGame(SSD1306Wire &display, int required, int avai
   display.display();
 }
 
+// Shared end of every scored game (Flappy, Pickleball solo, Sat Catcher):
+// +10 happiness for playing, "Game Over" with the score, then the score goes
+// to that game's leaderboard (queued if offline). A top-5 or personal-best
+// score earns +20 more and shows the board. Saves the pet stats; returns the
+// base happiness added.
+int finishGameWithScore(SSD1306Wire &display, uint8_t game, int score) {
+  // Base happiness reward for playing the game (always get +10 for playing)
+  int happinessIncrease = 10;
+  Serial.printf("Game %s played! Score: %d Base happiness: +10\n", petGameApiName(game), score);
+  
+  // Apply base happiness increase
+  int oldHappiness = petStats.happiness;
+  petStats.happiness = min(100, petStats.happiness + happinessIncrease);
+  Serial.println("Happiness: " + String(oldHappiness) + " → " + String(petStats.happiness));
+  // Stats are saved once below, after any leaderboard bonus is applied.
+  
+  display.clear();
+  display.setFont(ArialMT_Plain_16);
+  display.setTextAlignment(TEXT_ALIGN_CENTER);
+  display.drawString(64, 15, "Game Over!");
+  display.setFont(ArialMT_Plain_10);
+  display.drawString(64, 35, "Score: " + String(score));
+  if (happinessIncrease > 0) {
+    display.drawString(64, 48, "Happiness +" + String(happinessIncrease));
+  } else {
+    display.drawString(64, 48, "Try again!");
+  }
+  display.display();
+
+  playGameOverWomp();
+  flashRgbLed(4, 90, 55);
+
+  GameScoreResponse leaderboardResponse;
+  bool leaderboardSuccess = false;
+
+  #ifdef WOKWI_SIMULATOR
+  // Simulator runs must be deterministic and never write test scores to the
+  // production service.
+  leaderboardSuccess = false;
+  #else
+  if (ganamosConfig.deviceId.length() > 0) {
+    leaderboardSuccess = submitGameScore(score, leaderboardResponse, game);
+  } else {
+    Serial.println("Skipping leaderboard submission - missing deviceId");
+  }
+  #endif
+
+  // Check if score made it into top 5 global leaderboard
+  if (leaderboardSuccess && leaderboardResponse.isNewHighScore) {
+    Serial.println("🎯 Made it into top 5! Rank #" + String(leaderboardResponse.currentScoreRank));
+    
+    // Bonus happiness for making top 5 (+20, total +30 with base)
+    oldHappiness = petStats.happiness;
+    petStats.happiness = min(100, petStats.happiness + 20);
+    Serial.println("🎉 Top 5 bonus! Happiness: " + String(oldHappiness) + " → " + String(petStats.happiness) + " (+20 bonus)");
+    
+    playHighScoreCelebrationTone();
+    flashRgbLed(6, 120, 60);
+
+    display.clear();
+    display.setFont(ArialMT_Plain_16);
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(64, 10, "New High Score!");
+    display.setFont(ArialMT_Plain_10);
+    display.drawString(64, 32, "Score: " + String(score));
+    if (leaderboardResponse.currentScoreRank > 0) {
+      display.drawString(64, 46, "Rank #" + String(leaderboardResponse.currentScoreRank));
+    }
+    display.display();
+    delay(2000);
+
+    renderLeaderboard(display, leaderboardResponse);
+    delay(4000);
+  } 
+  // Check if it's a new personal best (but not in top 5)
+  else if (leaderboardSuccess && leaderboardResponse.isPersonalBest) {
+    Serial.println("🎯 New personal best!");
+    
+    // Bonus happiness for personal best (+20, total +30 with base)
+    oldHappiness = petStats.happiness;
+    petStats.happiness = min(100, petStats.happiness + 20);
+    Serial.println("🎉 Personal best bonus! Happiness: " + String(oldHappiness) + " → " + String(petStats.happiness) + " (+20 bonus)");
+    
+    playHighScoreCelebrationTone();
+    flashRgbLed(3, 120, 60);
+
+    display.clear();
+    display.setFont(ArialMT_Plain_16);
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(64, 10, "Personal Best!");
+    display.setFont(ArialMT_Plain_10);
+    display.drawString(64, 32, "Score: " + String(score));
+    display.display();
+    delay(2000);
+  } 
+  else if (!leaderboardSuccess) {
+    Serial.println("Leaderboard submission failed after game over.");
+    delay(1200);
+  } else {
+    delay(1500);
+  }
+
+  // Single NVS write for the base reward plus any leaderboard bonus.
+  savePetStats();
+
+  int batteryPct = getBatteryPercentage();
+  renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);
+  digitalWrite(RGB_LED, LOW);
+
+  return happinessIncrease;
+}
+
 int handleLightningGame(SSD1306Wire &display) {
   extern GanamosConfig ganamosConfig;
   extern int getLocalCoins();
@@ -1579,11 +1813,11 @@ int handleLightningGame(SSD1306Wire &display) {
   const int   COMBINED_WALL_START_SCORE = 30; // Start combined upper+lower walls
   
 // ===== Button init =====
-  DebouncedButton flapBtnExternal;
+  FlapDebouncedButton flapBtnExternal;
   flapBtnExternal.pin = BUTTON_PIN_EXTERNAL;
   flapBtnExternal.begin();
 
-  DebouncedButton flapBtnPrg;
+  FlapDebouncedButton flapBtnPrg;
   flapBtnPrg.pin = BUTTON_PIN_PRG;
   flapBtnPrg.begin();
 
@@ -1787,246 +2021,185 @@ int handleLightningGame(SSD1306Wire &display) {
     delay(16); // ~60 FPS
   }
   
-  // Base happiness reward for playing the game (always get +10 for playing)
-  int happinessIncrease = 10;
-  Serial.println("Game played! Score: " + String(score) + " Base happiness: +10");
-  
-  // Apply base happiness increase
-  int oldHappiness = petStats.happiness;
-  petStats.happiness = min(100, petStats.happiness + happinessIncrease);
-  petStats.lastActivity = millis();
-  Serial.println("Happiness: " + String(oldHappiness) + " → " + String(petStats.happiness));
-  
-  // Save pet stats to flash after game
-  savePetStats();
-  
-  display.clear();
-  display.setFont(ArialMT_Plain_16);
-  display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.drawString(64, 15, "Game Over!");
-  display.setFont(ArialMT_Plain_10);
-  display.drawString(64, 35, "Score: " + String(score));
-  if (happinessIncrease > 0) {
-    display.drawString(64, 48, "Happiness +" + String(happinessIncrease));
-  } else {
-    display.drawString(64, 48, "Try again!");
-  }
-  display.display();
-
-  playGameOverWomp();
-  flashRgbLed(4, 90, 55);
-
-  GameScoreResponse leaderboardResponse;
-  bool leaderboardSuccess = false;
-
-  #ifdef WOKWI_SIMULATOR
-  // Simulator runs must be deterministic and never write test scores to the
-  // production service.
-  leaderboardSuccess = false;
-  #else
-  if (ganamosConfig.deviceId.length() > 0) {
-    leaderboardSuccess = submitGameScore(score, leaderboardResponse);
-  } else {
-    Serial.println("Skipping leaderboard submission - missing deviceId");
-  }
-  #endif
-
-  // Check if score made it into top 5 global leaderboard
-  if (leaderboardSuccess && leaderboardResponse.isNewHighScore) {
-    Serial.println("🎯 Made it into top 5! Rank #" + String(leaderboardResponse.currentScoreRank));
-    
-    // Bonus happiness for making top 5 (+20, total +30 with base)
-    oldHappiness = petStats.happiness;
-    petStats.happiness = min(100, petStats.happiness + 20);
-    Serial.println("🎉 Top 5 bonus! Happiness: " + String(oldHappiness) + " → " + String(petStats.happiness) + " (+20 bonus)");
-    savePetStats();
-    
-    playHighScoreCelebrationTone();
-    flashRgbLed(6, 120, 60);
-
-    display.clear();
-    display.setFont(ArialMT_Plain_16);
-    display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 10, "New High Score!");
-    display.setFont(ArialMT_Plain_10);
-    display.drawString(64, 32, "Score: " + String(score));
-    if (leaderboardResponse.currentScoreRank > 0) {
-      display.drawString(64, 46, "Rank #" + String(leaderboardResponse.currentScoreRank));
-    }
-    display.display();
-    delay(2000);
-
-    renderLeaderboard(display, leaderboardResponse);
-    delay(4000);
-  } 
-  // Check if it's a new personal best (but not in top 5)
-  else if (leaderboardSuccess && leaderboardResponse.isPersonalBest) {
-    Serial.println("🎯 New personal best!");
-    
-    // Bonus happiness for personal best (+20, total +30 with base)
-    oldHappiness = petStats.happiness;
-    petStats.happiness = min(100, petStats.happiness + 20);
-    Serial.println("🎉 Personal best bonus! Happiness: " + String(oldHappiness) + " → " + String(petStats.happiness) + " (+20 bonus)");
-    savePetStats();
-    
-    playHighScoreCelebrationTone();
-    flashRgbLed(3, 120, 60);
-
-    display.clear();
-    display.setFont(ArialMT_Plain_16);
-    display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 10, "Personal Best!");
-    display.setFont(ArialMT_Plain_10);
-    display.drawString(64, 32, "Score: " + String(score));
-    display.display();
-    delay(2000);
-  } 
-  else if (!leaderboardSuccess) {
-    Serial.println("Leaderboard submission failed after game over.");
-    delay(1200);
-  } else {
-    delay(1500);
-  }
-
-  int batteryPct = getBatteryPercentage();
-  renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);
-  digitalWrite(RGB_LED, LOW);
-
-  return happinessIncrease;
+  return finishGameWithScore(display, GAME_FLAPPY, score);
 }
 
-int handlePickleballArcadePrototype(SSD1306Wire &display) {
-  Serial.println("Starting Pickleball Practice!");
+static bool anyButtonDownForGame() {
+  return digitalRead(BUTTON_PIN_EXTERNAL) == LOW || digitalRead(BUTTON_PIN_PRG) == LOW;
+}
 
-  DebouncedButton hitExternal;
-  hitExternal.pin = BUTTON_PIN_EXTERNAL;
-  hitExternal.begin();
-  DebouncedButton hitPrg;
-  hitPrg.pin = BUTTON_PIN_PRG;
-  hitPrg.begin();
+// ============================================================================
+// Sat Catcher
+// The pet walks along the ground and turns around on every tap. Sats and
+// rocks fall from the sky: catch sats (+1), dodge rocks (3 lives). Things
+// fall faster and more often as the score climbs. Costs a game like Flappy.
+// ============================================================================
 
-  const int paddleWidth = 22;
-  const int paddleHeight = 3;
-  const int playerY = 58;
-  const int cpuY = 10;
-  const unsigned long matchLimitMs = 45000;
-  float playerX = 53.0f;
-  float playerVelocity = 1.15f;
-  float cpuX = 53.0f;
-  float ballX = 64.0f;
-  float ballY = 34.0f;
-  float ballVX = 0.65f;
-  float ballVY = 1.05f;
-  int playerScore = 0;
-  int cpuScore = 0;
-  unsigned long started = millis();
-  unsigned long lastFrame = started;
+static const ToneNote SC_CATCH[] = {{1568, 45}, {2093, 70}};
+static const ToneNote SC_HIT[]   = {{196, 90}, {147, 140}};
 
-  auto resetServe = [&](bool towardPlayer) {
-    ballX = 64.0f;
-    ballY = 34.0f;
-    ballVX = random(0, 2) ? 0.65f : -0.65f;
-    ballVY = towardPlayer ? 1.05f : -1.05f;
-    delay(350);
-  };
+// 7x6 heart for the lives counter
+static const unsigned char SC_HEART[] PROGMEM = {0x36, 0x7F, 0x7F, 0x3E, 0x1C, 0x08};
+// 7x7 rock
+static const unsigned char SC_ROCK[] PROGMEM = {0x1C, 0x3E, 0x7B, 0x7F, 0x6F, 0x3E, 0x1C};
+
+int handleSatCatcherGame(SSD1306Wire &display) {
+  extern GanamosConfig ganamosConfig;
+  extern int getLocalCoins();
+  int localCoins = getLocalCoins();
+  if (localCoins < ganamosConfig.gameCost) {
+    renderInsufficientCoinsForGame(display, ganamosConfig.gameCost, localCoins);
+    delay(2500);
+    return 0;
+  }
+  extern bool spendCoinsLocal(int amount, const char* action);
+  if (!spendCoinsLocal(ganamosConfig.gameCost, "game")) return 0;
+  Serial.println(F("Starting Sat Catcher"));
+
+  const int GROUND_Y = 62;             // ground line
+  const int PET_W = 16, PET_H = 16;
+  const int PET_Y = GROUND_Y - PET_H;  // pet stands on the ground
+  const int ITEM = 8;                  // sats are 8x8, rocks 7x7
+  const int MAX_ITEMS = 6;
+  const unsigned long FRAME_MS = 30;
+
+  struct Item { float x, y; bool active, rock; };
+  Item items[MAX_ITEMS] = {};
+
+  DebouncedButton bExt, bPrg;
+  debounceInit(bExt, BUTTON_PIN_EXTERNAL);
+  debounceInit(bPrg, BUTTON_PIN_PRG);
 
   display.clear();
   display.setTextAlignment(TEXT_ALIGN_CENTER);
   display.setFont(ArialMT_Plain_16);
-  display.drawString(64, 10, "Pickle Practice");
+  display.drawString(64, 4, "Sat Catcher");
   display.setFont(ArialMT_Plain_10);
-  display.drawString(64, 34, "Paddle auto-moves");
-  display.drawString(64, 48, "Press near ball to hit");
+  display.drawString(64, 26, "Tap to turn around");
+  display.drawString(64, 39, "Catch sats, dodge rocks");
   display.display();
-  delay(1200);
-  (void)hitExternal.justPressed();
-  (void)hitPrg.justPressed();
+  for (unsigned long t = millis(); millis() - t < 1800;) {
+    esp_task_wdt_reset();
+    soundUpdate();
+    delay(20);
+  }
+  // A press held from the menu doesn't count as the first tap
+  debounceInit(bExt, BUTTON_PIN_EXTERNAL);
+  debounceInit(bPrg, BUTTON_PIN_PRG);
 
-  while (playerScore < 5 && cpuScore < 5 && millis() - started < matchLimitMs) {
+  float petX = 56;
+  int dir = 1;
+  int score = 0;
+  int lives = 3;
+  unsigned long hurtUntil = 0;   // brief blink after a rock hit
+  unsigned long nextSpawn = millis() + 600;
+  unsigned long lastFrame = millis();
+
+  while (lives > 0) {
     unsigned long now = millis();
-    float dt = (now - lastFrame) / 40.0f;
-    if (dt < 0.5f) dt = 0.5f;
-    if (dt > 2.0f) dt = 2.0f;
+    if (now - lastFrame < FRAME_MS) {
+      soundUpdate();
+      delay(2);
+      continue;
+    }
     lastFrame = now;
+    esp_task_wdt_reset();
+    soundUpdate();
 
-    playerX += playerVelocity * dt;
-    if (playerX <= 1 || playerX + paddleWidth >= 127) {
-      playerVelocity = -playerVelocity;
-      playerX = constrain(playerX, 1.0f, 127.0f - paddleWidth);
+    // Input: one turn per press (either button)
+    bool pressed = (debounceUpdate(bExt, now) == 1) | (debounceUpdate(bPrg, now) == 1);
+    if (pressed) dir = -dir;
+
+    // Difficulty ramps with the score
+    float petSpeed  = min(2.8f, 1.5f + score * 0.04f);
+    float fallSpeed = min(2.2f, 0.8f + score * 0.04f);
+    unsigned long spawnMs = (unsigned long)max(320, 950 - score * 18);
+    int rockChance = min(45, 22 + score);
+
+    petX += dir * petSpeed;
+    if (petX <= 0) { petX = 0; dir = 1; }
+    if (petX >= 128 - PET_W) { petX = 128 - PET_W; dir = -1; }
+
+    if ((long)(now - nextSpawn) >= 0) {
+      for (int i = 0; i < MAX_ITEMS; i++) {
+        if (!items[i].active) {
+          items[i].active = true;
+          items[i].rock = random(0, 100) < rockChance;
+          items[i].x = random(0, 128 - ITEM);
+          items[i].y = 12 - ITEM;
+          break;
+        }
+      }
+      nextSpawn = now + spawnMs;
     }
 
-    // CPU tracks with a capped speed, leaving room for angled shots to win.
-    float cpuTarget = ballX - paddleWidth / 2;
-    float cpuStep = 0.72f * dt;
-    if (cpuX < cpuTarget) cpuX += min(cpuStep, cpuTarget - cpuX);
-    if (cpuX > cpuTarget) cpuX -= min(cpuStep, cpuX - cpuTarget);
-    cpuX = constrain(cpuX, 1.0f, 127.0f - paddleWidth);
-
-    bool hitPressed = hitExternal.justPressed() || hitPrg.justPressed();
-    if (hitPressed && ballVY > 0 && ballY >= playerY - 9 &&
-        ballX >= playerX - 4 && ballX <= playerX + paddleWidth + 4) {
-      ballVY = -abs(ballVY) - 0.04f;
-      ballVX += ((ballX - (playerX + paddleWidth / 2)) / paddleWidth) * 0.9f;
-      ballVX = constrain(ballVX, -1.8f, 1.8f);
-      tone(BUZZER_PIN, 1050, 30);
+    for (int i = 0; i < MAX_ITEMS; i++) {
+      Item &it = items[i];
+      if (!it.active) continue;
+      it.y += fallSpeed * (it.rock ? 1.15f : 1.0f);
+      // Catch / hit: boxes overlap, 2 px forgiveness on the pet's edges
+      bool overlap = it.x + ITEM > petX + 2 && it.x < petX + PET_W - 2 &&
+                     it.y + ITEM > PET_Y + 3 && it.y < PET_Y + PET_H;
+      if (overlap) {
+        it.active = false;
+        if (it.rock) {
+          if ((long)(now - hurtUntil) >= 0) {   // no double hits while blinking
+            lives--;
+            hurtUntil = now + 900;
+            soundPlay(SC_HIT, 2, false);
+          }
+        } else {
+          score++;
+          soundPlay(SC_CATCH, 2, false);
+        }
+      } else if (it.y > GROUND_Y) {
+        it.active = false;  // landed
+      }
     }
 
-    ballX += ballVX * dt;
-    ballY += ballVY * dt;
-    if (ballX <= 2 || ballX >= 125) {
-      ballVX = -ballVX;
-      ballX = constrain(ballX, 2.0f, 125.0f);
-    }
-
-    if (ballVY < 0 && ballY <= cpuY + paddleHeight &&
-        ballX >= cpuX && ballX <= cpuX + paddleWidth) {
-      ballVY = abs(ballVY) + 0.025f;
-      ballVX += ((ballX - (cpuX + paddleWidth / 2)) / paddleWidth) * 0.45f;
-    }
-
-    if (ballY < 3) {
-      playerScore++;
-      Serial.println("Pickleball point: player " + String(playerScore) + "-" + String(cpuScore));
-      resetServe(false);
-    } else if (ballY > 63) {
-      cpuScore++;
-      Serial.println("Pickleball point: CPU " + String(playerScore) + "-" + String(cpuScore));
-      resetServe(true);
-    }
-
+    // Draw
     display.clear();
     display.setFont(ArialMT_Plain_10);
     display.setTextAlignment(TEXT_ALIGN_LEFT);
-    display.drawString(2, 0, "CPU " + String(cpuScore));
-    display.setTextAlignment(TEXT_ALIGN_RIGHT);
-    display.drawString(126, 0, "YOU " + String(playerScore));
-    display.drawLine(0, 32, 127, 32);
-    for (int x = 4; x < 128; x += 12) display.drawLine(x, 31, x + 5, 31);
-    display.fillRect((int)cpuX, cpuY, paddleWidth, paddleHeight);
-    display.fillRect((int)playerX, playerY, paddleWidth, paddleHeight);
-    display.fillCircle((int)ballX, (int)ballY, 2);
-    display.display();
+    display.drawXbm(0, 1, 8, 8, bitcoin_spin_frames[0]);
+    display.drawString(11, -1, String(score));
+    for (int l = 0; l < lives; l++) display.drawXbm(120 - l * 9, 2, 7, 6, SC_HEART);
+    display.drawLine(0, GROUND_Y + 1, 127, GROUND_Y + 1);
 
-    esp_task_wdt_reset();
-    delay(40); // 25 FPS is responsive and much cheaper than the Flappy 60 FPS loop.
+    for (int i = 0; i < MAX_ITEMS; i++) {
+      const Item &it = items[i];
+      if (!it.active) continue;
+      if (it.rock) display.drawXbm((int)it.x, (int)it.y, 7, 7, SC_ROCK);
+      else display.drawXbm((int)it.x, (int)it.y, 8, 8, bitcoin_spin_frames[(now / 120 + i) % 4]);
+    }
+
+    // Pet, facing the way it walks; blinks after a hit
+    bool visible = (long)(now - hurtUntil) >= 0 || ((now / 90) % 2);
+    if (visible) {
+      int px = (int)petX;
+      for (int y = 0; y < PET_H; y++) {
+        for (int x = 0; x < PET_W; x++) {
+          int sx = dir > 0 ? x : PET_W - 1 - x;
+          if ((pgm_read_byte(game_character_bitmap + y * 2 + (sx >> 3)) >> (sx & 7)) & 1) {
+            display.setPixel(px + x, PET_Y + y);
+          }
+        }
+      }
+    }
+    display.display();
   }
 
-  noTone(BUZZER_PIN);
-  bool won = playerScore > cpuScore;
-  Serial.println("Pickleball practice complete! Score: " + String(playerScore) + "-" + String(cpuScore));
-  display.clear();
-  display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.setFont(ArialMT_Plain_16);
-  display.drawString(64, 12, won ? "You win!" : "Practice over");
-  display.setFont(ArialMT_Plain_10);
-  display.drawString(64, 36, "YOU " + String(playerScore) + " - " + String(cpuScore) + " CPU");
-  display.drawString(64, 52, "Offline / no wager");
-  display.display();
-  delay(1800);
-  return playerScore;
+  // Let the last hit sound finish, and don't carry a held press onward
+  while (soundBusy() || anyButtonDownForGame()) {
+    esp_task_wdt_reset();
+    soundUpdate();
+    delay(10);
+  }
+  Serial.printf("Sat Catcher over: %d sats\n", score);
+  return finishGameWithScore(display, GAME_SATCATCHER, score);
 }
 
-// Pet stats persistence functions (stubs - stats already managed in updatePetStats)
+// Pet stats persistence (single checksummed NVS record)
 static constexpr uint32_t PET_STATE_MAGIC = 0x50545632; // "PTV2"
 static constexpr uint16_t PET_STATE_VERSION = 2;
 
@@ -2063,7 +2236,7 @@ void loadPetStats() {
                           state.fullness >= 0 && state.fullness <= 100 &&
                           state.checksum == petStateChecksum(state);
 
-  unsigned long lastSaveEpoch = 0;
+  uint32_t lastSaveEpoch = 0;
   if (validState) {
     petStats.happiness = state.happiness;
     petStats.fullness = state.fullness;
@@ -2072,7 +2245,7 @@ void loadPetStats() {
     // One-time migration from the original independent keys.
     petStats.happiness = constrain(preferences.getInt("happiness", 50), 0, 100);
     petStats.fullness = constrain(preferences.getInt("fullness", 50), 0, 100);
-    lastSaveEpoch = preferences.getULong("lastSaveEpoch", 0);
+    lastSaveEpoch = (uint32_t)preferences.getULong("lastSaveEpoch", 0);
   } else {
     // A partial/corrupt state must not create impossible pet values.
     petStats.happiness = 50;
@@ -2082,80 +2255,48 @@ void loadPetStats() {
 
   preferences.end();
 
-  if (!validState) savePetStats();
-  
-  Serial.println("📊 Loaded pet stats from flash:");
-  Serial.println("  Happiness: " + String(petStats.happiness));
-  Serial.println("  Fullness: " + String(petStats.fullness));
-  Serial.println("  Last save: " + String(lastSaveEpoch));
-  
-  // Apply offline decay if we have a valid timestamp and current time
-  if (lastSaveEpoch > 0) {
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo, 10)) {  // 10ms timeout to prevent blocking
-      time_t currentEpoch = mktime(&timeinfo);
-      long elapsedSeconds = (long)(currentEpoch - lastSaveEpoch);
-      
-      if (elapsedSeconds > 0) {
-        long elapsedMinutes = elapsedSeconds / 60;
-        
-        Serial.println("⏰ Device was offline for " + String(elapsedMinutes) + " minutes");
-        
-        int oldFullness = petStats.fullness;
-        int oldHappiness = petStats.happiness;
-        // More than 30 days already takes both meters to zero at current rates;
-        // cap the conversion so seconds-to-milliseconds cannot overflow uint32_t.
-        const unsigned long cappedSeconds = min((unsigned long)elapsedSeconds, 30UL * 86400UL);
-        applyDecayForMilliseconds(cappedSeconds * 1000UL);
-        int fullnessDecay = oldFullness - petStats.fullness;
-        int happinessDecay = oldHappiness - petStats.happiness;
-        
-        Serial.println("📉 Offline decay applied:");
-        Serial.println("  Fullness: " + String(oldFullness) + " → " + String(petStats.fullness) + " (-" + String(fullnessDecay) + ")");
-        Serial.println("  Happiness: " + String(oldHappiness) + " → " + String(petStats.happiness) + " (-" + String(happinessDecay) + ")");
-        
-        // Save the updated stats with current timestamp
-        savePetStats();
-      } else if (elapsedSeconds < 0) {
-        Serial.println("⚠️ Clock went backwards! Skipping offline decay.");
-      }
-    } else {
-      Serial.println("⚠️ Could not get current time - skipping offline decay");
-    }
-  } else {
-    Serial.println("ℹ️ No previous timestamp found - first boot or fresh device");
+  // Remember the saved epoch; the offline gap is applied once the wall clock
+  // is valid (usually shortly after NTP sync, see updatePetStats()).
+  petBaseEpoch = (lastSaveEpoch > (uint32_t)MIN_VALID_EPOCH) ? lastSaveEpoch : 0;
+  petBaseMillis = millis();
+  offlineDecayPending = petBaseEpoch != 0;
+
+  Serial.println("Loaded pet stats: happiness " + String(petStats.happiness) +
+                 ", fullness " + String(petStats.fullness) +
+                 ", saved at " + String((unsigned long)lastSaveEpoch));
+
+  bool needSave = !validState;
+  if (tryApplyOfflineDecay()) needSave = true;
+  if (offlineDecayPending) {
+    Serial.println("Pet stats: clock not synced yet - offline decay deferred");
   }
+  if (needSave) savePetStats();
 }
 
 void savePetStats() {
   extern Preferences preferences;
-  preferences.begin("satoshi-pet", false);
-  
-  // Get current epoch time (10ms timeout to prevent blocking when offline)
-  struct tm timeinfo;
-  time_t now = 0;
-  if (getLocalTime(&timeinfo, 10)) {
-    now = mktime(&timeinfo);
-  }
-  
+
+  // Real time when known; otherwise the loaded epoch advanced by uptime, so an
+  // unsynced clock never erases the saved timestamp.
+  const uint32_t epoch = accountedEpoch();
+
   PetStateV2 state = {};
   state.magic = PET_STATE_MAGIC;
   state.version = PET_STATE_VERSION;
   state.happiness = constrain(petStats.happiness, 0, 100);
   state.fullness = constrain(petStats.fullness, 0, 100);
-  state.savedEpoch = (unsigned long)now;
+  state.savedEpoch = epoch;
   state.checksum = petStateChecksum(state);
 
+  preferences.begin("satoshi-pet", false);
   const size_t written = preferences.putBytes("petStateV2", &state, sizeof(state));
-  
   preferences.end();
 
   if (written != sizeof(state)) Serial.println("Pet stats: incomplete NVS write");
   
-  Serial.println("💾 Saved pet stats to flash:");
-  Serial.println("  Happiness: " + String(petStats.happiness));
-  Serial.println("  Fullness: " + String(petStats.fullness));
-  Serial.println("  Timestamp: " + String((unsigned long)now));
+  Serial.println("Saved pet stats: happiness " + String(petStats.happiness) +
+                 ", fullness " + String(petStats.fullness) +
+                 ", epoch " + String((unsigned long)epoch));
 }
 
 void applyTimeBasedDecay() {

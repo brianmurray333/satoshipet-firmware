@@ -28,9 +28,10 @@ void digitalWrite(int,int v){led=v;}
 void setOLEDContrast(int){}
 struct {void init(){}} display;
 struct Radio {bool off=false; void disconnect(bool){off=true;} void mode(int){off=true;}} WiFi;
+void wifiRadioOff(){WiFi.disconnect(true);WiFi.mode(WIFI_OFF);}
 '''
 code+=block('  void wakeForNotification()')+'\n'
-code+=block('        struct IdleRadioCleanup')+';\n'
+code+=block('    struct IdleRadioCleanup')+';\n'
 code+='void expire(unsigned long now){'+block('    if (notificationActive && now - notificationStarted')+'}\n'
 code+='bool consumeButtonUntilRelease=false;\nvoid consume(bool currentButtonState){'+block('    if (consumeButtonUntilRelease)')+'}\n'
 code+=r'''
