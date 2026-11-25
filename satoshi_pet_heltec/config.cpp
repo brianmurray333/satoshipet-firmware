@@ -1,5 +1,6 @@
 #include "config.h"
 #include "ca_roots.h"
+#include "economy.h"
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
@@ -539,7 +540,7 @@ void clearWifiFastConnect() {
   wifiPrefs.end();
 }
 
-bool submitGameScore(int score, GameScoreResponse &response) {
+bool submitGameScore(int score, GameScoreResponse &response, uint8_t game) {
   response.success = false;
   response.isNewHighScore = false;
   response.isPersonalBest = false;
@@ -560,8 +561,7 @@ bool submitGameScore(int score, GameScoreResponse &response) {
 
   // If WiFi not connected, queue score for later sync
   if (WiFi.status() != WL_CONNECTED) {
-    extern bool queueGameScoreLocal(int score);
-    queueGameScoreLocal(score);
+    queueGameScoreLocal(score, game);
     return false;
   }
 
@@ -572,6 +572,7 @@ bool submitGameScore(int score, GameScoreResponse &response) {
 
   JsonDocument payloadDoc;
   payloadDoc["score"] = score;
+  payloadDoc["game"] = petGameApiName(game);
   String payload;
   serializeJson(payloadDoc, payload);
 

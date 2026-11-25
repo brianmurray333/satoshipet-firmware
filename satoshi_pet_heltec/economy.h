@@ -25,12 +25,18 @@ struct PendingSpend {
   uint8_t reserved[2];
 };
 
+// Pet games; each has its own leaderboard on the server.
+enum PetGame : uint8_t { GAME_FLAPPY = 0, GAME_PICKLEBALL = 1, GAME_SATCATCHER = 2 };
+// Name the server uses for a game ("flappy", "pickleball", "satcatcher").
+const char* petGameApiName(uint8_t game);
+
 // 24 bytes per entry (was 52).
 struct PendingGameScore {
   uint8_t id[16];        // UUIDv4 raw bytes
   int32_t score;         // game score
   uint8_t synced;        // 1 if successfully synced to backend
-  uint8_t reserved[3];
+  uint8_t game;          // PetGame; 0 (Flappy) in entries saved before games had types
+  uint8_t reserved[2];
 };
 
 // Initialize economy system (load pending spends, coin balance and pending
@@ -65,7 +71,7 @@ void clearEconomyData();
 
 // Queue a game score locally (for sync when online)
 // Returns true if queued successfully
-bool queueGameScoreLocal(int score);
+bool queueGameScoreLocal(int score, uint8_t game = GAME_FLAPPY);
 
 // Sync pending game scores to backend (call when WiFi available). Marks
 // entries as synced in RAM only; call clearSyncedGameScores() afterwards.

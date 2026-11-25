@@ -126,8 +126,9 @@ struct PickleballState {
 // Returns happiness bonus (0 if no game played)
 int handlePickleballGame(SSD1306Wire &display);
 
-// Offline practice using the same reaction-window and 1/2-press rules as
-// multiplayer. Does not create a lobby, initialize ESP-NOW, or use wagers.
+// Solo rally streak using the same reaction-window and 1/2-press rules as
+// multiplayer; one miss ends it and the streak goes to the Pickleball
+// leaderboard. No lobby, ESP-NOW or wagers. Applies its own happiness.
 int handlePickleballPractice(SSD1306Wire &display);
 
 #endif

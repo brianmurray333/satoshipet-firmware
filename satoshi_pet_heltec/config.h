@@ -61,7 +61,7 @@ struct GameScoreResponse {
   LeaderboardEntry personalEntry;
 };
 
-bool submitGameScore(int score, GameScoreResponse &response);
+bool submitGameScore(int score, GameScoreResponse &response, uint8_t game = 0);  // game: PetGame
 
 // Balance and coins persistence to prevent false celebrations on restart
 int loadLastKnownBalance();

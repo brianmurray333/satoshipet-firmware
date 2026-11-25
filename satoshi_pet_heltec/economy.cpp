@@ -672,7 +672,15 @@ void clearEconomyData() {
 // Game scores
 // ---------------------------------------------------------------------------
 
-bool queueGameScoreLocal(int score) {
+const char* petGameApiName(uint8_t game) {
+  switch (game) {
+    case GAME_PICKLEBALL: return "pickleball";
+    case GAME_SATCATCHER: return "satcatcher";
+    default: return "flappy";
+  }
+}
+
+bool queueGameScoreLocal(int score, uint8_t game) {
   if (score < 0) {
     Serial.printf("Scores: invalid score %d\n", score);
     return false;
@@ -687,9 +695,10 @@ bool queueGameScoreLocal(int score) {
   generateUUID(entry.id);
   entry.score = score;
   entry.synced = 0;
+  entry.game = game;
   scoreState.hdr.count++;
 
-  Serial.printf("Scores: queued score %d (pending %d)\n", score, scoreState.hdr.count);
+  Serial.printf("Scores: queued %s score %d (pending %d)\n", petGameApiName(game), score, scoreState.hdr.count);
   persistScores();
   return true;
 }
@@ -732,9 +741,9 @@ int syncPendingGameScores() {
     // know the field ignore it.
     char id[37];
     formatUUID(entry.id, id);
-    char payload[96];
-    int len = snprintf(payload, sizeof(payload), "{\"score\":%ld,\"scoreId\":\"%s\"}",
-                       (long)entry.score, id);
+    char payload[128];
+    int len = snprintf(payload, sizeof(payload), "{\"score\":%ld,\"scoreId\":\"%s\",\"game\":\"%s\"}",
+                       (long)entry.score, id, petGameApiName(entry.game));
     if (len < 0 || len >= (int)sizeof(payload)) {
       http.end();
       continue;

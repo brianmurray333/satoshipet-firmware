@@ -699,6 +699,45 @@
     return constrain(next, 20UL, DECAY_CHECK_INTERVAL_MS);
   }
 
+  // A titled tap/hold list (tap = next, hold = pick). Returns the picked
+  // index, or -1 after 30 s without input or when the last item is "Back".
+  int runListMenu(const char* title, const char* const* options, int count) {
+    int selected = 0;
+    unsigned long lastInput = millis();
+    auto render = [&]() {
+      display.clear();
+      display.setFont(ArialMT_Plain_10);
+      display.setTextAlignment(TEXT_ALIGN_LEFT);
+      display.drawString(0, 0, title);
+      display.drawLine(0, 12, 127, 12);
+      for (int i = 0; i < count; i++) {
+        display.drawString(4, 15 + i * 12, String(i == selected ? "> " : "  ") + options[i]);
+      }
+      display.display();
+    };
+    render();
+    while (millis() - lastInput < 30000) {
+      PressEvent ev = holdPressUpdate(anyButtonDown());
+      if (holdPressActive()) lastInput = lastButtonPress = millis();
+      if (ev == PRESS_TAP) {
+        lastInput = lastButtonPress = millis();
+        selected = (selected + 1) % count;
+        playButtonChirp();
+        render();
+      } else if (ev == PRESS_HOLD) {
+        lastButtonPress = millis();
+        bool back = strcmp(options[selected], "Back") == 0;
+        if (back) playMenuSelectTone();
+        return back ? -1 : selected;
+      }
+      holdPressDrawBar(display);
+      esp_task_wdt_reset();
+      soundUpdate();
+      delay(20);
+    }
+    return -1;
+  }
+
   void applyGameHappinessBonus(int bonus) {
     if (bonus <= 0) return;
     int oldHappiness = petStats.happiness;
@@ -1553,7 +1592,10 @@
           // One frame per second keeps the pet feeling alive while halving idle
           // OLED transfers compared with the previous 500 ms refresh cadence.
           // While syncing, refresh faster so the "..." indicator animates.
-          bool animationUpdate = (now - lastDisplayUpdate > ((syncPending || wifiConnecting) ? 400UL : 1000UL));
+          // While the pet plays a gesture or eats, redraw every 200 ms so no
+          // frame is skipped; otherwise once a second (the breath bob).
+          unsigned long frameMs = petAnimating() ? 200UL : ((syncPending || wifiConnecting) ? 400UL : 1000UL);
+          bool animationUpdate = (now - lastDisplayUpdate >= frameMs);
           
           if (dataChanged || animationUpdate || screenChanged) {
             renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, cachedBatteryPct);
@@ -1757,60 +1799,33 @@
             int batteryPct = getBatteryPercentage();
             renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);
           } else if (selectedOption == 1) {
-            bool inGameMenu = true;
-            int selectedGame = 0;
-            unsigned long lastGameInput = millis();
-
-            auto renderGameMenu = [&]() {
-              const char* gameOptions[] = {"Flappy Pet", "Pickle Practice", "Multiplayer", "Back"};
-              display.clear();
-              display.setFont(ArialMT_Plain_10);
-              display.setTextAlignment(TEXT_ALIGN_LEFT);
-              display.drawString(0, 0, "Choose game");
-              display.drawLine(0, 12, 127, 12);
-              for (int i = 0; i < 4; i++) {
-                display.drawString(4, 15 + i * 12,
-                  String(i == selectedGame ? "> " : "  ") + gameOptions[i]);
-              }
-              display.display();
-            };
-            renderGameMenu();
-
-            while (inGameMenu && millis() - lastGameInput < 30000) {
-              PressEvent gameEv = holdPressUpdate(anyButtonDown());
-              if (holdPressActive()) lastGameInput = lastButtonPress = millis();
-              if (gameEv != PRESS_NONE) {
-                lastGameInput = millis();
-                lastButtonPress = lastGameInput;
-                if (gameEv == PRESS_TAP) {
-                  selectedGame = (selectedGame + 1) % 4;
-                  playButtonChirp();
-                  renderGameMenu();
-                } else {
-                  playMenuSelectToneBlocking();  // Games run their own blocking loops
-                  inGameMenu = false;
-                  if (selectedGame == 0) {
-                    handleLightningGame(display);  // Applies its own happiness reward
-                  } else if (selectedGame == 1) {
-                    applyGameHappinessBonus(handlePickleballPractice(display));
-                  } else if (selectedGame == 2) {
+            static const char* const GAME_OPTIONS[] = {"Flappy Pet", "Pickleball", "Sat Catcher", "Back"};
+            static const char* const PICKLEBALL_OPTIONS[] = {"Solo", "2 Players", "Back"};
+            int game = runListMenu("Choose game", GAME_OPTIONS, 4);
+            if (game == 1) {  // Pickleball: pick solo or 2 players next
+              int mode = runListMenu("Pickleball", PICKLEBALL_OPTIONS, 3);
+              game = mode == 0 ? 10 : mode == 1 ? 11 : -1;
+            }
+            if (game == 0 || game == 2 || game == 10 || game == 11) {
+              playMenuSelectToneBlocking();  // Games run their own blocking loops
+            }
+            if (game == 0) {
+              handleLightningGame(display);        // Applies its own happiness and leaderboard
+            } else if (game == 2) {
+              handleSatCatcherGame(display);       // Applies its own happiness and leaderboard
+            } else if (game == 10) {
+              handlePickleballPractice(display);   // Solo rally: own happiness and leaderboard
+            } else if (game == 11) {
 #ifdef WOKWI_SIMULATOR
-                    display.clear();
-                    display.setTextAlignment(TEXT_ALIGN_CENTER);
-                    display.drawString(64, 22, "Multiplayer needs");
-                    display.drawString(64, 38, "physical devices");
-                    display.display();
-                    delay(1800);
+              display.clear();
+              display.setTextAlignment(TEXT_ALIGN_CENTER);
+              display.drawString(64, 22, "Multiplayer needs");
+              display.drawString(64, 38, "physical devices");
+              display.display();
+              delay(1800);
 #else
-                    applyGameHappinessBonus(handlePickleballGame(display));
+              applyGameHappinessBonus(handlePickleballGame(display));
 #endif
-                  }
-                }
-              }
-              holdPressDrawBar(display);
-              esp_task_wdt_reset();
-              soundUpdate();
-              delay(20);
             }
             int batteryPct = getBatteryPercentage();
             renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);

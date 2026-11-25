@@ -3,6 +3,7 @@
 #include "button_handler.h"
 #include "sound.h"
 #include "hold_press.h"
+#include "economy.h"
 #include <esp_task_wdt.h>
 #include <esp_timer.h>
 #include <esp_wifi.h>
@@ -482,29 +483,29 @@ static void pbProcessRx(unsigned long now) {
 // Practice (offline, single player)
 // ============================================================================
 
+// Solo: a rally streak against the CPU, which returns every ball a little
+// faster each time. One missed return ends the game; the score (returns in a
+// row) goes to the Pickleball leaderboard like a Flappy score.
+static const int PB_SOLO_REACTION_MIN = 320;
+int finishGameWithScore(SSD1306Wire &display, uint8_t game, int score);  // pet_blob.cpp  // solo keeps speeding up past the multiplayer floor
+
 int handlePickleballPractice(SSD1306Wire &display) {
-  Serial.println(F("Starting Pickleball Practice!"));
+  Serial.println(F("Starting Pickleball solo (rally streak)"));
 
   PbInput input;
   pbInputInit(input);  // also configures both pins as INPUT_PULLUP
 
-  uint8_t playerScore = 0;
-  uint8_t cpuScore = 0;
-  uint8_t volleyCount = 0;
+  int streak = 0;           // returns in a row: the score
   bool ballAtPlayer = true;
-  unsigned long practiceStart = millis();
 
   auto drawPracticeCourt = [&](bool ballVisible, uint8_t requiredPresses,
                                const char *status, int ballX, int ballY) {
-    char buf[16];
+    char buf[20];
     display.clear();
     display.setFont(ArialMT_Plain_10);
     display.setTextAlignment(TEXT_ALIGN_LEFT);
-    snprintf(buf, sizeof(buf), "YOU %u", (unsigned)playerScore);
+    snprintf(buf, sizeof(buf), "Rally %d", streak);
     display.drawString(2, 0, buf);
-    display.setTextAlignment(TEXT_ALIGN_RIGHT);
-    snprintf(buf, sizeof(buf), "CPU %u", (unsigned)cpuScore);
-    display.drawString(126, 0, buf);
     display.drawRect(PB_COURT_X, PB_COURT_Y, PB_COURT_W, PB_COURT_H);
     display.drawLine(PB_NET_X, PB_COURT_Y, PB_NET_X, PB_COURT_Y + PB_COURT_H);
     display.drawLine(PB_COURT_X, PB_COURT_MID_Y,
@@ -526,11 +527,11 @@ int handlePickleballPractice(SSD1306Wire &display) {
   display.clear();
   display.setTextAlignment(TEXT_ALIGN_CENTER);
   display.setFont(ArialMT_Plain_16);
-  display.drawString(64, 8, "Pickle Practice");
+  display.drawString(64, 8, "Rally!");
   display.setFont(ArialMT_Plain_10);
   display.drawString(64, 31, "Top zone: press once");
   display.drawString(64, 44, "Bottom: press twice");
-  display.drawString(64, 56, "First to 6");
+  display.drawString(64, 56, "Don't miss!");
   display.display();
   pbWait(1800);
 
@@ -540,14 +541,15 @@ int handlePickleballPractice(SSD1306Wire &display) {
   }
   pbInputInit(input);
 
-  while (playerScore < PB_WINNING_SCORE && cpuScore < PB_WINNING_SCORE &&
-         millis() - practiceStart < 90000UL) {
+  bool missed = false;
+  const char *missLabel = "MISSED";
+  while (!missed) {
     uint8_t zone = random(0, 2);
     uint8_t requiredPresses = zone == 0 ? 1 : 2;
 
     // Fly from the hitter to the receiving court. The small parabolic arc
-    // makes direction and timing legible without increasing the reaction
-    // window or doing more than eight OLED transfers per volley.
+    // makes direction and timing legible without doing more than eight OLED
+    // transfers per volley.
     const int startX = ballAtPlayer ? 99 : 29;
     const int endX = ballAtPlayer ? 29 : 99;
     const int startY = PB_COURT_MID_Y;
@@ -562,86 +564,61 @@ int handlePickleballPractice(SSD1306Wire &display) {
       pbWait(PB_BALL_TRAVEL_MS / 8);
     }
 
-    if (ballAtPlayer) {
-      unsigned long reactionWindow = max((int)PB_REACTION_TIME_MIN,
-        (int)PB_REACTION_TIME_START - (int)volleyCount * PB_REACTION_STEP);
-      unsigned long reactStart = millis();
-      uint8_t pressCount = 0;
-      unsigned long confirmStart = 0;
-      bool confirming = false;
-      drawPracticeCourt(true, requiredPresses,
-                        requiredPresses == 1 ? "PRESS 1" : "PRESS 2",
-                        29, zone == 0 ? 23 : 48);
+    if (!ballAtPlayer) {
+      // The CPU always returns, a little sooner as the rally grows.
+      pbWait(max(160, 520 - streak * 25));
+      ballAtPlayer = true;
+      continue;
+    }
 
-      while (true) {
-        unsigned long now = millis();
-        bool inWindow = now - reactStart < reactionWindow;
-        bool inConfirm = confirming && now - confirmStart < PB_CONFIRM_WINDOW_MS;
-        if (!inWindow && !inConfirm) break;
-        if (pbInputPressed(input, now)) {
-          pressCount++;
-          playPickleballHit();
-          if (pressCount == requiredPresses) {
-            confirming = true;
-            confirmStart = now;
-          }
+    unsigned long reactionWindow = max(PB_SOLO_REACTION_MIN,
+      (int)PB_REACTION_TIME_START - streak * PB_REACTION_STEP);
+    unsigned long reactStart = millis();
+    uint8_t pressCount = 0;
+    unsigned long confirmStart = 0;
+    bool confirming = false;
+    drawPracticeCourt(true, requiredPresses,
+                      requiredPresses == 1 ? "PRESS 1" : "PRESS 2",
+                      29, zone == 0 ? 23 : 48);
+
+    while (true) {
+      unsigned long now = millis();
+      bool inWindow = now - reactStart < reactionWindow;
+      bool inConfirm = confirming && now - confirmStart < PB_CONFIRM_WINDOW_MS;
+      if (!inWindow && !inConfirm) break;
+      if (pbInputPressed(input, now)) {
+        pressCount++;
+        playPickleballHit();
+        if (pressCount == requiredPresses) {
+          confirming = true;
+          confirmStart = now;
         }
-        if (pressCount > requiredPresses) break;
-        soundUpdate();
-        esp_task_wdt_reset();
-        delay(5);
       }
+      if (pressCount > requiredPresses) break;
+      soundUpdate();
+      esp_task_wdt_reset();
+      delay(5);
+    }
 
-      if (pressCount == requiredPresses) {
-        volleyCount++;
-        ballAtPlayer = false;
-      } else {
-        cpuScore++;
-        volleyCount = 0;
-        drawPracticeCourt(false, requiredPresses,
-                          pressCount > requiredPresses ? "TOO MANY" : "MISSED",
-                          0, 0);
-        playPickleballMiss();
-        pbWait(PB_POINT_DISPLAY_MS);
-        ballAtPlayer = true;
-      }
+    if (pressCount == requiredPresses) {
+      streak++;
+      ballAtPlayer = false;
     } else {
-      // CPU returns most balls, but occasionally misses so a practiced player
-      // can win. Longer rallies slightly increase its miss chance.
-      int missChance = min(38, 14 + (int)volleyCount * 3);
-      pbWait(max(180, 520 - (int)volleyCount * 25));
-      if (random(0, 100) < missChance) {
-        playerScore++;
-        volleyCount = 0;
-        drawPracticeCourt(false, requiredPresses, "CPU MISSED", 0, 0);
-        playPickleballPoint();
-        pbWait(PB_POINT_DISPLAY_MS);
-        ballAtPlayer = true;
-      } else {
-        volleyCount++;
-        ballAtPlayer = true;
-      }
+      missed = true;
+      missLabel = pressCount > requiredPresses ? "TOO MANY" : "MISSED";
     }
   }
 
-  bool won = playerScore > cpuScore;
-  Serial.printf("Pickleball practice complete! Score: %u-%u\n",
-                (unsigned)playerScore, (unsigned)cpuScore);
-  char buf[24];
-  display.clear();
-  display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.setFont(ArialMT_Plain_16);
-  display.drawString(64, 12, won ? "You win!" : "Practice over");
-  display.setFont(ArialMT_Plain_10);
-  snprintf(buf, sizeof(buf), "YOU %u - %u CPU", (unsigned)playerScore, (unsigned)cpuScore);
-  display.drawString(64, 36, buf);
-  display.drawString(64, 52, "Offline / no wager");
-  display.display();
-  if (won) playPickleballWin();
-  else playPickleballMiss();
-  pbWait(1800);
+  Serial.printf("Pickleball rally over: %d returns\n", streak);
+  drawPracticeCourt(false, 1, missLabel, 0, 0);
+  playPickleballMiss();
+  pbWait(900);
   soundStop();
-  return won ? 10 : 5;
+  while (pbRawButtonDown()) {  // don't carry a held press into the result screens
+    esp_task_wdt_reset();
+    delay(10);
+  }
+  return finishGameWithScore(display, GAME_PICKLEBALL, streak);
 }
 
 // ============================================================================

@@ -47,6 +47,8 @@ void applyTimeBasedDecay(); // Apply fullness/happiness decay based on elapsed t
 void savePetStats(); // Save stats to NVS
 void loadPetStats(); // Load stats from NVS
 void renderPet(SSD1306Wire &display, int btcPrice, int satoshis, int batteryPercent);
+// True while the pet plays a gesture, intro or eating: redraw every 200 ms.
+bool petAnimating();
 void renderScreensaver(SSD1306Wire &display, int satoshis);
 void renderMenu(SSD1306Wire &display, int menuOption); // 0=Home, 1=Play, 2=Feed
 void renderFeedResult(SSD1306Wire &display, bool success, int foodIndex, bool hadEnoughCoins);
@@ -57,6 +59,12 @@ int getFoodFullnessPercent(int foodIndex);
 const char* getFoodNameByIndex(int foodIndex);
 int getFoodOptionCount();
 int handleLightningGame(SSD1306Wire &display); // Returns happiness increase (0 if failed)
+// Sat Catcher: tap to turn the pet around, catch falling sats, dodge rocks.
+// Applies its own happiness reward and leaderboard; returns the reward.
+int handleSatCatcherGame(SSD1306Wire &display);
+// Shared game-over: +10 happiness, score to the game's leaderboard (game is a
+// PetGame from economy.h), celebration on a top-5/personal best. Returns +10.
+int finishGameWithScore(SSD1306Wire &display, uint8_t game, int score);
 
 // Jobs feature
 void handleJobsMenu(SSD1306Wire &display);
