@@ -5,6 +5,7 @@
 #define BUTTON_PIN_EXTERNAL 2 // External button (active LOW with pull-up)
 #endif
 
+#include "game_rng.h"
 #include <Wire.h>
 #include <esp_task_wdt.h>
 #include "pet_blob.h"
@@ -1771,31 +1772,9 @@ int finishGameWithScore(SSD1306Wire &display, uint8_t game, int score) {
   return happinessIncrease;
 }
 
-int handleLightningGame(SSD1306Wire &display) {
-  extern GanamosConfig ganamosConfig;
-  extern int getLocalCoins();
-  extern void setLocalCoins(int coins);
-  
-  // Check if we have enough coins for game (use local balance)
-  int localCoins = getLocalCoins();
-  if (localCoins < ganamosConfig.gameCost) {
-    Serial.println("Not enough coins to play game! Need " + String(ganamosConfig.gameCost) + ", have " + String(localCoins));
-    
-    // Show error screen to user
-    renderInsufficientCoinsForGame(display, ganamosConfig.gameCost, localCoins);
-    delay(2500); // Show error for 2.5 seconds
-    
-    return 0;
-  }
-  
-  // Spend coins locally (offline-first)
-  extern bool spendCoinsLocal(int amount, const char* action);
-  Serial.println("Spending " + String(ganamosConfig.gameCost) + " coins to play game (current coins: " + String(localCoins) + ")");
-  if (!spendCoinsLocal(ganamosConfig.gameCost, "game")) {
-    Serial.println("Failed to spend coins locally");
-    return 0;
-  }
-  
+// One Flappy Pet run on the current course (courseRngSeed first). Returns the
+// score; no coin cost, happiness or leaderboard (callers handle those).
+static int flappyRun(SSD1306Wire &display) {
   Serial.println("Starting Flappy Pet Game!");
   
   // ===== Game constants (tuned for easier start, better progression) =====
@@ -1863,13 +1842,13 @@ int handleLightningGame(SSD1306Wire &display) {
       walls[i].wallHeight = 12;  // First wall: very low (12px) - wall top at y=52, pet at y=48 clears easily
       walls[i].topWallHeight = 0;  // No top wall initially
     } else if (i == 1) {
-      walls[i].wallHeight = random(12, 18);  // Second wall: 12-17px (still easy)
+      walls[i].wallHeight = courseRandom(12, 18);  // Second wall: 12-17px (still easy)
       walls[i].topWallHeight = 0;  // No top wall initially
     } else if (i == 2) {
-      walls[i].wallHeight = random(15, 22);  // Third wall: 15-21px (medium)
+      walls[i].wallHeight = courseRandom(15, 22);  // Third wall: 15-21px (medium)
       walls[i].topWallHeight = 0;  // No top wall initially
     } else {
-      walls[i].wallHeight = random(18, 28);  // Later walls: 18-27px (harder but jumpable)
+      walls[i].wallHeight = courseRandom(18, 28);  // Later walls: 18-27px (harder but jumpable)
       walls[i].topWallHeight = 0;  // No top wall initially
     }
     walls[i].passed = false;
@@ -1919,17 +1898,17 @@ int handleLightningGame(SSD1306Wire &display) {
         
         if (score < SINGLE_WALL_START_SCORE) {
           // Early game: lower walls only
-          walls[i].wallHeight = random(minHeight, maxHeight + 1);
+          walls[i].wallHeight = courseRandom(minHeight, maxHeight + 1);
           walls[i].topWallHeight = 0;
         }
         else if (score < COMBINED_WALL_START_SCORE) {
           // Mid game (15-29): mix of upper-only and lower-only walls
-          bool upperOnly = random(0, 2) == 0; // 50% chance
+          bool upperOnly = courseRandom(0, 2) == 0; // 50% chance
           if (upperOnly) {
             walls[i].wallHeight = 0; // No lower wall
-            walls[i].topWallHeight = random(12, 24); // Upper wall only
+            walls[i].topWallHeight = courseRandom(12, 24); // Upper wall only
           } else {
-            walls[i].wallHeight = random(minHeight, maxHeight + 1); // Lower wall only
+            walls[i].wallHeight = courseRandom(minHeight, maxHeight + 1); // Lower wall only
             walls[i].topWallHeight = 0; // No upper wall
           }
         }
@@ -1940,7 +1919,7 @@ int handleLightningGame(SSD1306Wire &display) {
           const int MAX_WALL_HEIGHT = 18;  // Max height for each wall
           
           // First, decide the gap size (28-36 pixels)
-          int gapSize = random(MIN_GAP, MIN_GAP + 8);
+          int gapSize = courseRandom(MIN_GAP, MIN_GAP + 8);
           
           // Then allocate remaining space to walls
           int availableForWalls = 64 - gapSize;  // e.g., 64 - 30 = 34 pixels for both walls
@@ -1949,8 +1928,8 @@ int handleLightningGame(SSD1306Wire &display) {
           int bottomWallMax = min(MAX_WALL_HEIGHT, availableForWalls / 2);
           int topWallMax = min(MAX_WALL_HEIGHT, availableForWalls / 2);
           
-          walls[i].wallHeight = random(8, bottomWallMax + 1);  // Bottom wall
-          walls[i].topWallHeight = random(6, topWallMax + 1);  // Top wall
+          walls[i].wallHeight = courseRandom(8, bottomWallMax + 1);  // Bottom wall
+          walls[i].topWallHeight = courseRandom(6, topWallMax + 1);  // Top wall
         }
         
         walls[i].passed = false;
@@ -2021,7 +2000,42 @@ int handleLightningGame(SSD1306Wire &display) {
     delay(16); // ~60 FPS
   }
   
+  return score;
+}
+
+int handleLightningGame(SSD1306Wire &display) {
+  extern GanamosConfig ganamosConfig;
+  extern int getLocalCoins();
+  extern void setLocalCoins(int coins);
+  
+  // Check if we have enough coins for game (use local balance)
+  int localCoins = getLocalCoins();
+  if (localCoins < ganamosConfig.gameCost) {
+    Serial.println("Not enough coins to play game! Need " + String(ganamosConfig.gameCost) + ", have " + String(localCoins));
+    
+    // Show error screen to user
+    renderInsufficientCoinsForGame(display, ganamosConfig.gameCost, localCoins);
+    delay(2500); // Show error for 2.5 seconds
+    
+    return 0;
+  }
+  
+  // Spend coins locally (offline-first)
+  extern bool spendCoinsLocal(int amount, const char* action);
+  Serial.println("Spending " + String(ganamosConfig.gameCost) + " coins to play game (current coins: " + String(localCoins) + ")");
+  if (!spendCoinsLocal(ganamosConfig.gameCost, "game")) {
+    Serial.println("Failed to spend coins locally");
+    return 0;
+  }
+  
+  courseRngSeed(0);  // solo: a fresh course
+  int score = flappyRun(display);
   return finishGameWithScore(display, GAME_FLAPPY, score);
+}
+
+int playFlappyRoomTurn(SSD1306Wire &display, uint32_t seed) {
+  courseRngSeed(seed);  // same course as everyone else in the room
+  return flappyRun(display);
 }
 
 static bool anyButtonDownForGame() {
@@ -2043,17 +2057,9 @@ static const unsigned char SC_HEART[] PROGMEM = {0x36, 0x7F, 0x7F, 0x3E, 0x1C, 0
 // 7x7 rock
 static const unsigned char SC_ROCK[] PROGMEM = {0x1C, 0x3E, 0x7B, 0x7F, 0x6F, 0x3E, 0x1C};
 
-int handleSatCatcherGame(SSD1306Wire &display) {
-  extern GanamosConfig ganamosConfig;
-  extern int getLocalCoins();
-  int localCoins = getLocalCoins();
-  if (localCoins < ganamosConfig.gameCost) {
-    renderInsufficientCoinsForGame(display, ganamosConfig.gameCost, localCoins);
-    delay(2500);
-    return 0;
-  }
-  extern bool spendCoinsLocal(int amount, const char* action);
-  if (!spendCoinsLocal(ganamosConfig.gameCost, "game")) return 0;
+// One Sat Catcher run on the current course (courseRngSeed first). Returns
+// the score; no coin cost, happiness or leaderboard.
+static int satCatcherRun(SSD1306Wire &display) {
   Serial.println(F("Starting Sat Catcher"));
 
   const int GROUND_Y = 62;             // ground line
@@ -2124,8 +2130,8 @@ int handleSatCatcherGame(SSD1306Wire &display) {
       for (int i = 0; i < MAX_ITEMS; i++) {
         if (!items[i].active) {
           items[i].active = true;
-          items[i].rock = random(0, 100) < rockChance;
-          items[i].x = random(0, 128 - ITEM);
+          items[i].rock = courseRandom(0, 100) < rockChance;
+          items[i].x = courseRandom(0, 128 - ITEM);
           items[i].y = 12 - ITEM;
           break;
         }
@@ -2196,7 +2202,28 @@ int handleSatCatcherGame(SSD1306Wire &display) {
     delay(10);
   }
   Serial.printf("Sat Catcher over: %d sats\n", score);
+  return score;
+}
+
+int handleSatCatcherGame(SSD1306Wire &display) {
+  extern GanamosConfig ganamosConfig;
+  extern int getLocalCoins();
+  int localCoins = getLocalCoins();
+  if (localCoins < ganamosConfig.gameCost) {
+    renderInsufficientCoinsForGame(display, ganamosConfig.gameCost, localCoins);
+    delay(2500);
+    return 0;
+  }
+  extern bool spendCoinsLocal(int amount, const char* action);
+  if (!spendCoinsLocal(ganamosConfig.gameCost, "game")) return 0;
+  courseRngSeed(0);  // solo: a fresh course
+  int score = satCatcherRun(display);
   return finishGameWithScore(display, GAME_SATCATCHER, score);
+}
+
+int playSatCatcherRoomTurn(SSD1306Wire &display, uint32_t seed) {
+  courseRngSeed(seed);
+  return satCatcherRun(display);
 }
 
 // Pet stats persistence (single checksummed NVS record)

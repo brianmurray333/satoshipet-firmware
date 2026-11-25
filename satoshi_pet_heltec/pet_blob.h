@@ -62,6 +62,11 @@ int handleLightningGame(SSD1306Wire &display); // Returns happiness increase (0 
 // Sat Catcher: tap to turn the pet around, catch falling sats, dodge rocks.
 // Applies its own happiness reward and leaderboard; returns the reward.
 int handleSatCatcherGame(SSD1306Wire &display);
+
+// Room turns: one run on the room's shared course (same seed for every player).
+// Return the score only: no coin cost, happiness or leaderboard.
+int playFlappyRoomTurn(SSD1306Wire &display, uint32_t seed);
+int playSatCatcherRoomTurn(SSD1306Wire &display, uint32_t seed);
 // Shared game-over: +10 happiness, score to the game's leaderboard (game is a
 // PetGame from economy.h), celebration on a top-5/personal best. Returns +10.
 int finishGameWithScore(SSD1306Wire &display, uint8_t game, int score);

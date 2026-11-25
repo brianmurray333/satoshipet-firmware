@@ -19,8 +19,6 @@
 #define PB_POINT_DISPLAY_MS    1500  // Show point result (ms)
 #define PB_COUNTDOWN_SECS      3     // 3-2-1 countdown before game
 #define PB_SERVE_DELAY_MS      800   // Pause before next serve
-#define PB_LOBBY_POLL_MS       2500  // Poll server for lobby state every 2.5s
-#define PB_LOBBY_TIMEOUT_MS    100000UL // Host gives up if nobody joins in 100s
 #define PB_HOST_LOST_MS        5000  // Client ends game after 5s without host packets
 #define PB_ESPNOW_STATE_MS     50    // Send game state every 50ms via ESP-NOW
 
@@ -35,7 +33,7 @@
 
 // Game phases
 enum PickleballPhase : uint8_t {
-  PB_PHASE_LOBBY,        // Waiting for players (server polling)
+  PB_PHASE_LOBBY,        // Not in a match yet (the room screens handle the lobby)
   PB_PHASE_ESPNOW_SYNC,  // Transitioning to ESP-NOW, confirming peers
   PB_PHASE_COUNTDOWN,     // 3-2-1 countdown
   PB_PHASE_SERVING,       // Brief pause before ball launch
@@ -89,13 +87,7 @@ struct PickleballState {
   // Timing
   unsigned long phaseStartTime = 0;
   unsigned long lastStateSend = 0;     // Last ESP-NOW state broadcast (host only)
-  unsigned long lastLobbyPoll = 0;     // Last server poll during lobby
   unsigned long reactionDeadline = 0;  // When reaction window closes
-
-  // Lobby
-  String gameId;            // Server-side game ID
-  String roomCode;          // Short code for optional cross-group joining
-  bool lobbyCancelled = false;  // Server reported the lobby as cancelled
 
   // Animation
   uint8_t ballAnimFrame = 0;
@@ -113,22 +105,36 @@ struct PickleballState {
   // Rally difficulty
   uint8_t volleyCount = 0;            // Volleys in current rally (resets on point)
 
-  // Wagering
-  uint16_t wagerAmount = 0;           // 0 = free, 100/500/1000 sats
-  bool wagerActive = false;           // All players accepted the wager
-  int16_t wagerResult = 0;            // Sats won (+) or lost (-), set after game over
 };
 
 // ---- Public API ----
 
-// Main entry point: runs the entire pickleball game flow
-// Called from menu selection. Blocks until game ends.
-// Returns happiness bonus (0 if no game played)
-int handlePickleballGame(SSD1306Wire &display);
+// One player in a room match, in seat order (seat 0 = host).
+struct PbRosterEntry {
+  uint8_t mac[6];
+  char initial;
+  uint8_t side;      // 0 = left, 1 = right
+  uint8_t position;  // 0 = top, 1 = bottom
+};
+
+struct PbMatchOutcome {
+  bool finished = false;   // a winner was decided on this pet
+  bool iWon = false;
+  uint8_t winnerSide = 0;  // 0 = left, 1 = right
+  uint8_t scoreLeft = 0;
+  uint8_t scoreRight = 0;
+};
+
+// Live match for a started game room: links the pets over ESP-NOW (the room
+// already holds the bets and decided the roster), plays to 6, and fills `out`.
+// The caller reports the result to the room. Blocks until the match ends.
+// Returns the happiness bonus (0 if the match didn't finish).
+int handlePickleballRoomMatch(SSD1306Wire &display, const PbRosterEntry *roster, uint8_t count,
+                              uint8_t myIndex, uint32_t matchGeneration, PbMatchOutcome &out);
 
 // Solo rally streak using the same reaction-window and 1/2-press rules as
 // multiplayer; one miss ends it and the streak goes to the Pickleball
-// leaderboard. No lobby, ESP-NOW or wagers. Applies its own happiness.
+// leaderboard. No room, ESP-NOW or bets. Applies its own happiness.
 int handlePickleballPractice(SSD1306Wire &display);
 
 #endif

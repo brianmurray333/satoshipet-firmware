@@ -12,6 +12,7 @@
   #include "display_assets.h"
   #include "espnow_comm.h"
   #include "pickleball.h"
+#include "game_rooms.h"
   #include <esp_task_wdt.h>  // Watchdog timer support (framework auto-initializes)
   #include <esp_idf_version.h>
   #include <esp_sleep.h>
@@ -101,7 +102,6 @@
   }
 
   bool isPaired = false;  
-  String pendingPickleballGameId = "";
   unsigned long lastUpdate = 0;
   // Server pollInterval is in seconds; clamp so config can't create a battery-heavy loop.
   const long DEFAULT_POLL_INTERVAL_S = 60;
@@ -1810,31 +1810,32 @@
             renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);
           } else if (selectedOption == 1) {
             static const char* const GAME_OPTIONS[] = {"Flappy Pet", "Pickleball", "Sat Catcher", "Back"};
-            static const char* const PICKLEBALL_OPTIONS[] = {"Solo", "2 Players", "Back"};
+            static const char* const MODE_OPTIONS[] = {"Solo", "With friends", "Back"};
+            static const uint8_t GAME_IDS[] = {GAME_FLAPPY, GAME_PICKLEBALL, GAME_SATCATCHER};
             int game = runListMenu("Choose game", GAME_OPTIONS, 4);
-            if (game == 1) {  // Pickleball: pick solo or 2 players next
-              int mode = runListMenu("Pickleball", PICKLEBALL_OPTIONS, 3);
-              game = mode == 0 ? 10 : mode == 1 ? 11 : -1;
+            int mode = -1;
+            if (game >= 0) {
+              // Same choice for every game: play alone, or a room with friends
+              mode = runListMenu(GAME_OPTIONS[game], MODE_OPTIONS, 3);
             }
-            if (game == 0 || game == 2 || game == 10 || game == 11) {
+            if (mode >= 0) {
               playMenuSelectToneBlocking();  // Games run their own blocking loops
             }
-            if (game == 0) {
-              handleLightningGame(display);        // Applies its own happiness and leaderboard
-            } else if (game == 2) {
-              handleSatCatcherGame(display);       // Applies its own happiness and leaderboard
-            } else if (game == 10) {
-              handlePickleballPractice(display);   // Solo rally: own happiness and leaderboard
-            } else if (game == 11) {
+            if (mode == 0) {
+              // Solo: each applies its own happiness and leaderboard
+              if (game == 0) handleLightningGame(display);
+              else if (game == 1) handlePickleballPractice(display);
+              else handleSatCatcherGame(display);
+            } else if (mode == 1) {
 #ifdef WOKWI_SIMULATOR
               display.clear();
               display.setTextAlignment(TEXT_ALIGN_CENTER);
-              display.drawString(64, 22, "Multiplayer needs");
+              display.drawString(64, 22, "Friends games need");
               display.drawString(64, 38, "physical devices");
               display.display();
               delay(1800);
 #else
-              applyGameHappinessBonus(handlePickleballGame(display));
+              applyGameHappinessBonus(runFriendsGame(display, GAME_IDS[game]));
 #endif
             }
             int batteryPct = getBatteryPercentage();
