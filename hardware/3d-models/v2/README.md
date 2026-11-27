@@ -16,7 +16,7 @@ what didn't work in v1.
 | Closing | friction only | snap ridges on both long sides (`snap`) |
 | USB-C opening | 10 × 4 mm (most cable plugs don't seat) | 9.8 × 4.2 mm around the socket, which reaches to 0.9 mm from the outside |
 | Battery | loose in the back cavity | 5.5 mm ribs hold an 802540 (8 × 25 × 40 mm); the wire end has open corners so the leads can't jam |
-| Buzzer | glued | ring holder + 7-hole sound grille |
+| Buzzer | glued | press-fit ring (crush ribs) + 7-hole sound grille; solder wells under its two pin holes |
 | Button | glued | socket for a 6 × 6 mm tactile switch |
 | Board | 0.7 mm pin holes in rails | rails + side guides; USB-C end tucks into its opening, the other end clicks under two snap hooks (0.1 mm play) |
 
@@ -50,12 +50,15 @@ All parts are already oriented for printing (outside face down, no supports need
 
 ## Assembly (PRG-key front)
 
-1. Press the buzzer into its ring (face toward the grille), wires out through the slot toward the board.
-2. Solder the buzzer to **GPIO 46 and GPIO 45**: the last two holes on that header, at the board's
-   keyring end (either way round). The firmware drives 46 and holds 45 low, so there's no wire to the
-   GND pin at the far end and both leads stay short, clear of the battery.
-3. Put the board in screen-first, **USB-C end first**: tip it so the socket goes into the end-wall
+1. Press the buzzer into its ring (face toward the grille, leads out through the slot toward the
+   board). Three crush ribs hold it snug.
+2. Put the board in screen-first, **USB-C end first**: tip it so the socket goes into the end-wall
    opening, then press the other end down until it clicks under the two hooks.
+3. Solder the buzzer to **GPIO 46 and GPIO 45**, the last two holes on that header at the keyring end
+   (either way round). The rails are cut away under those holes (and under the matching holes on the
+   other row), so feed each lead up through its hole from underneath and solder on top. The firmware
+   drives 46 and holds 45 low, so nothing runs to the GND pin at the far end and both leads stay
+   short, clear of the battery.
 4. Put the battery in the back half with its **wire end toward the keyring** (the end with the single
    centre stop); the leads leave through either open corner. A thin foam pad on top keeps it from
    rattling. Plug it in.
@@ -63,7 +66,7 @@ All parts are already oriented for printing (outside face down, no supports need
 
 To take the board out, push the hooks back toward the buzzer with a fingernail and lift that end.
 
-![snap hooks](previews/board-hooks.png) ![battery pocket](previews/battery-pocket.png)
+![snap hooks](previews/board-hooks.png) ![solder wells and buzzer ribs](previews/solder-wells.png) ![battery pocket](previews/battery-pocket.png)
 
 Earlier wiring (buzzer on GPIO 48 + GND, wired button on GPIO 2) still works with the same firmware.
 

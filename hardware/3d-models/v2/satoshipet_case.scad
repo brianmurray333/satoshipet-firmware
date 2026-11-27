@@ -63,6 +63,15 @@ hook_lip  = 0.6;   // how far the hook reaches over the PCB end
 hook_play = 0.1;   // lengthwise play: hook face to PCB end
 hook_zgap = 0.1;   // vertical play under the hook
 hook_in   = 2.2;   // hook position in from the PCB's long edges
+// Solder wells: the rails are cut away under the last two pin holes at the
+// keyring end (GPIO 46/45 on one row, 1/2 on the other), so the buzzer leads
+// can come up through the holes from the screen side and be soldered on top.
+// Heltec V3 headers: 18 holes at 2.54 mm, first hole centre ~3.5 mm from the
+// PCB end, hole centres ~1.3 mm in from the long edges.
+pin_pitch  = 2.54;
+pin_first  = 3.5;   // first hole centre from the PCB's keyring end
+well_holes = 2;     // holes cleared per row
+well_pad   = 1.6;   // extra length past the outer hole centres
 
 /* ---------- screen window ---------- */
 win_cx = 13.3;                 // across: ~3 mm toward one pin row (fit confirmed on the v2 print)
@@ -72,7 +81,8 @@ win_chamfer = true;            // 45 deg bevel out to the front face
 
 /* ---------- other parts ---------- */
 key_c   = [6, 6.6];  key_d = 5.5; key_od = 9;    // keyring tube through both halves
-buz_c   = [16.3, 9.6]; buz_d = 12.4; buz_h = 4;  // buzzer ring, sound grille in front
+buz_c   = [16.3, 9.6]; buz_d = 12.4; buz_h = 5;  // buzzer ring, sound grille in front
+buz_grip = 11.9;     // three crush ribs inside the ring: a 12 mm buzzer presses in snug
 btn_c   = [27, 13];  btn_hole = 3.8; btn_sock = 6.4; btn_sock_h = 3.0; // 6x6 tactile
 btn_body_h = 3.5;    // switch body height (6x6 switches: 3.5 mm whatever the plunger length)
 stop_gap   = 0.3;    // backstop clearance above the switch body when closed
@@ -224,9 +234,16 @@ module front_half() {
       translate([key_c[0], key_c[1], 0]) cylinder(d = key_od, h = split);
       // buzzer ring
       translate([buz_c[0], buz_c[1], floor_f - eps]) difference() {
-        cylinder(d = buz_d + 2, h = buz_h);
-        translate([0, 0, -eps]) cylinder(d = buz_d, h = buz_h + 1);
-        translate([-1.5, 0, 1]) cube([3, 10, buz_h]);  // wire exit
+        union() {
+          difference() {
+            cylinder(d = buz_d + 2, h = buz_h);
+            translate([0, 0, -eps]) cylinder(d = buz_d, h = buz_h + 1);
+          }
+          // crush ribs, chamfered at the top so the buzzer starts in easily
+          for (a = [30, 150, 270]) rotate(a) translate([buz_grip/2 + 0.6, 0, 0])
+            hull() { cylinder(r = 0.6, h = buz_h - 1, $fn = 12); translate([0.5, 0, 0]) cylinder(r = 0.6, h = buz_h, $fn = 12); }
+        }
+        translate([-1.5, 0, 1]) cube([3, 10, buz_h]);  // wire exit, toward the board
       }
       // tactile button socket (not needed with the PRG key)
       if (!PRG_KEY) translate([btn_c[0] - btn_sock/2 - 1, btn_c[1] - btn_sock/2 - 1, floor_f - eps])
@@ -236,6 +253,10 @@ module front_half() {
           translate([btn_sock/2 - 1, -eps, 1]) cube([2, 1.2, btn_sock_h]);  // leg/wire slot
         }
     }
+    // solder wells in both rails under the first holes at the keyring end
+    for (xr = [board_x0, board_x0 + board_w - rail_w])
+      translate([xr - eps, board_y0 + pin_first - well_pad, floor_f])
+        cube([rail_w + 2*eps, (well_holes - 1) * pin_pitch + 2*well_pad, oled_stack + 1]);
     // screen window (+ bevel)
     translate([win_cx, win_cy, 0]) {
       translate([-win_x/2, -win_y/2, -1]) cube([win_x, win_y, floor_f + 2]);
