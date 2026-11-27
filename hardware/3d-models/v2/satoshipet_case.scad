@@ -60,19 +60,26 @@ oled_stack= 5.2;   // gap from the front wall to the PCB: the OLED glass and
 rail_w    = 2.0;   // PCB rests on these along its long edges
 // Board retention. Assembly: USB-C end first (the socket slides into its
 // opening, which holds that end down), then lower the keyring end until it
-// clicks under one wide, thin snap wall in front of the board's middle flat.
-// Two rigid stops at the start of the angled edges hold the board lengthwise
-// (a cable being plugged in pushes it toward the keyring) and centre it.
-// Keep everything at the keyring end clear of the OLED's glass/frame, which
-// sits under the PCB and sticks out past the cut corners (see oled_* below).
-kw_play   = 0.15;  // gap from snap wall / stops to the PCB edge
-snap_t    = 0.8;   // snap wall thickness (2 perimeters): thin = low strain
-snap_inset= 0.6;   // snap wall ends this far in from each end of the 10 mm middle flat
-snap_lip  = 0.4;   // lip reach over the PCB (= how far the wall bends, ~1% strain)
-snap_lip_t= 1.0;   // lip thickness
+// clicks under a snap beam that spans the case from side wall to side wall,
+// just past the board's end. The beam is clear of the floor, so it bends
+// sideways along its layer lines (the strong direction for a print) instead
+// of across them; it reaches over the board only along the middle flat.
+// Rigid stops in front of the corner flats hold the board lengthwise (a cable
+// being plugged in pushes it toward the keyring). The back half's lip is
+// notched where the beam meets the side walls. Keep everything at the keyring
+// end clear of the OLED's glass/frame, which sits under the PCB and sticks
+// out past the cut corners (see oled_* below).
+kw_play   = 0.15;  // gap from snap beam / stops to the PCB edge
+beam_t    = 1.0;   // beam thickness along the case (bending ~12*t*d/L^2 = ~0.6%)
+beam_z0   = 5.0;   // beam underside (clear of the floor, printed as a bridge)
+beam_top  = 9.4;   // beam top (just under the back half's lip bridge at 9.5)
+snap_inset= 0.6;   // lip ends this far in from each end of the 10 mm middle flat
+snap_lip  = 0.4;   // lip reach over the PCB (= how far the beam bends)
 snap_zgap = 0.1;   // vertical play under the lip
-stop_t    = 1.6;   // rigid stops: thickness
-stop_len  = 1.8;   // rigid stops: length along each angled edge from the middle flat
+notch_clr = 0.3;   // back half lip notch: clearance around the beam
+stop_len  = 1.5;   // corner stops: depth along the case
+stop_in   = 0.3;   // corner stops start this far in from the PCB's long edge
+stop_glass= 0.4;   // corner stops end this far short of the OLED glass
 // OLED glass + clear frame, under the PCB (measured from a photo with a ruler):
 // starts 2.4 mm in from the PCB's middle flat, spans 3.0-23.1 mm across from
 // the PCB's low-x long edge.
@@ -209,34 +216,32 @@ module key_nub() {
   translate([prg_c[0], prg_c[1], floor_f - eps]) cylinder(d = key_nub_d, h = nub_end - floor_f + eps, $fn = 24);
 }
 
-/* ---------- keyring end: snap wall + rigid stops ---------- */
+/* ---------- keyring end: snap beam + corner stops ---------- */
 function kw_dx() = (board_w - pcb_mid_w) / 2 - pcb_corner_w;   // 3.75 across each angled edge
-module board_stop_left() {
-  // rigid post outside the left angled edge, next to the middle flat
-  dx = kw_dx(); dy = pcb_corner_back;
-  ang = atan2(-dy, dx);                          // edge direction, corner flat -> middle flat
-  B = [board_x0 + pcb_corner_w + dx, board_y0];  // where the angled edge meets the middle flat
-  translate([B[0], B[1], floor_f - eps]) rotate(ang)
-    hull() {
-      translate([-stop_len, -kw_play - stop_t, 0]) cube([stop_len, stop_t, pcb_z0 + pcb_t - floor_f - 0.4]);
-      translate([-stop_len, -kw_play - stop_t, 0]) cube([stop_len, stop_t - 0.4, pcb_z0 + pcb_t - floor_f + eps]);
-    }
-}
+function beam_y1() = board_y0 - kw_play;              // beam face toward the board
+function beam_y0() = beam_y1() - beam_t;
 module board_retention() {
-  board_stop_left();
-  translate([W, 0, 0]) mirror([1, 0, 0]) board_stop_left();
-  // snap wall in front of the middle flat, lip ramped on top
+  z_lip = pcb_z0 + pcb_t + snap_zgap;                 // lip underside
+  // snap beam: side wall to side wall, clear of the floor
+  translate([wall - eps, beam_y0(), beam_z0]) cube([W - 2*wall + 2*eps, beam_t, beam_top - beam_z0]);
+  // lip over the middle flat, ramped on top so the board pushes the beam back
   xm0 = board_x0 + pcb_corner_w + kw_dx() + snap_inset;
   wlen = pcb_mid_w - 2 * snap_inset;
-  y1 = board_y0 - kw_play;                       // wall face
-  z_lip = pcb_z0 + pcb_t + snap_zgap;
-  translate([xm0, 0, 0]) {
-    translate([0, y1 - snap_t, floor_f - eps]) cube([wlen, snap_t, z_lip - floor_f + eps]);
-    hull() {
-      translate([0, y1 - snap_t, z_lip]) cube([wlen, snap_t + kw_play + snap_lip, 0.3]);
-      translate([0, y1 - snap_t, z_lip + snap_lip_t]) cube([wlen, snap_t, eps]);
-    }
+  translate([xm0, 0, 0]) hull() {
+    translate([0, beam_y0(), z_lip]) cube([wlen, beam_t + kw_play + snap_lip, 0.3]);
+    translate([0, beam_y0(), beam_top - eps]) cube([wlen, beam_t, eps]);
   }
+  // rigid corner stops in front of the corner flats, clear of the OLED glass
+  ys = board_y0 + pcb_corner_back - kw_play;          // stop face
+  zs = pcb_z0 + pcb_t;                                // stop top = PCB top
+  translate([board_x0 + stop_in, ys - stop_len, floor_f - eps])
+    cube([oled_x0 - stop_glass - stop_in, stop_len, zs - floor_f + eps]);
+  translate([board_x0 + oled_x1 + stop_glass, ys - stop_len, floor_f - eps])
+    cube([board_w - stop_in - oled_x1 - stop_glass, stop_len, zs - floor_f + eps]);
+}
+// cut from the back half's lip where the beam meets the side walls
+module beam_notch() {
+  translate([-1, beam_y0() - notch_clr, beam_z0 - 1]) cube([W + 2, beam_t + 2*notch_clr, beam_top - beam_z0 + 1 + notch_clr]);
 }
 
 /* ---------- front half (screen side) ---------- */
@@ -282,8 +287,8 @@ module front_half() {
     }
     // solder wells in both rails under the first holes at the keyring end
     for (xr = [board_x0, board_x0 + board_w - rail_w])
-      translate([xr - eps, board_y0 + pin_first - well_pad, floor_f])
-        cube([rail_w + 2*eps, (well_holes - 1) * pin_pitch + 2*well_pad, oled_stack + 1]);
+      translate([xr - eps, board_y0 + pcb_corner_back, floor_f])
+        cube([rail_w + 2*eps, pin_first + (well_holes - 1) * pin_pitch + well_pad - pcb_corner_back, oled_stack + 1]);
     // screen window (+ bevel)
     translate([win_cx, win_cy, 0]) {
       translate([-win_x/2, -win_y/2, -1]) cube([win_x, win_y, floor_f + 2]);
@@ -335,6 +340,7 @@ module back_half() {
           }
         }
         translate([key_c[0], key_c[1], split - lip_h - 1]) cylinder(d = key_od + 2*clr + 0.4, h = lip_h + 2);
+        beam_notch();  // the front half's snap beam passes through here
         // clear the PCB end at the USB-C wall
         translate([board_x0 - 0.3, L - wall - lip_t - clr - 1, split - lip_h - 1]) cube([board_w + 0.6, lip_t + clr + 1.5, pcb_z0 + pcb_t + 0.4 - (split - lip_h) + 1]);
       }

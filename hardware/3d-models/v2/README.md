@@ -18,7 +18,7 @@ what didn't work in v1.
 | Battery | loose in the back cavity | 5.5 mm ribs hold an 802540 (8 × 25 × 40 mm); the wire end has open corners so the leads can't jam |
 | Buzzer | glued | press-fit ring (crush ribs) + 7-hole sound grille; solder wells under its two pin holes |
 | Button | glued | socket for a 6 × 6 mm tactile switch |
-| Board | 0.7 mm pin holes in rails | rails + side guides; USB-C end slides into its opening, the keyring end clicks under one wide, thin snap wall (~1% bend); two rigid stops hold it lengthwise. Clear of the OLED glass |
+| Board | 0.7 mm pin holes in rails | rails + side guides; USB-C end slides into its opening, the keyring end clicks under a snap beam spanning side wall to side wall (bends along its layer lines, ~0.6%); rigid stops at the corner flats hold it lengthwise. Clear of the OLED glass |
 
 ## Files
 
@@ -30,7 +30,7 @@ what didn't work in v1.
 | `stl/classic-front-prg-key.stl` | Same, in the classic box shape (use with `stl/classic-back.stl`) |
 | `stl/prg-test-A.stl`, `-B`, `-C` | The USB-C end of that front (~12 min each), with the key's nub 0.3 / 0.6 / 0.9 mm above the button. Pick the one that clicks when pressed and not at rest |
 | `stl/pebble-back-button-stopper.stl` | Pebble back with a post that holds the wired button's switch against the front wall, so it can't sink (use with `stl/pebble-front.stl`) |
-| `stl/screen-test.stl` | Front wall + rails + snap wall and stops (~10 min). Click the board in (USB-C end first) to check the snap, screen depth and window position before printing a full case |
+| `stl/screen-test.stl` | Front wall + rails + snap beam and corner stops (~10 min). Click the board in (USB-C end first) to check the snap, screen depth and window position before printing a full case |
 | `stl/fit-test.stl` | The USB-C end of both halves (~15 min). Checks the lip/snap fit and the USB-C opening |
 | `satoshipet_case.scad`, `artwork.scad` | OpenSCAD source; every dimension is a named parameter at the top |
 
@@ -53,10 +53,12 @@ All parts are already oriented for printing (outside face down, no supports need
 1. Press the buzzer into its ring (face toward the grille, leads out through the slot toward the
    board). Three crush ribs hold it snug.
 2. Put the board in screen-first, **USB-C end first**: tilt it so the socket slides into its opening,
-   then lower the keyring end until it clicks under the snap wall in front of the board's middle flat
-   (measured on a V3.1: 10 mm middle flat, corners set back 4 mm, angled edges between). The wall is
-   ~9 mm wide and 0.8 mm thick and bends only 0.4 mm (~1 %), so press gently. Two rigid stops at the
-   start of the angled edges hold the board lengthwise when a cable is plugged in, and centre it.
+   then lower the keyring end until it clicks under the snap beam just past the board's end. The beam
+   runs from side wall to side wall, clear of the floor, so it bends sideways along its layer lines
+   (the strong direction for a print) and only ~0.6 %; its ramped lip reaches 0.4 mm over the board's
+   10 mm middle flat (measured on a V3.1: corners set back 4 mm, angled edges between). Two rigid stops
+   in front of the corner flats hold the board lengthwise when a cable is plugged in. The back half's
+   lip is notched where the beam meets the side walls.
    Everything at that end is kept clear of the OLED glass, which sits under the board and sticks out
    past its cut corners. The corner flats stay open for the buzzer wires and the solder wells.
 3. Wire the buzzer to the last two holes on that header at the keyring end: **red (+) to GPIO 46**
@@ -71,9 +73,9 @@ All parts are already oriented for printing (outside face down, no supports need
    rattling. Plug it in.
 5. Snap the halves together and thread the keyring through the corner tube.
 
-To take the board out, ease the snap wall back toward the buzzer with a fingernail and lift the keyring end.
+To take the board out, ease the middle of the beam back toward the buzzer with a fingernail and lift the keyring end.
 
-![snap wall and stops](previews/board-hooks.png) ![top: board green, OLED glass light purple](previews/board-hooks-top.png) ![solder wells and buzzer ribs](previews/solder-wells.png) ![battery pocket](previews/battery-pocket.png)
+![snap beam and corner stops](previews/board-hooks.png) ![top: board green, OLED glass light purple](previews/board-hooks-top.png) ![solder wells and buzzer ribs](previews/solder-wells.png) ![battery pocket](previews/battery-pocket.png)
 
 Earlier wiring (buzzer on GPIO 48 + GND, wired button on GPIO 2) still works with the same firmware.
 
