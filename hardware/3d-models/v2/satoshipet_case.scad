@@ -58,16 +58,20 @@ oled_stack= 5.2;   // gap from the front wall to the PCB: the OLED glass and
                    // the USB-C socket sit on this side. Measured glass on a
                    // V3: 5 mm tall x 33 x 19 mm, plus 0.2 mm clearance.
 rail_w    = 2.0;   // PCB rests on these along its long edges
-// Snap hooks at the keyring end of the board, one along each angled edge, in
-// the dead space beside it: the USB-C end goes in first (its socket sits in the
-// end-wall opening, which holds that end down), then the other end is pressed
-// down and clicks under both hooks. Their angled faces also stop the board
-// sliding toward the keyring and centre it side to side.
-hook_len  = 4.0;   // along the angled edge (it is ~5.5 mm long)
-hook_t    = 1.2;   // post thickness (thinner = softer click)
-hook_lip  = 0.6;   // how far the hook reaches over the PCB edge
-hook_play = 0.1;   // gap from the hook face to the PCB edge
-hook_zgap = 0.1;   // vertical play under the hook
+// Board retention, no flexing parts (thin snap hooks printed upright broke):
+// the keyring end tucks under a lip on a solid end wall that follows the
+// board's middle flat and angled edges; the USB-C socket drops into a slot
+// that is open at the top, and a tongue on the back half fills that slot when
+// the case closes, clamping the USB-C end down.
+kw_t      = 1.6;   // keyring end wall thickness
+kw_play   = 0.15;  // gap from the wall to the PCB edge
+kw_lip    = 0.7;   // lip reach over the PCB edge
+kw_lip_t  = 1.2;   // lip thickness
+kw_zgap   = 0.1;   // vertical play under the lip
+kw_diag_lip = 2.4; // lip runs this far along each angled edge from the middle flat
+                   // (stops short of the screw heads near the corners)
+tongue_clr = 0.2;  // per side, tongue in the USB-C slot
+tongue_gap = 0.2;  // tongue bottom above the USB-C socket's shell
 // Solder wells: the rails are cut away under the last two pin holes at the
 // keyring end (GPIO 46/45 on one row, 1/2 on the other), so the buzzer leads
 // can come up through the holes from the screen side and be soldered on top.
@@ -200,27 +204,37 @@ module key_nub() {
   translate([prg_c[0], prg_c[1], floor_f - eps]) cylinder(d = key_nub_d, h = nub_end - floor_f + eps, $fn = 24);
 }
 
-/* ---------- board snap hooks ---------- */
-// The left angled edge runs from the corner flat (board_x0 + 4, board_y0 + 4)
-// to the middle flat (board_x0 + 7.75, board_y0); the right one mirrors it.
-module board_hook_left() {
-  dx = (board_w - pcb_mid_w) / 2 - pcb_corner_w;   // 3.75 across
-  dy = pcb_corner_back;                            // 4 along
-  ang = atan2(-dy, dx);                            // edge direction
-  mid = [board_x0 + pcb_corner_w + dx/2, board_y0 + dy/2];
-  z_top = pcb_z0 + pcb_t + hook_zgap;              // underside of the lip
-  // local frame: x along the edge, +y into the board
-  translate([mid[0], mid[1], 0]) rotate(ang) {
-    translate([-hook_len/2, -hook_play - hook_t, floor_f - eps]) cube([hook_len, hook_t, z_top - floor_f + eps]);
-    hull() {
-      translate([-hook_len/2, -hook_play - hook_t, z_top]) cube([hook_len, hook_t + hook_play + hook_lip, 0.4]);
-      translate([-hook_len/2, -hook_play - hook_t, z_top + 1.2]) cube([hook_len, hook_t, eps]);
-    }
+/* ---------- keyring end wall ---------- */
+function kw_dx() = (board_w - pcb_mid_w) / 2 - pcb_corner_w;   // 3.75 across each angled edge
+// the board's keyring end as a 2D region (middle flat + angled edges), extended
+// well into the board so offsets only act on the end edge
+module kw_end_2d() {
+  xm0 = board_x0 + pcb_corner_w + kw_dx();
+  polygon([[board_x0 + pcb_corner_w, board_y0 + pcb_corner_back], [xm0, board_y0],
+           [xm0 + pcb_mid_w, board_y0], [board_x0 + board_w - pcb_corner_w, board_y0 + pcb_corner_back],
+           [board_x0 + board_w - pcb_corner_w, board_y0 + 30], [board_x0 + pcb_corner_w, board_y0 + 30]]);
+}
+// band between `a` outside and `b` outside the end edge (negative = inside),
+// kept to the end (in front of the corner flats' line)
+module kw_band_2d(a, b) {
+  intersection() {
+    difference() { offset(delta = a) kw_end_2d(); offset(delta = b) kw_end_2d(); }
+    translate([0, board_y0 - 10]) square([W, 10 + pcb_corner_back]);
   }
 }
-module board_hooks() {
-  board_hook_left();
-  translate([W, 0, 0]) mirror([1, 0, 0]) board_hook_left();
+module keyring_wall() {
+  z_lip = pcb_z0 + pcb_t + kw_zgap;            // underside of the lip
+  dlen = sqrt(pow(kw_dx(), 2) + pow(pcb_corner_back, 2));
+  xm0 = board_x0 + pcb_corner_w + kw_dx();
+  // wall, kw_play outside the board edge
+  translate([0, 0, floor_f - eps]) linear_extrude(z_lip + kw_lip_t - floor_f + eps)
+    kw_band_2d(kw_play + kw_t, kw_play);
+  // lip reaching kw_lip over the board: middle flat + kw_diag_lip along each angled edge
+  translate([0, 0, z_lip]) linear_extrude(kw_lip_t) intersection() {
+    kw_band_2d(kw_play + kw_t, -kw_lip);
+    translate([xm0 - kw_dx() * kw_diag_lip / dlen - 2, board_y0 - 10])
+      square([pcb_mid_w + 2 * kw_dx() * kw_diag_lip / dlen + 4, 10 + pcb_corner_back * kw_diag_lip / dlen]);
+  }
 }
 
 /* ---------- front half (screen side) ---------- */
@@ -240,7 +254,7 @@ module front_half() {
         gw = s == 0 ? board_x0 - 0.15 - wall + eps : W - wall - xg + eps;
         translate([xg, board_y0, floor_f - eps]) cube([gw, board_l, min(oled_stack + pcb_t, split - lip_h - 0.3 - floor_f) + eps]);
       }
-      board_hooks();
+      keyring_wall();
       // keyring tube
       translate([key_c[0], key_c[1], 0]) cylinder(d = key_od, h = split);
       // buzzer ring
@@ -254,7 +268,7 @@ module front_half() {
           for (a = [30, 150, 270]) rotate(a) translate([buz_grip/2 + 0.6, 0, 0])
             hull() { cylinder(r = 0.6, h = buz_h - 1, $fn = 12); translate([0.5, 0, 0]) cylinder(r = 0.6, h = buz_h, $fn = 12); }
         }
-        translate([-1.5, 0, 1]) cube([3, 10, buz_h]);  // wire exit, toward the board
+        rotate(-90) translate([-1.5, 0, 1]) cube([3, 10, buz_h]);  // wire exit, sideways (the end wall is toward the board)
       }
       // tactile button socket (not needed with the PRG key)
       if (!PRG_KEY) translate([btn_c[0] - btn_sock/2 - 1, btn_c[1] - btn_sock/2 - 1, floor_f - eps])
@@ -287,8 +301,9 @@ module front_half() {
     if (!PRG_KEY) translate([btn_c[0], btn_c[1], -1]) cylinder(d = btn_hole, h = floor_f + 2);
     if (PRG_KEY) key_slot_cut();
     if (!PRG_KEY) translate([pin_c[0], pin_c[1], -1]) cylinder(d = pin_d, h = floor_f + 2, $fn = 16);
-    // USB-C opening in the end wall
-    translate([W/2 - usb_w/2, L - wall - 1, usb_z0]) cube([usb_w, wall + 2, usb_h]);
+    // USB-C opening in the end wall, open to the top so the socket drops in
+    // (the back half's tongue closes the top when the case is shut)
+    translate([W/2 - usb_w/2, L - wall - 1, usb_z0]) cube([usb_w, wall + 2, split - usb_z0 + 1]);
     // groove for the snap ridges
     snap_ridges(extra = 0.1);
     // Bitcoin logo, engraved in the front face
@@ -323,6 +338,12 @@ module back_half() {
         translate([board_x0 - 0.3, L - wall - lip_t - clr - 1, split - lip_h - 1]) cube([board_w + 0.6, lip_t + clr + 1.5, pcb_z0 + pcb_t + 0.4 - (split - lip_h) + 1]);
       }
       snap_ridges();
+      // tongue: fills the top of the USB-C slot, clamping the socket down
+      intersection() {
+        outer_body();
+        translate([W/2 - usb_w/2 + tongue_clr, L - wall + 0.05, usb_z0 + usb_h/2 + 1.6 + tongue_gap])
+          cube([usb_w - 2*tongue_clr, wall + 1, split - (usb_z0 + usb_h/2 + 1.6 + tongue_gap) + 1]);
+      }
       // keyring tube
       translate([key_c[0], key_c[1], split]) cylinder(d = key_od, h = T - split);
       // button backstop: tapered post from the back wall down to just above the

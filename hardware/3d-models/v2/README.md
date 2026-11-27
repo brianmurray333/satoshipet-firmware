@@ -14,11 +14,11 @@ what didn't work in v1.
 | Screen window | 15.5 × 26.5 mm straight-walled, 2 mm wall | 13.5 × 25 mm over the OLED's dark area, 1.6 mm wall bevelled 45° |
 | Lip fit | 0 mm clearance (lip 29.0 × 66.3 into a 29.0 × 66.2 opening) | 0.2 mm per side (`clr`) |
 | Closing | friction only | snap ridges on both long sides (`snap`) |
-| USB-C opening | 10 × 4 mm (most cable plugs don't seat) | 9.8 × 4.2 mm around the socket, which reaches to 0.9 mm from the outside |
+| USB-C opening | 10 × 4 mm (most cable plugs don't seat) | 9.8 mm slot open at the top of the front half; a tongue on the back half closes it to a 9.8 × 4.2 mm opening around the socket |
 | Battery | loose in the back cavity | 5.5 mm ribs hold an 802540 (8 × 25 × 40 mm); the wire end has open corners so the leads can't jam |
 | Buzzer | glued | press-fit ring (crush ribs) + 7-hole sound grille; solder wells under its two pin holes |
 | Button | glued | socket for a 6 × 6 mm tactile switch |
-| Board | 0.7 mm pin holes in rails | rails + side guides; USB-C end tucks into its opening, the other end clicks under two angled snap hooks along the board's cut corners (0.1 mm play) |
+| Board | 0.7 mm pin holes in rails | rails + side guides; keyring end tucks under a lip on a solid end wall that follows the board's end; the USB-C socket drops into a slot the back half's tongue closes. No flexing parts |
 
 ## Files
 
@@ -30,7 +30,7 @@ what didn't work in v1.
 | `stl/classic-front-prg-key.stl` | Same, in the classic box shape (use with `stl/classic-back.stl`) |
 | `stl/prg-test-A.stl`, `-B`, `-C` | The USB-C end of that front (~12 min each), with the key's nub 0.3 / 0.6 / 0.9 mm above the button. Pick the one that clicks when pressed and not at rest |
 | `stl/pebble-back-button-stopper.stl` | Pebble back with a post that holds the wired button's switch against the front wall, so it can't sink (use with `stl/pebble-front.stl`) |
-| `stl/screen-test.stl` | Front wall + rails + snap hooks (~10 min). Click the board in to check the hooks, screen depth and window position before printing a full case |
+| `stl/screen-test.stl` | Front wall + rails + keyring end wall (~10 min). Tilt the board in to check the lip, USB-C slot, screen depth and window position before printing a full case |
 | `stl/fit-test.stl` | The USB-C end of both halves (~15 min). Checks the lip/snap fit and the USB-C opening |
 | `satoshipet_case.scad`, `artwork.scad` | OpenSCAD source; every dimension is a named parameter at the top |
 
@@ -52,10 +52,12 @@ All parts are already oriented for printing (outside face down, no supports need
 
 1. Press the buzzer into its ring (face toward the grille, leads out through the slot toward the
    board). Three crush ribs hold it snug.
-2. Put the board in screen-first, **USB-C end first**: tip it so the socket goes into the end-wall
-   opening, then press the other end down until it clicks under the two hooks. The hooks sit along
-   the board's angled corner edges at the keyring end (measured on a V3.1: 10 mm middle flat,
-   corners set back 4 mm), so they hold it down, stop it sliding toward the keyring and centre it.
+2. Put the board in screen-first, **keyring end first**: tilt it, slide its keyring end under the lip
+   of the end wall by the buzzer, then lower the USB-C end so the socket drops into its slot. Nothing
+   needs to flex. The end wall follows the board's end (measured on a V3.1: 10 mm middle flat, corners
+   set back 4 mm, angled edges between); its lip covers the middle flat and the first 2.4 mm of each
+   angled edge, short of the two screws at that end (leave them in). The corner flats stay open for
+   the buzzer wires and the solder wells.
 3. Wire the buzzer to the last two holes on that header at the keyring end: **red (+) to GPIO 46**
    (the end hole, tone) and **white (−) to GPIO 45** (next to it, held low as ground). Solder the
    wires to the buzzer's prongs first, run them flat over the top of the board, push each end
@@ -68,9 +70,10 @@ All parts are already oriented for printing (outside face down, no supports need
    rattling. Plug it in.
 5. Snap the halves together and thread the keyring through the corner tube.
 
-To take the board out, push the hooks outward with a fingernail and lift that end.
+To take the board out, lift the USB-C end and slide the board out from under the lip. When the case is
+closed, the back half's tongue fills the top of the USB-C slot and holds that end down.
 
-![snap hooks](previews/board-hooks.png) ![snap hooks, top](previews/board-hooks-top.png) ![solder wells and buzzer ribs](previews/solder-wells.png) ![battery pocket](previews/battery-pocket.png)
+![keyring end wall and lip](previews/board-hooks.png) ![end wall, top](previews/board-hooks-top.png) ![solder wells and buzzer ribs](previews/solder-wells.png) ![battery pocket](previews/battery-pocket.png)
 
 Earlier wiring (buzzer on GPIO 48 + GND, wired button on GPIO 2) still works with the same firmware.
 
