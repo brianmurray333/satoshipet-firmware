@@ -15,10 +15,10 @@ what didn't work in v1.
 | Lip fit | 0 mm clearance (lip 29.0 × 66.3 into a 29.0 × 66.2 opening) | 0.2 mm per side (`clr`) |
 | Closing | friction only | snap ridges on both long sides (`snap`) |
 | USB-C opening | 10 × 4 mm (most cable plugs don't seat) | 9.8 × 4.2 mm around the socket, which reaches to 0.9 mm from the outside |
-| Battery | loose in the back cavity | corner ribs hold an 802540 (8 × 25 × 40 mm) |
+| Battery | loose in the back cavity | 5.5 mm ribs hold an 802540 (8 × 25 × 40 mm); the wire end has open corners so the leads can't jam |
 | Buzzer | glued | ring holder + 7-hole sound grille |
 | Button | glued | socket for a 6 × 6 mm tactile switch |
-| Board | 0.7 mm pin holes in rails | rails + side guides; end stops under the board's cut-back corners hold it against the USB-C wall (0.2 mm play) |
+| Board | 0.7 mm pin holes in rails | rails + side guides; USB-C end tucks into its opening, the other end clicks under two snap hooks (0.1 mm play) |
 
 ## Files
 
@@ -26,10 +26,11 @@ what didn't work in v1.
 |---|---|
 | `stl/classic-front.stl`, `stl/classic-back.stl` | Box shape like v1 with small edge chamfers |
 | `stl/pebble-front.stl`, `stl/pebble-back.stl` | Same internals, rounded front/back edges and corners |
-| `stl/pebble-front-prg-key.stl` | Pebble front with a flexing key over the Heltec's own PRG button instead of a wired button (use with `stl/pebble-back.stl`) |
+| `stl/pebble-front-prg-key.stl` | Pebble front with a flexing key over the Heltec's own PRG button instead of a wired button (use with `stl/pebble-back.stl`). **Recommended.** |
+| `stl/classic-front-prg-key.stl` | Same, in the classic box shape (use with `stl/classic-back.stl`) |
 | `stl/prg-test-A.stl`, `-B`, `-C` | The USB-C end of that front (~12 min each), with the key's nub 0.3 / 0.6 / 0.9 mm above the button. Pick the one that clicks when pressed and not at rest |
 | `stl/pebble-back-button-stopper.stl` | Pebble back with a post that holds the wired button's switch against the front wall, so it can't sink (use with `stl/pebble-front.stl`) |
-| `stl/screen-test.stl` | Front wall + rails only (~10 min). Drop the board in to check screen depth and window position before printing a full case |
+| `stl/screen-test.stl` | Front wall + rails + snap hooks (~10 min). Click the board in to check the hooks, screen depth and window position before printing a full case |
 | `stl/fit-test.stl` | The USB-C end of both halves (~15 min). Checks the lip/snap fit and the USB-C opening |
 | `satoshipet_case.scad`, `artwork.scad` | OpenSCAD source; every dimension is a named parameter at the top |
 
@@ -47,13 +48,24 @@ All parts are already oriented for printing (outside face down, no supports need
      Too tight → raise `clr` to 0.25–0.3 or lower `snap`; too loose → lower `clr` to 0.15 or raise `snap` to 0.45.
 - Then print the front and back in the style you like.
 
-## Assembly
+## Assembly (PRG-key front)
 
-1. Press the 6 × 6 mm tactile switch into its socket (actuator through the front hole), wire to GPIO 2 + GND.
-2. Press the buzzer into its ring (face toward the grille), wires out through the slot toward the board.
-3. Drop the board in screen-first; it rests on the rails with the USB-C socket at the opening.
-4. Put the battery in the back half between the corner ribs (a thin foam pad on top keeps it from rattling), plug it in.
+1. Press the buzzer into its ring (face toward the grille), wires out through the slot toward the board.
+2. Solder the buzzer to **GPIO 46 and GPIO 45**: the last two holes on that header, at the board's
+   keyring end (either way round). The firmware drives 46 and holds 45 low, so there's no wire to the
+   GND pin at the far end and both leads stay short, clear of the battery.
+3. Put the board in screen-first, **USB-C end first**: tip it so the socket goes into the end-wall
+   opening, then press the other end down until it clicks under the two hooks.
+4. Put the battery in the back half with its **wire end toward the keyring** (the end with the single
+   centre stop); the leads leave through either open corner. A thin foam pad on top keeps it from
+   rattling. Plug it in.
 5. Snap the halves together and thread the keyring through the corner tube.
+
+To take the board out, push the hooks back toward the buzzer with a fingernail and lift that end.
+
+![snap hooks](previews/board-hooks.png) ![battery pocket](previews/battery-pocket.png)
+
+Earlier wiring (buzzer on GPIO 48 + GND, wired button on GPIO 2) still works with the same firmware.
 
 ## Button stopper (wired button)
 

@@ -18,7 +18,7 @@ PART  = "assembly";
 STYLE = "classic";
 BTN_BACKSTOP = false;  // true: a post on the back half presses the wired button's
                        // switch against the front wall so it can't sink
-PRG_KEY = false;   // true: a flexing key in the front wall presses the Heltec's own
+PRG_KEY = true;    // true: a flexing key in the front wall presses the Heltec's own
                    // PRG button (no wired button, no button hole or socket)
 
 /* ---------- main dimensions ---------- */
@@ -52,6 +52,17 @@ oled_stack= 5.2;   // gap from the front wall to the PCB: the OLED glass and
                    // the USB-C socket sit on this side. Measured glass on a
                    // V3: 5 mm tall x 33 x 19 mm, plus 0.2 mm clearance.
 rail_w    = 2.0;   // PCB rests on these along its long edges
+// Snap hooks at the keyring end of the board: the USB-C end goes in first (its
+// socket sits in the end-wall opening, which holds that end down), then the
+// other end is pressed down and clicks under the hooks. Their faces also stop
+// the board lengthwise. They sit 2.2 mm in from the long edges, clear of the
+// PCB's 1.1 mm cut-back corners.
+hook_w    = 4.0;   // across
+hook_t    = 1.2;   // post thickness along the board (thinner = softer click)
+hook_lip  = 0.6;   // how far the hook reaches over the PCB end
+hook_play = 0.1;   // lengthwise play: hook face to PCB end
+hook_zgap = 0.1;   // vertical play under the hook
+hook_in   = 2.2;   // hook position in from the PCB's long edges
 
 /* ---------- screen window ---------- */
 win_cx = 13.3;                 // across: ~3 mm toward one pin row (fit confirmed on the v2 print)
@@ -71,6 +82,9 @@ usb_w   = 9.8;  usb_h = 4.2;                      // USB-C opening: the socket's
 usb_z0  = floor_f + oled_stack - 1.6 - usb_h/2;   // centred on the socket (3.2 mm tall, under the PCB)
 bat     = [25.6, 40.6, 8.6];                     // battery pocket (802540 + clearance)
 bat_cy  = 43;                                    // pocket centre along y
+bat_rib_h  = 5.5;   // pocket ribs (the battery is 8 mm thick)
+bat_stop_w = 8;     // wire end (keyring end): one centre stop, both corners open
+                    // so the leads can leave from either corner
 engrave = 0.7;                                   // artwork depth
 
 /* ---------- PRG key (PRG_KEY = true) ---------- */
@@ -171,6 +185,23 @@ module key_nub() {
   translate([prg_c[0], prg_c[1], floor_f - eps]) cylinder(d = key_nub_d, h = nub_end - floor_f + eps, $fn = 24);
 }
 
+/* ---------- board snap hooks ---------- */
+module board_hooks() {
+  z_top = pcb_z0 + pcb_t + hook_zgap;    // underside of the hook lip
+  y1 = board_y0 - hook_play;             // hook face (meets the PCB end)
+  // with the wired button its socket sits where the second hook goes
+  for (x = PRG_KEY ? [board_x0 + hook_in, board_x0 + board_w - hook_in - hook_w]
+                   : [board_x0 + hook_in])
+    translate([x, 0, 0]) {
+      translate([0, y1 - hook_t, floor_f - eps]) cube([hook_w, hook_t, z_top - floor_f + eps]);
+      // lip over the PCB, ramped on top so the board pushes the hook back
+      hull() {
+        translate([0, y1 - hook_t, z_top]) cube([hook_w, hook_t + hook_lip, 0.4]);
+        translate([0, y1 - hook_t, z_top + 1.2]) cube([hook_w, hook_t, eps]);
+      }
+    }
+}
+
 /* ---------- front half (screen side) ---------- */
 module front_half() {
   union() {
@@ -187,11 +218,8 @@ module front_half() {
         xg = s == 0 ? wall - eps : board_x0 + board_w + 0.15;
         gw = s == 0 ? board_x0 - 0.15 - wall + eps : W - wall - xg + eps;
         translate([xg, board_y0, floor_f - eps]) cube([gw, board_l, min(oled_stack + pcb_t, split - lip_h - 0.3 - floor_f) + eps]);
-        // end stops at the keyring end of the board, under its cut-back corners:
-        // they meet the corner edge (pcb_notch in from the end), so the board
-        // can't slide away from the USB-C wall
-        translate([xr, board_y0 + pcb_notch - stop_play - 1.5, floor_f - eps]) cube([rail_w, 1.5, oled_stack + pcb_t + eps]);
       }
+      board_hooks();
       // keyring tube
       translate([key_c[0], key_c[1], 0]) cylinder(d = key_od, h = split);
       // buzzer ring
@@ -271,14 +299,20 @@ module back_half() {
         translate([btn_c[0] - stop_tip/2, btn_c[1] - stop_tip/2, floor_f + btn_body_h + stop_gap]) cube([stop_tip, stop_tip, 1]);
         translate([btn_c[0] - 2.5, btn_c[1] - 2.5, T - floor_b - 1]) cube([5, 5, 1 + eps]);
       }
-      // battery pocket: four corner ribs (gaps let wires pass)
-      translate([W/2 - bat[0]/2, bat_cy - bat[1]/2, T - floor_b - 3]) {
-        for (cx = [0, 1], cy = [0, 1])
-          translate([cx * bat[0], cy * bat[1], 0]) mirror([cx, 0, 0]) mirror([0, cy, 0])
+      // battery pocket: corner ribs at the USB-C end; at the wire end (keyring
+      // end) a single centre stop, so the leads leave freely from either corner
+      translate([W/2 - bat[0]/2, bat_cy - bat[1]/2, T - floor_b - bat_rib_h]) {
+        for (cx = [0, 1])
+          translate([cx * bat[0], bat[1], 0]) mirror([cx, 0, 0]) mirror([0, 1, 0])
             difference() {
-              translate([-1.2, -1.2, 0]) cube([7, 7, 3 + eps]);
-              translate([0, 0, -1]) cube([8, 8, 5]);
+              translate([-1.2, -1.2, 0]) cube([7, 7, bat_rib_h + eps]);
+              translate([0, 0, -1]) cube([8, 8, bat_rib_h + 2]);
             }
+        // side ribs along the long edges, starting clear of the wire corners
+        for (cx = [0, 1])
+          translate([cx * bat[0] - (cx ? 0 : 1.2), 8, 0]) cube([1.2, 14, bat_rib_h + eps]);
+        // centre stop at the wire end
+        translate([bat[0]/2 - bat_stop_w/2, -1.2, 0]) cube([bat_stop_w, 1.2, bat_rib_h + eps]);
       }
     }
     translate([key_c[0], key_c[1], -1]) cylinder(d = key_d, h = T + 2);
