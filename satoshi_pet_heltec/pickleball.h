@@ -31,6 +31,12 @@
 #define PB_NET_X         64      // Center net X position
 #define PB_COURT_MID_Y   (PB_COURT_Y + PB_COURT_H / 2)  // Horizontal split Y
 
+// With 3 players the CPU takes the 4th quadrant, addressed as this index
+#define PB_CPU_IDX       3
+#define PB_CPU_HIT_PCT_START  92   // CPU return rate on the first volley...
+#define PB_CPU_HIT_PCT_STEP   3    // ...dropping this much per volley in the rally
+#define PB_CPU_HIT_PCT_MIN    60
+
 // Game phases
 enum PickleballPhase : uint8_t {
   PB_PHASE_LOBBY,        // Not in a match yet (the room screens handle the lobby)
@@ -104,6 +110,15 @@ struct PickleballState {
 
   // Rally difficulty
   uint8_t volleyCount = 0;            // Volleys in current rally (resets on point)
+
+  // CPU partner: with 3 players it fills the empty quadrant. Every pet derives
+  // it from the same roster, so the wire protocol is unchanged; it is addressed
+  // as player index PB_CPU_IDX (== playerCount). Only the host plays its shots.
+  bool cpuActive = false;
+  uint8_t cpuSide = 0;
+  uint8_t cpuPosition = 0;
+  bool cpuWillHit = false;            // Host: decided when the ball lands
+  unsigned long cpuHitAt = 0;         // Host: when the CPU swings
 
 };
 

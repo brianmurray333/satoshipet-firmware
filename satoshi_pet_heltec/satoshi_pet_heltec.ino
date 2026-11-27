@@ -1810,7 +1810,7 @@
             renderPet(display, ganamosConfig.btcPrice, ganamosConfig.balance, batteryPct);
           } else if (selectedOption == 1) {
             static const char* const GAME_OPTIONS[] = {"Flappy Pet", "Pickleball", "Sat Catcher", "Back"};
-            static const char* const MODE_OPTIONS[] = {"Solo", "With friends", "Back"};
+            static const char* const MODE_OPTIONS[] = {"Solo", "Multiplayer", "Back"};
             static const uint8_t GAME_IDS[] = {GAME_FLAPPY, GAME_PICKLEBALL, GAME_SATCATCHER};
             int game = runListMenu("Choose game", GAME_OPTIONS, 4);
             int mode = -1;

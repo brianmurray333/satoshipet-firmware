@@ -500,7 +500,10 @@ static LobbyResult runLobby(SSD1306Wire &d, Room &room) {
     if (room.count > 2) names[1] += "  +" + String(room.count - 2);
     String status;
     if (room.youAreHost) {
-      status = room.count < 2 ? String("Waiting for friends") : (room.bet ? "Pot: " + satsText(room.pot) : String("Ready!"));
+      status = room.count < 2 ? String("Waiting for friends")
+             : room.bet ? "Pot: " + satsText(room.pot)
+             : (room.game == GAME_PICKLEBALL && room.count == 3) ? String("Ready! CPU plays 4th")
+             : String("Ready!");
     } else {
       status = room.bet ? "Pot: " + satsText(room.pot) : String("Waiting for host");
     }
@@ -855,7 +858,7 @@ int runFriendsGame(SSD1306Wire &d, uint8_t game) {
       char joinLabel[24];
       snprintf(joinLabel, sizeof(joinLabel), n > 0 ? "Join a room (%d)" : "Join a room", n);
       const char *options[] = {"Start a room", joinLabel, "Back"};
-      int pick = runListMenu("WITH FRIENDS", options, 3);
+      int pick = runListMenu("MULTIPLAYER", options, 3);
       if (pick < 0) return bonus;
 
       if (pick == 0) {

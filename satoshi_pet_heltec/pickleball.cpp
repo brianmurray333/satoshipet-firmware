@@ -69,6 +69,41 @@ static bool macIsZero(const uint8_t *mac) {
   return true;
 }
 
+// With exactly 3 players the CPU takes the empty quadrant. Every pet computes
+// this from the same roster (room seats / GAME_START), so they all agree.
+static void pbSetupCpu() {
+  pbState.cpuActive = false;
+  if (pbState.playerCount != 3) return;
+  bool taken[2][2] = {{false, false}, {false, false}};
+  for (int i = 0; i < 3; i++) {
+    const ESPNowPlayer &p = pbState.players[i];
+    if (p.side > 1 || p.position > 1 || taken[p.side][p.position]) return;  // bad roster: no CPU
+    taken[p.side][p.position] = true;
+  }
+  for (uint8_t side = 0; side < 2; side++) {
+    for (uint8_t pos = 0; pos < 2; pos++) {
+      if (!taken[side][pos]) {
+        pbState.cpuActive = true;
+        pbState.cpuSide = side;
+        pbState.cpuPosition = pos;
+        return;
+      }
+    }
+  }
+}
+
+static bool pbIsCpu(uint8_t idx) {
+  return pbState.cpuActive && idx == PB_CPU_IDX;
+}
+
+static bool pbValidTarget(uint8_t idx) {
+  return idx < pbState.playerCount || pbIsCpu(idx);
+}
+
+static uint8_t pbSideOf(uint8_t idx) {
+  return pbIsCpu(idx) ? pbState.cpuSide : pbState.players[idx].side;
+}
+
 static uint8_t mySide() {
   return pbState.myPlayerIndex < MAX_GAME_PLAYERS
     ? pbState.players[pbState.myPlayerIndex].side : 0;
@@ -315,6 +350,7 @@ static void pbHandleClientPacket(const uint8_t *mac, const uint8_t *data, unsign
       pbState.players[i].side = msg.sides[i];
       pbState.players[i].position = msg.positions[i];
     }
+    pbSetupCpu();
     pbState.startReceived = true;
     pbStartMatch(now);
     pbSendStartAck(mac);
@@ -344,7 +380,7 @@ static void pbHandleClientPacket(const uint8_t *mac, const uint8_t *data, unsign
     if (msg.generation != pbState.matchGeneration || msg.sequence <= pbState.lastReceivedSequence) return;
     // Host only broadcasts state for COUNTDOWN..BALL_LANDED
     if (msg.phase < PB_PHASE_COUNTDOWN || msg.phase > PB_PHASE_BALL_LANDED) return;
-    if (msg.targetPlayerIdx >= pbState.playerCount) return;
+    if (!pbValidTarget(msg.targetPlayerIdx)) return;
     if (msg.ballSide > 1 || msg.ballZone > 1 || msg.servingSide > 1) return;
     if (pbState.phase == PB_PHASE_GAME_OVER) return;
     pbState.lastReceivedSequence = msg.sequence;
@@ -651,6 +687,7 @@ int handlePickleballRoomMatch(SSD1306Wire &display, const PbRosterEntry *roster,
     if (i != myIndex && !macIsZero(pl.mac)) espnowAddPeer(pl.mac);
   }
   pbState.playerCount = count;
+  pbSetupCpu();
   pbState.myPlayerIndex = myIndex;
   pbState.isHost = (myIndex == 0);
   pbState.players[myIndex].connected = true;
@@ -796,7 +833,7 @@ int handlePickleballRoomMatch(SSD1306Wire &display, const PbRosterEntry *roster,
           pbState.ballSide = receiveSide;
           pbState.ballZone = random(0, 2); // 0=top, 1=bottom
 
-          // Find the target player
+          // Find the target player (the CPU counts when it holds that quadrant)
           pbState.targetPlayerIdx = 255; // Invalid
           for (int i = 0; i < pbState.playerCount; i++) {
             if (pbState.players[i].side == receiveSide &&
@@ -804,6 +841,10 @@ int handlePickleballRoomMatch(SSD1306Wire &display, const PbRosterEntry *roster,
               pbState.targetPlayerIdx = i;
               break;
             }
+          }
+          if (pbState.targetPlayerIdx == 255 && pbState.cpuActive &&
+              pbState.cpuSide == receiveSide && pbState.cpuPosition == pbState.ballZone) {
+            pbState.targetPlayerIdx = PB_CPU_IDX;
           }
 
           // If only 1 player on receiving side (1v2 or 1v1), they're the target regardless of zone
@@ -831,7 +872,7 @@ int handlePickleballRoomMatch(SSD1306Wire &display, const PbRosterEntry *roster,
           pbState.confirmDeadline = 0;
 
           // Determine required presses: 1 for top zone, 2 for bottom zone
-          bool isSoloOnSide = true;
+          bool isSoloOnSide = !(pbState.cpuActive && pbState.cpuSide == receiveSide);
           for (int i = 0; i < pbState.playerCount; i++) {
             if (i != pbState.targetPlayerIdx &&
                 pbState.players[i].side == receiveSide) {
@@ -865,6 +906,19 @@ int handlePickleballRoomMatch(SSD1306Wire &display, const PbRosterEntry *roster,
           if (reactionMs < PB_REACTION_TIME_MIN) reactionMs = PB_REACTION_TIME_MIN;
           pbState.reactionDeadline = now + reactionMs;
 
+          // CPU's ball: it returns most of them, a little less often as the
+          // rally speeds up, swinging somewhere inside the reaction window.
+          if (pbIsCpu(pbState.targetPlayerIdx)) {
+            int hitPct = PB_CPU_HIT_PCT_START - pbState.volleyCount * PB_CPU_HIT_PCT_STEP;
+            if (hitPct < PB_CPU_HIT_PCT_MIN) hitPct = PB_CPU_HIT_PCT_MIN;
+            pbState.cpuWillHit = (int)random(0, 100) < hitPct;
+            int latest = reactionMs - 150;
+            if (latest < 250) latest = 250;
+            pbState.cpuHitAt = now + random(200, latest);
+          } else {
+            pbState.cpuWillHit = false;
+          }
+
           sendGameStateToPlayers();
           playPickleballHit();
         }
@@ -876,13 +930,13 @@ int handlePickleballRoomMatch(SSD1306Wire &display, const PbRosterEntry *roster,
 
       case PB_PHASE_BALL_LANDED: {
         if (pbState.isHost) {
-          if (pbState.targetPlayerIdx >= pbState.playerCount) {
+          if (!pbValidTarget(pbState.targetPlayerIdx)) {
             // Should not happen (SERVING validates); re-serve safely
             pbState.phase = PB_PHASE_SERVING;
             pbState.phaseStartTime = now;
             break;
           }
-          uint8_t targetSide = pbState.players[pbState.targetPlayerIdx].side;
+          uint8_t targetSide = pbSideOf(pbState.targetPlayerIdx);
 
           // --- Handle incoming button presses for this volley ---
           PendingButtonPress pendingPress;
@@ -917,6 +971,15 @@ int handlePickleballRoomMatch(SSD1306Wire &display, const PbRosterEntry *roster,
             }
           }
           if (pbState.phase != PB_PHASE_BALL_LANDED) break;
+
+          // --- CPU's swing (host only) ---
+          if (pbIsCpu(pbState.targetPlayerIdx) && pbState.cpuWillHit && !pbState.hitConfirmed &&
+              (long)(now - pbState.cpuHitAt) >= 0) {
+            pbState.cpuWillHit = false;
+            pbState.hitConfirmed = true;
+            pbState.confirmDeadline = now + PB_CONFIRM_WINDOW_MS;
+            playPickleballHit();
+          }
 
           // --- Check confirm window expiry (successful hit!) ---
           if (pbState.hitConfirmed && (long)(now - pbState.confirmDeadline) >= 0) {
@@ -1241,11 +1304,19 @@ static void renderCourt(SSD1306Wire &display) {
     display.setTextAlignment(TEXT_ALIGN_CENTER);
     display.drawString(x, y, initial);
   }
+  if (pbState.cpuActive) {
+    int x = (pbState.cpuSide == 0)
+      ? PB_COURT_X + (PB_NET_X - PB_COURT_X) / 2
+      : PB_NET_X + (PB_COURT_X + PB_COURT_W - PB_NET_X) / 2;
+    int y = (pbState.cpuPosition == 0) ? PB_COURT_Y + 4 : PB_COURT_MID_Y + 4;
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(x, y, "CPU");
+  }
 
   // For solo player on a side: show "1" and "2" indicators
   display.setTextAlignment(TEXT_ALIGN_CENTER);
   for (uint8_t side = 0; side <= 1; side++) {
-    int playersOnSide = 0;
+    int playersOnSide = (pbState.cpuActive && pbState.cpuSide == side) ? 1 : 0;
     int soloIdx = -1;
     for (int i = 0; i < pbState.playerCount && i < MAX_GAME_PLAYERS; i++) {
       if (pbState.players[i].side == side) {
@@ -1254,7 +1325,7 @@ static void renderCourt(SSD1306Wire &display) {
       }
     }
 
-    if (playersOnSide == 1) {
+    if (playersOnSide == 1 && soloIdx >= 0) {
       int baseX = (side == 0) ? PB_COURT_X + 5 : PB_COURT_X + PB_COURT_W - 12;
       uint8_t playerPos = pbState.players[soloIdx].position;
 
