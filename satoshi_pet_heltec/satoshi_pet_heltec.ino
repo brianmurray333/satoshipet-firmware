@@ -861,8 +861,7 @@
     display.setTextAlignment(TEXT_ALIGN_LEFT);
     pinMode(RGB_LED, OUTPUT);  // Enable RGB LED
     digitalWrite(RGB_LED, LOW);  // Start with LED off
-    pinMode(BUZZER_PIN, OUTPUT);  // Enable buzzer
-    digitalWrite(BUZZER_PIN, LOW);  // Start with buzzer off
+    soundInit();  // Buzzer: GPIO 48 (+GND), or GPIO 46 + 45 on case v2 wiring
     
     // Configure ADC for battery reading
     analogReadResolution(12);  // 12-bit resolution (0-4095)

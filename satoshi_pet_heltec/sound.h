@@ -12,6 +12,9 @@ struct ToneNote {
   uint16_t ms;    // duration
 };
 
+// Set up the buzzer outputs (call once in setup()).
+void soundInit();
+
 // Start playing a note sequence, replacing whatever is playing. Non-blocking:
 // call soundUpdate() regularly (every loop iteration) to advance it.
 // The array is NOT copied: `notes` must stay valid until the sequence ends
