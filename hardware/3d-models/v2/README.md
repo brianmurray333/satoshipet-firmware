@@ -54,11 +54,13 @@ All parts are already oriented for printing (outside face down, no supports need
    board). Three crush ribs hold it snug.
 2. Put the board in screen-first, **USB-C end first**: tip it so the socket goes into the end-wall
    opening, then press the other end down until it clicks under the two hooks.
-3. Solder the buzzer to **GPIO 46 and GPIO 45**, the last two holes on that header at the keyring end
-   (either way round). The rails are cut away under those holes (and under the matching holes on the
-   other row), so feed each lead up through its hole from underneath and solder on top. The firmware
-   drives 46 and holds 45 low, so nothing runs to the GND pin at the far end and both leads stay
-   short, clear of the battery.
+3. Wire the buzzer to the last two holes on that header at the keyring end: **red (+) to GPIO 46**
+   (the end hole, tone) and **white (−) to GPIO 45** (next to it, held low as ground). Solder the
+   wires to the buzzer's prongs first, run them flat over the top of the board, push each end
+   **down** through its hole and solder on top. The rails are cut away under those holes (and under
+   the matching holes on the other row), so the wire ends drop into the well instead of hitting the
+   rail; trim them to ~2 mm. Keep the wires flat: the battery sits ~3 mm above the board just past
+   these holes. Nothing runs to the GND pin at the far end.
 4. Put the battery in the back half with its **wire end toward the keyring** (the end with the single
    centre stop); the leads leave through either open corner. A thin foam pad on top keeps it from
    rattling. Plug it in.
