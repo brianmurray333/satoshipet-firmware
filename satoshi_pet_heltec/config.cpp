@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <esp_task_wdt.h>
+#include <esp_random.h>
 #include <time.h>
 
 GanamosConfig ganamosConfig = {
@@ -260,10 +261,77 @@ static void applyServerTimezone(const char* tz) {
 }
 
 // ===== Device config =====
+// ---- Game-room secret (NVS "sp-game") ----
+// The pet makes its own random secret and claims it with the server through
+// the config request (X-Game-Secret-Claim) until the server accepts it. A
+// claim can be retried safely; the secret never comes from the server.
+static String cachedGameSecret;
+static bool gameSecretClaimed = false;
+static bool gameSecretLoaded = false;
+
+static void loadGameSecret() {
+  if (gameSecretLoaded) return;
+  gameSecretLoaded = true;
+  Preferences p;
+  if (p.begin("sp-game", true)) {
+    cachedGameSecret = p.getString("secret", "");
+    gameSecretClaimed = p.getBool("claimed", false);
+    p.end();
+  }
+  if (cachedGameSecret.length() != 64) {
+    char buf[65];
+    for (int i = 0; i < 32; i++) snprintf(buf + i * 2, 3, "%02x", (unsigned)(esp_random() & 0xFF));
+    cachedGameSecret = buf;
+    gameSecretClaimed = false;
+    if (p.begin("sp-game", false)) {
+      p.putString("secret", cachedGameSecret);
+      p.putBool("claimed", false);
+      p.end();
+    }
+  }
+}
+
+String gameSecret() {
+  loadGameSecret();
+  return cachedGameSecret;
+}
+
+bool hasGameSecret() {
+  loadGameSecret();
+  return gameSecretClaimed;
+}
+
+static void markGameSecretClaimed(bool accepted) {
+  loadGameSecret();
+  if (accepted == gameSecretClaimed) return;
+  gameSecretClaimed = accepted;
+  Preferences p;
+  if (p.begin("sp-game", false)) {
+    p.putBool("claimed", accepted);
+    p.end();
+  }
+  Serial.println(accepted ? F("Game secret accepted") : F("Game secret refused (pair again to play for sats)"));
+}
+
+void clearGameSecret() {
+  Preferences p;
+  if (p.begin("sp-game", false)) {
+    p.clear();
+    p.end();
+  }
+  cachedGameSecret = "";
+  gameSecretClaimed = false;
+  gameSecretLoaded = false;  // a new one is made on next use
+}
+
 static bool requestConfigOnce(HTTPClient& http, const String& path) {
   lastHttpCode = 0;
   if (!ganamosHttpBegin(http, path)) {
     return false;
+  }
+  // Claim our game-room secret until the server has accepted it
+  if (!hasGameSecret()) {
+    http.addHeader("X-Game-Secret-Claim", gameSecret());
   }
   unsigned long started = millis();
   lastHttpCode = http.GET();
@@ -305,7 +373,7 @@ static bool parseConfigResponse(HTTPClient& http) {
     "lastSenderName", "gameCost", "gameReward", "lastRejectionId",
     "rejectionMessage", "rejectionPostTitle", "hungerDecayPer24h",
     "happinessDecayPer24h", "coinsEarnedSinceLastSync", "hasNewJob",
-    "newJobTitle", "newJobReward", "timezone", "tz"
+    "newJobTitle", "newJobReward", "timezone", "tz", "gameSecretAccepted", "openRooms"
   };
   for (const char* field : fields) {
     f[field] = true;
@@ -358,6 +426,12 @@ static bool parseConfigResponse(HTTPClient& http) {
   const char* tz = config["timezone"].is<const char*>() ? config["timezone"].as<const char*>()
                                                         : config["tz"].as<const char*>();
   if (tz) applyServerTimezone(tz);
+
+  // Game rooms
+  ganamosConfig.openRooms = config["openRooms"] | 0;
+  if (config["gameSecretAccepted"].is<bool>()) {
+    markGameSecretClaimed(config["gameSecretAccepted"].as<bool>());
+  }
 
   // Apply coins earned from server
   int coinsEarned = config["coinsEarnedSinceLastSync"] | 0;
@@ -483,6 +557,7 @@ void clearDeviceConfig() {
   preferences.begin("satoshi-pet", false);
   preferences.clear();
   preferences.end();
+  clearGameSecret();  // a new pairing gets a new one
 }
 
 int loadLastKnownBalance() {

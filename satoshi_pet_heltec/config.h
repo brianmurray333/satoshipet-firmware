@@ -35,6 +35,7 @@ struct GanamosConfig {
   String lastRejectionId;    // ID of last rejected fix (to detect new rejections)
   String rejectionMessage;   // Message to show on rejection
   String rejectionPostTitle; // Post title for rejected fix
+  int openRooms = 0;         // Open game rooms this pet could join (family/groups)
 };
 
 extern GanamosConfig ganamosConfig;
@@ -141,5 +142,12 @@ void clearWifiFastConnect();
 // calls WiFi.begin() while a connect is already pending. For user-initiated
 // network actions only.
 bool wifiEnsureConnected(unsigned long timeoutMs);
+
+// Per-device secret that authenticates game-room (bet) requests. The pet makes
+// it, keeps it in NVS and claims it with the server through the config request;
+// game requests send it as X-Device-Secret. Unpairing clears it.
+String gameSecret();
+bool hasGameSecret();   // claimed and accepted by the server
+void clearGameSecret();
 
 #endif
