@@ -18,7 +18,7 @@ what didn't work in v1.
 | Battery | loose in the back cavity | 5.5 mm ribs hold an 802540 (8 × 25 × 40 mm); the wire end has open corners so the leads can't jam |
 | Buzzer | glued | press-fit ring (crush ribs) + 7-hole sound grille; solder wells under its two pin holes |
 | Button | glued | socket for a 6 × 6 mm tactile switch |
-| Board | 0.7 mm pin holes in rails | rails + side guides; USB-C end tucks into its opening, the other end clicks under two snap hooks (0.1 mm play) |
+| Board | 0.7 mm pin holes in rails | rails + side guides; USB-C end tucks into its opening, the other end clicks under two angled snap hooks along the board's cut corners (0.1 mm play) |
 
 ## Files
 
@@ -53,7 +53,9 @@ All parts are already oriented for printing (outside face down, no supports need
 1. Press the buzzer into its ring (face toward the grille, leads out through the slot toward the
    board). Three crush ribs hold it snug.
 2. Put the board in screen-first, **USB-C end first**: tip it so the socket goes into the end-wall
-   opening, then press the other end down until it clicks under the two hooks.
+   opening, then press the other end down until it clicks under the two hooks. The hooks sit along
+   the board's angled corner edges at the keyring end (measured on a V3.1: 10 mm middle flat,
+   corners set back 4 mm), so they hold it down, stop it sliding toward the keyring and centre it.
 3. Wire the buzzer to the last two holes on that header at the keyring end: **red (+) to GPIO 46**
    (the end hole, tone) and **white (−) to GPIO 45** (next to it, held low as ground). Solder the
    wires to the buzzer's prongs first, run them flat over the top of the board, push each end
@@ -66,9 +68,9 @@ All parts are already oriented for printing (outside face down, no supports need
    rattling. Plug it in.
 5. Snap the halves together and thread the keyring through the corner tube.
 
-To take the board out, push the hooks back toward the buzzer with a fingernail and lift that end.
+To take the board out, push the hooks outward with a fingernail and lift that end.
 
-![snap hooks](previews/board-hooks.png) ![solder wells and buzzer ribs](previews/solder-wells.png) ![battery pocket](previews/battery-pocket.png)
+![snap hooks](previews/board-hooks.png) ![snap hooks, top](previews/board-hooks-top.png) ![solder wells and buzzer ribs](previews/solder-wells.png) ![battery pocket](previews/battery-pocket.png)
 
 Earlier wiring (buzzer on GPIO 48 + GND, wired button on GPIO 2) still works with the same firmware.
 

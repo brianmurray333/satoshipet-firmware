@@ -45,33 +45,38 @@ board_w   = 25.5;  // Heltec V3 PCB width
 board_l   = 50.2;  // Heltec V3 PCB length (datasheet), measured through the middle of the ends.
                    // The USB-C end of the PCB rests against the inside of the end wall; the
                    // socket sticks out 0.9 mm past the PCB into the USB opening.
-pcb_notch = 1.1;   // the PCB's corners are cut back 1.1 mm at each end (long edges are 48.0)
+pcb_notch = 1.1;   // USB-C end: corners cut back ~1.1 mm
+// Keyring end (measured on a V3.1): a 10 mm flat in the middle; 4 mm flats at
+// the corners, set back 4 mm from it; angled edges (~5.5 mm) between them.
+// board_y0 is the middle flat.
+pcb_mid_w    = 10;
+pcb_corner_w = 4;
+pcb_corner_back = 4;
 stop_play = 0.2;   // lengthwise play between the board and the end stops
 pcb_t     = 1.6;
 oled_stack= 5.2;   // gap from the front wall to the PCB: the OLED glass and
                    // the USB-C socket sit on this side. Measured glass on a
                    // V3: 5 mm tall x 33 x 19 mm, plus 0.2 mm clearance.
 rail_w    = 2.0;   // PCB rests on these along its long edges
-// Snap hooks at the keyring end of the board: the USB-C end goes in first (its
-// socket sits in the end-wall opening, which holds that end down), then the
-// other end is pressed down and clicks under the hooks. Their faces also stop
-// the board lengthwise. They sit 2.2 mm in from the long edges, clear of the
-// PCB's 1.1 mm cut-back corners.
-hook_w    = 4.0;   // across
-hook_t    = 1.2;   // post thickness along the board (thinner = softer click)
-hook_lip  = 0.6;   // how far the hook reaches over the PCB end
-hook_play = 0.1;   // lengthwise play: hook face to PCB end
+// Snap hooks at the keyring end of the board, one along each angled edge, in
+// the dead space beside it: the USB-C end goes in first (its socket sits in the
+// end-wall opening, which holds that end down), then the other end is pressed
+// down and clicks under both hooks. Their angled faces also stop the board
+// sliding toward the keyring and centre it side to side.
+hook_len  = 4.0;   // along the angled edge (it is ~5.5 mm long)
+hook_t    = 1.2;   // post thickness (thinner = softer click)
+hook_lip  = 0.6;   // how far the hook reaches over the PCB edge
+hook_play = 0.1;   // gap from the hook face to the PCB edge
 hook_zgap = 0.1;   // vertical play under the hook
-hook_in   = 2.2;   // hook position in from the PCB's long edges
 // Solder wells: the rails are cut away under the last two pin holes at the
 // keyring end (GPIO 46/45 on one row, 1/2 on the other), so the buzzer leads
 // can come up through the holes from the screen side and be soldered on top.
 // Heltec V3 headers: 18 holes at 2.54 mm, first hole centre ~3.5 mm from the
 // PCB end, hole centres ~1.3 mm in from the long edges.
 pin_pitch  = 2.54;
-pin_first  = 3.5;   // first hole centre from the PCB's keyring end
+pin_first  = 5.2;   // first hole centre from the PCB's middle flat (4 mm corner set-back + ~1.2)
 well_holes = 2;     // holes cleared per row
-well_pad   = 1.6;   // extra length past the outer hole centres
+well_pad   = 1.8;   // extra length past the outer hole centres (covers ±0.5 mm)
 
 /* ---------- screen window ---------- */
 win_cx = 13.3;                 // across: ~3 mm toward one pin row (fit confirmed on the v2 print)
@@ -196,20 +201,26 @@ module key_nub() {
 }
 
 /* ---------- board snap hooks ---------- */
-module board_hooks() {
-  z_top = pcb_z0 + pcb_t + hook_zgap;    // underside of the hook lip
-  y1 = board_y0 - hook_play;             // hook face (meets the PCB end)
-  // with the wired button its socket sits where the second hook goes
-  for (x = PRG_KEY ? [board_x0 + hook_in, board_x0 + board_w - hook_in - hook_w]
-                   : [board_x0 + hook_in])
-    translate([x, 0, 0]) {
-      translate([0, y1 - hook_t, floor_f - eps]) cube([hook_w, hook_t, z_top - floor_f + eps]);
-      // lip over the PCB, ramped on top so the board pushes the hook back
-      hull() {
-        translate([0, y1 - hook_t, z_top]) cube([hook_w, hook_t + hook_lip, 0.4]);
-        translate([0, y1 - hook_t, z_top + 1.2]) cube([hook_w, hook_t, eps]);
-      }
+// The left angled edge runs from the corner flat (board_x0 + 4, board_y0 + 4)
+// to the middle flat (board_x0 + 7.75, board_y0); the right one mirrors it.
+module board_hook_left() {
+  dx = (board_w - pcb_mid_w) / 2 - pcb_corner_w;   // 3.75 across
+  dy = pcb_corner_back;                            // 4 along
+  ang = atan2(-dy, dx);                            // edge direction
+  mid = [board_x0 + pcb_corner_w + dx/2, board_y0 + dy/2];
+  z_top = pcb_z0 + pcb_t + hook_zgap;              // underside of the lip
+  // local frame: x along the edge, +y into the board
+  translate([mid[0], mid[1], 0]) rotate(ang) {
+    translate([-hook_len/2, -hook_play - hook_t, floor_f - eps]) cube([hook_len, hook_t, z_top - floor_f + eps]);
+    hull() {
+      translate([-hook_len/2, -hook_play - hook_t, z_top]) cube([hook_len, hook_t + hook_play + hook_lip, 0.4]);
+      translate([-hook_len/2, -hook_play - hook_t, z_top + 1.2]) cube([hook_len, hook_t, eps]);
     }
+  }
+}
+module board_hooks() {
+  board_hook_left();
+  translate([W, 0, 0]) mirror([1, 0, 0]) board_hook_left();
 }
 
 /* ---------- front half (screen side) ---------- */
