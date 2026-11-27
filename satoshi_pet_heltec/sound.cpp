@@ -5,19 +5,18 @@
 #define BUZZER_PIN 48  // Piezo buzzer pin (matches satoshi_pet_heltec.ino / pet_blob.h)
 #endif
 
-// Case v2 wiring: the buzzer is soldered to the first two holes at the board's
-// keyring end, one driven with the tone and one held LOW as its ground, so
-// neither lead runs to the GND pin at the USB-C end. Which GPIOs those holes
-// are depends on the board:
-//   WiFi Kit 32 V3.1:   GPIO 46 (tone) + GPIO 45 (low)
-//   WiFi LoRa 32 V3.2:  GPIO 7  (tone) + GPIO 6  (low)
-// Earlier pets wire it to GPIO 48 + GND. All tone outputs share one LEDC
-// channel, so one build drives any of these wirings.
+// Case v2 wiring: the buzzer sits on the last two holes at the board's keyring
+// end, GPIO 46 (tone) and GPIO 45 (held LOW as its ground), so neither lead
+// runs to the GND pin at the USB-C end. Earlier pets wire it to GPIO 48 + GND.
+// Both outputs share one LEDC channel, so one build drives either wiring.
 // (45 and 46 are strapping pins: both default LOW at reset, which is what they
-// need for a normal boot, and the buzzer coil between them keeps them equal.
-// 6 and 7 are plain GPIOs, unused on both boards.)
-static const uint8_t BUZZER_TONE_PINS[] = {BUZZER_PIN, 46, 7};
-static const uint8_t BUZZER_LOW_PINS[]  = {45, 6};
+// need for a normal boot, and the buzzer coil between them keeps them equal.)
+#ifndef BUZZER_PIN_ALT
+#define BUZZER_PIN_ALT 46
+#endif
+#ifndef BUZZER_LOW_PIN
+#define BUZZER_LOW_PIN 45
+#endif
 #define BUZZER_LEDC_CHANNEL 7
 #define BUZZER_LEDC_BITS    10
 
@@ -25,13 +24,10 @@ static bool s_init = false;
 
 void soundInit() {
   if (s_init) return;
-  for (uint8_t pin : BUZZER_LOW_PINS) {
-    pinMode(pin, OUTPUT);
-    digitalWrite(pin, LOW);
-  }
-  for (uint8_t pin : BUZZER_TONE_PINS) {
-    ledcAttachChannel(pin, 2000, BUZZER_LEDC_BITS, BUZZER_LEDC_CHANNEL);
-  }
+  pinMode(BUZZER_LOW_PIN, OUTPUT);
+  digitalWrite(BUZZER_LOW_PIN, LOW);
+  ledcAttachChannel(BUZZER_PIN, 2000, BUZZER_LEDC_BITS, BUZZER_LEDC_CHANNEL);
+  ledcAttachChannel(BUZZER_PIN_ALT, 2000, BUZZER_LEDC_BITS, BUZZER_LEDC_CHANNEL);
   ledcWrite(BUZZER_PIN, 0);  // silent: both outputs low
   s_init = true;
 }

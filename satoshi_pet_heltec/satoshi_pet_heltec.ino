@@ -861,7 +861,7 @@
     display.setTextAlignment(TEXT_ALIGN_LEFT);
     pinMode(RGB_LED, OUTPUT);  // Enable RGB LED
     digitalWrite(RGB_LED, LOW);  // Start with LED off
-    soundInit();  // Buzzer: GPIO 48 (+GND), or case v2 wiring: 46+45 (Kit V3.1) / 7+6 (LoRa V3.2)
+    soundInit();  // Buzzer: GPIO 48 (+GND), or GPIO 46 + 45 on case v2 wiring
     
     // Configure ADC for battery reading
     analogReadResolution(12);  // 12-bit resolution (0-4095)
