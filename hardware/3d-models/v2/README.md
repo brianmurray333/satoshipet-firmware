@@ -56,14 +56,8 @@ All parts are already oriented for printing (outside face down, no supports need
    opening, then press the other end down until it clicks under the two hooks. The hooks sit along
    the board's angled corner edges at the keyring end (measured on a V3.1: 10 mm middle flat,
    corners set back 4 mm), so they hold it down, stop it sliding toward the keyring and centre it.
-3. Wire the buzzer to the first two holes at the keyring end, on the row whose end holes are:
-
-   | Board | Red (+), end hole, tone | White (−), next hole, held low |
-   |---|---|---|
-   | WiFi Kit 32 V3.1 | GPIO 46 | GPIO 45 |
-   | WiFi LoRa 32 V3.2 (HTIT-WB32LAF) | GPIO 7 | GPIO 6 |
-
-   (Not the other row: on the LoRa board its end holes are 19/20, the USB data pins.) Solder the
+3. Wire the buzzer to the last two holes on that header at the keyring end: **red (+) to GPIO 46**
+   (the end hole, tone) and **white (−) to GPIO 45** (next to it, held low as ground). Solder the
    wires to the buzzer's prongs first, run them flat over the top of the board, push each end
    **down** through its hole and solder on top. The rails are cut away under those holes (and under
    the matching holes on the other row), so the wire ends drop into the well instead of hitting the
